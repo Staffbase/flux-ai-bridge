@@ -61,6 +61,14 @@ type ResourceStatus struct {
 	// Pod rows produced by the pod kstatus snapshot; zero when absent or
 	// unparseable.
 	CreatedAt time.Time
+	// VersionGuessed reports that the final read of this row used a guessed
+	// apiVersion: the (group, kind) wasn't in MCP's discovery cache, even
+	// after the NotFound refresh in checkOne, so the version came from
+	// fallbackPreferredVersions or the "v1" default. A NotFound under a
+	// guessed version may only mean the bridge asked for a version the
+	// cluster doesn't serve, so it doesn't prove the resource is gone. The
+	// core group ("") is never guessed: it only serves v1.
+	VersionGuessed bool
 	// Replicas carries the hard replica accounting for workload kinds
 	// (Deployment/StatefulSet/ReplicaSet/DaemonSet); nil for everything else.
 	// Populated for non-Current rows so the LLM states "0/1 ready" as fact
@@ -266,7 +274,7 @@ func (c *Checker) checkOne(ctx context.Context, ref string) ResourceStatus {
 		return ResourceStatus{Status: "Unknown", Message: err.Error()}
 	}
 
-	apiVersion := c.resolver.APIVersion(parsed.Group, parsed.Kind)
+	apiVersion, known := c.resolver.apiVersionKnown(parsed.Group, parsed.Kind)
 	rs := c.fetchResource(ctx, parsed, apiVersion)
 
 	// NotFound may mean we polled at the wrong apiVersion: a GUESSED one (no
@@ -280,12 +288,20 @@ func (c *Checker) checkOne(ctx context.Context, ref string) ResourceStatus {
 		if _, rerr := c.resolver.Refresh(ctx); rerr != nil {
 			c.log().Warn("readiness: discovery refresh failed", "group", parsed.Group, "kind", parsed.Kind, "error", rerr.Error())
 		}
-		if v, nowKnown := c.resolver.apiVersionKnown(parsed.Group, parsed.Kind); nowKnown && v != apiVersion {
-			c.log().Info("readiness: re-resolved apiVersion after NotFound; retrying",
-				"group", parsed.Group, "kind", parsed.Kind, "from", apiVersion, "to", v)
-			rs = c.fetchResource(ctx, parsed, v)
+		if v, nowKnown := c.resolver.apiVersionKnown(parsed.Group, parsed.Kind); nowKnown {
+			// Discovery now knows the kind: either at the version already read
+			// (the NotFound stands, read at a known version) or at another one,
+			// which is re-polled.
+			known = true
+			if v != apiVersion {
+				c.log().Info("readiness: re-resolved apiVersion after NotFound; retrying",
+					"group", parsed.Group, "kind", parsed.Kind, "from", apiVersion, "to", v)
+				rs = c.fetchResource(ctx, parsed, v)
+			}
 		}
 	}
+	// The core group only serves v1, so its "v1" default is no guess.
+	rs.VersionGuessed = !known && parsed.Group != ""
 	return rs
 }
 

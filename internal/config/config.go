@@ -266,6 +266,39 @@ type Config struct {
 	// waitPodsSettled and
 	// docs/configuration.md (READINESS_POD_QUIET_PERIOD).
 	ReadinessPodQuietPeriod time.Duration
+
+	// FailureFetchLogsScope selects which failing pods' logs the failure
+	// context sends to the LLM: LogsScopeOwned (default) only pods owned by a
+	// workload in the Kustomization's inventory, LogsScopeNamespace every
+	// failing pod in the swept namespaces. Any other value (including empty,
+	// as in a hand-built Config) is treated as LogsScopeOwned by the
+	// processor. Set via FAILURE_FETCH_LOGS_SCOPE.
+	FailureFetchLogsScope string
+}
+
+// Values of FailureFetchLogsScope.
+const (
+	// LogsScopeOwned fetches logs only for failing pods owned by a workload in
+	// the Kustomization's inventory, so logs of unrelated apps sharing the
+	// namespace never reach the LLM.
+	LogsScopeOwned = "owned"
+	// LogsScopeNamespace fetches logs for any failing pod in the swept
+	// namespaces, whoever owns it.
+	LogsScopeNamespace = "namespace"
+)
+
+// logsScopeFromEnv reads FAILURE_FETCH_LOGS_SCOPE: LogsScopeOwned when unset,
+// and an error for anything but the two known values, so a typo can't
+// silently widen what reaches the LLM.
+func logsScopeFromEnv(key string) (string, error) {
+	switch raw := strings.ToLower(strings.TrimSpace(os.Getenv(key))); raw {
+	case "":
+		return LogsScopeOwned, nil
+	case LogsScopeOwned, LogsScopeNamespace:
+		return raw, nil
+	default:
+		return "", fmt.Errorf("invalid %s: %q (use %s or %s)", key, raw, LogsScopeOwned, LogsScopeNamespace)
+	}
 }
 
 // processingSlack is what one event's pipeline gets on top of the readiness
@@ -427,6 +460,11 @@ func Load() (*Config, error) {
 	if strings.HasPrefix(strings.ToLower(cfg.GitHubAPIURL), "http://") && !cfg.GitHubAPIAllowInsecure {
 		return nil, fmt.Errorf("GITHUB_API_URL %q uses plain HTTP, which sends the GitHub App credentials unencrypted; use https:// or set GITHUB_API_ALLOW_INSECURE=true (test mocks only)", cfg.GitHubAPIURL)
 	}
+	logsScope, err := logsScopeFromEnv("FAILURE_FETCH_LOGS_SCOPE")
+	if err != nil {
+		return nil, err
+	}
+	cfg.FailureFetchLogsScope = logsScope
 	if cfg.InstanceID != "" && !instanceIDPattern.MatchString(cfg.InstanceID) {
 		return nil, fmt.Errorf("INSTANCE_ID %q must be a DNS label: lowercase letters, digits and '-', at most 63 characters, starting and ending alphanumeric", cfg.InstanceID)
 	}

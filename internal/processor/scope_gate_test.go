@@ -290,7 +290,7 @@ func TestProcess_ScopeGate_InPlaceRemovalAttributedDespiteScopeFailure(t *testin
 	}
 	// Scope resolution fails (revision mismatch) — present-file attribution is
 	// suppressed, but the in-place removal must still be attributed via prune.
-	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default()).
+	proc := New(cfg, mcpMock, discoveredChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default()).
 		WithScopeResolver(fakeScope{err: bridgesource.ErrRevisionMismatch})
 	event := eventv1.Event{
 		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "kyverno", Namespace: "flux-system"},
@@ -330,7 +330,7 @@ func TestProcess_ScopeGate_RemovedFileAttributedDespiteScopeFailure(t *testing.T
 		PRLabelEnabled: true, PRAttributePrunes: true,
 		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
 	}
-	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default()).
+	proc := New(cfg, mcpMock, discoveredChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default()).
 		WithScopeResolver(fakeScope{err: bridgesource.ErrRevisionMismatch})
 	event := eventv1.Event{
 		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "batch-jobs", Namespace: "flux-system"},

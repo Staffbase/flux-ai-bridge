@@ -1027,6 +1027,46 @@ func TestCheckOne_GenuinelyMissingStaysNotFound(t *testing.T) {
 	}
 }
 
+// A kind discovery doesn't know is read at a guessed apiVersion. Its NotFound
+// may only mean the cluster doesn't serve that version, so the row says the
+// version was guessed; a kind discovery knows, or one it learns on the
+// NotFound refresh, and the core group (v1 only) are not guesses.
+func TestCheckOne_ReportsGuessedVersion(t *testing.T) {
+	cases := []struct {
+		name     string
+		resolver *Resolver
+		ref      string
+		want     bool
+	}{
+		{"unknown kind, no refresher", NewResolver(nil), "ns1_w1_example.com_Widget", true},
+		{"no resolver at all", nil, "ns1_w1_example.com_Widget", true},
+		{"fallback-table group", NewResolver(nil), "ns1_hr_helm.toolkit.fluxcd.io_HelmRelease", true},
+		{"refresh still doesn't know the kind", NewResolver(nil).WithRefresher(func(context.Context) ([]VersionEntry, error) {
+			return []VersionEntry{{Group: "other.io", Kind: "Gadget", Version: "v1"}}, nil
+		}), "ns1_w1_example.com_Widget", true},
+		{"known from discovery", NewResolver([]VersionEntry{{Group: "example.com", Kind: "Widget", Version: "v1beta1"}}), "ns1_w1_example.com_Widget", false},
+		{"learned on the NotFound refresh", NewResolver(nil).WithRefresher(func(context.Context) ([]VersionEntry, error) {
+			return []VersionEntry{{Group: "example.com", Kind: "Widget", Version: "v1"}}, nil
+		}), "ns1_w1_example.com_Widget", false},
+		{"core group", nil, "ns1_cm__ConfigMap", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			checker := NewChecker(&fakeFetcher{resources: map[string]string{}}).WithResolver(c.resolver)
+			results, err := checker.CheckAll(context.Background(), []string{c.ref})
+			if err != nil {
+				t.Fatalf("CheckAll: %v", err)
+			}
+			if results[0].Status != "NotFound" {
+				t.Fatalf("status = %q, want NotFound", results[0].Status)
+			}
+			if results[0].VersionGuessed != c.want {
+				t.Errorf("VersionGuessed = %v, want %v", results[0].VersionGuessed, c.want)
+			}
+		})
+	}
+}
+
 // A CRD upgraded after startup (v1beta1 → v1) is cached at a version the
 // cluster no longer serves. Its NotFound triggers a discovery refresh like a
 // guessed version's does, and the re-poll at v1 resolves it. When the first

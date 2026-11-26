@@ -342,7 +342,7 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	if len(prs) > 0 && teardownFailure(reconcileFailedMsg, reconcileWaitingMsg) {
 		selfRemovalPath = p.parentBuildPath(ctx, kspec)
 	}
-	targets, finalized, prunedToVerify, selfRemovalOnly, err := p.filterPRs(ctx, owner, repo, event.InvolvedObject.Namespace, event.InvolvedObject.Name, inventorySet, buildFiles, scopeFailed, inventoryTrusted, selfRemovalPath, prs)
+	targets, finalized, prunedToVerify, selfRemovalOnly, err := p.filterPRs(ctx, owner, repo, event.InvolvedObject.Namespace, event.InvolvedObject.Name, sha, inventorySet, buildFiles, scopeFailed, inventoryTrusted, selfRemovalPath, prs)
 	if err != nil {
 		// Surface rate-limit + other unrecoverable GitHub errors so the
 		// webhook handler can classify them (rate_limited outcome). No PR
@@ -1273,6 +1273,13 @@ func (p *Processor) applyPRLabel(ctx context.Context, owner, repo string, prNumb
 		}
 	}
 	if err := p.commenter.SetPRLabels(ctx, owner, repo, prNumber, headSHA, agg); err != nil {
+		// Another replica is reconciling this PR's labels: expected with
+		// several replicas, and the returned error makes a later event retry.
+		if errors.Is(err, bridgegithub.ErrPRLabelsLocked) {
+			p.logger.Debug("PR label update deferred: another replica holds the label lock",
+				"owner", owner, "repo", repo, "pr", prNumber, "aggregate", string(agg))
+			return err
+		}
 		p.logger.Warn("PR label update failed",
 			"owner", owner, "repo", repo, "pr", prNumber, "aggregate", string(agg), "error", err.Error())
 		return err
@@ -1344,7 +1351,9 @@ func aggregatePRLabelOutcome(scopeOutcomes map[string]string) bridgegithub.Outco
 // only for the self-removal check — the returned set marks those PRs, which
 // get no normal report (see Process).
 // ns/name is the Kustomization scope, used to clean up a now-stale comment
-// when a PR no longer touches this inventory (see below).
+// when a PR no longer touches this inventory (see below). revision is the
+// analysed revision; prune attribution only reads prune Events of that
+// revision (see parsePrunedSubjects).
 //
 // Attribution (prTouchesInventory) is the load-bearing step: for each PR we
 // fetch its changed files, fetch each file's content (cached by blob SHA),
@@ -1369,7 +1378,7 @@ func aggregatePRLabelOutcome(scopeOutcomes map[string]string) bridgegithub.Outco
 // resources the PR added, and acting on it would erase the failure evidence),
 // and only via the cache-guarded RemoveComment — zero GitHub calls unless a
 // comment was actually recorded for this (PR, scope).
-func (p *Processor) filterPRs(ctx context.Context, owner, repo, ns, name string, inventory map[string]struct{}, buildFiles map[string]struct{}, scopeFailed bool, inventoryTrusted bool, selfRemovalPath string, prs []bridgegithub.PRInfo) ([]bridgegithub.PRInfo, int, []string, map[int]bool, error) {
+func (p *Processor) filterPRs(ctx context.Context, owner, repo, ns, name, revision string, inventory map[string]struct{}, buildFiles map[string]struct{}, scopeFailed bool, inventoryTrusted bool, selfRemovalPath string, prs []bridgegithub.PRInfo) ([]bridgegithub.PRInfo, int, []string, map[int]bool, error) {
 	var out []bridgegithub.PRInfo
 	var finalized int
 	// prunedToVerify accumulates the inventory IDs of resources that attributed
@@ -1383,7 +1392,7 @@ func (p *Processor) filterPRs(ctx context.Context, owner, repo, ns, name string,
 	// attributed by its removed resource even after the resource has left the
 	// inventory. Memoised + fetched only on first use, so non-deletion PRs pay
 	// nothing (see newPruneSetProvider).
-	pruneSet := p.newPruneSetProvider(ctx, ns, name)
+	pruneSet := p.newPruneSetProvider(ctx, ns, name, revision)
 	for _, pr := range prs {
 		if pr.Merged || pr.State == "closed" {
 			finalized++

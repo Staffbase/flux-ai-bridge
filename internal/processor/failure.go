@@ -28,6 +28,7 @@ import (
 	"time"
 
 	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
+	"github.com/staffbase/flux-ai-bridge/internal/config"
 	"github.com/staffbase/flux-ai-bridge/internal/readiness"
 	"gopkg.in/yaml.v3"
 )
@@ -147,10 +148,29 @@ func (p *Processor) fetchFailureContext(ctx context.Context, event eventv1.Event
 	//       LLM, especially when the pod has been replaced.
 	//    b) the sweep is also what step 4 uses to fetch logs; doing it once
 	//       at the top means we don't list pods twice.
+	//
+	//    With FAILURE_FETCH_LOGS_SCOPE=owned (the default) logs come only from
+	//    failing pods a workload in this Kustomization's inventory owns, so in
+	//    a shared namespace an unrelated app's logs never reach the prompt (or
+	//    an external LLM). The sweep then looks at every failing pod, as owned
+	//    ones may come after unrelated ones; `failing` itself — the pods the
+	//    events and the hard-failure signal use — stays the first
+	//    maxFailingPods, exactly as without the scope.
+	ownedLogs := p.cfg.FailureFetchLogs && p.cfg.FailureFetchLogsScope != config.LogsScopeNamespace
 	var failing []failingPod
 	if p.cfg.FailureFetchEvents || p.cfg.FailureFetchLogs {
-		failing = p.sweepFailingPods(ctx, namespaces)
+		limit := maxFailingPods
+		if ownedLogs {
+			limit = 0
+		}
+		failing = p.sweepFailingPods(ctx, namespaces, limit)
 	}
+	logPods := failing
+	withheldLogs := 0
+	if ownedLogs {
+		logPods, withheldLogs = p.ownedFailingPods(ctx, failing, statuses, podStatuses)
+	}
+	failing = failing[:min(len(failing), maxFailingPods)]
 	cutoffs := earliestFailingPodPerNamespace(failing)
 
 	// 4. Failing pod logs — rendered BEFORE events on purpose. Logs are the
@@ -168,7 +188,7 @@ func (p *Processor) fetchFailureContext(ctx context.Context, event eventv1.Event
 	//    If the pod has never crashed (no previous instance) the MCP server
 	//    returns an error; we fall back to the current container's logs.
 	if p.cfg.FailureFetchLogs {
-		for i, fp := range failing {
+		for i, fp := range logPods {
 			if i >= maxFailingPods {
 				break
 			}
@@ -195,6 +215,9 @@ func (p *Processor) fetchFailureContext(ctx context.Context, event eventv1.Event
 				logs = "<no log output>"
 			}
 			sections = append(sections, header+"\n\n"+promptFence("", logs))
+		}
+		if withheldLogs > 0 {
+			sections = append(sections, withheldLogsNote(withheldLogs))
 		}
 	}
 
@@ -681,6 +704,10 @@ type eventRecord struct {
 	} `yaml:"source"`
 	Metadata struct {
 		CreationTimestamp string `yaml:"creationTimestamp"`
+		// Annotations carry, on kustomize-controller's Events, the source
+		// revision the reconcile ran (kustomizeRevisionAnnotation); prune
+		// attribution uses it to ignore another revision's prune.
+		Annotations map[string]string `yaml:"annotations"`
 	} `yaml:"metadata"`
 	InvolvedObject struct {
 		Kind string `yaml:"kind"`
@@ -868,17 +895,22 @@ type failingPod struct {
 	// Events older than the earliest failing pod in a namespace describe a
 	// previous (replaced) pod and are dropped.
 	creationTimestamp string
+	// ownerRefs are the pod's metadata.ownerReferences, for the owned-logs
+	// scope (see ownedFailingPods).
+	ownerRefs []ownerReference
 }
 
-// sweepFailingPods lists pods in each swept namespace and selects up to
-// maxFailingPods that satisfy isFailingPod. Continues on per-namespace MCP
-// errors so a single broken namespace doesn't blackhole the whole analysis.
-func (p *Processor) sweepFailingPods(ctx context.Context, namespaces []string) []failingPod {
+// sweepFailingPods lists pods in each swept namespace and selects up to limit
+// pods that satisfy isFailingPod (limit <= 0: all of them). Continues on
+// per-namespace MCP errors so a single broken namespace doesn't blackhole the
+// whole analysis.
+func (p *Processor) sweepFailingPods(ctx context.Context, namespaces []string, limit int) []failingPod {
 	p.logger.Debug("failure context: pod sweep starting", "namespaces", namespaces)
+	full := func(n int) bool { return limit > 0 && n >= limit }
 	out := make([]failingPod, 0, maxFailingPods)
 	now := time.Now()
 	for _, ns := range namespaces {
-		if len(out) >= maxFailingPods {
+		if full(len(out)) {
 			break
 		}
 		body, err := p.mcp.ListKubernetesResources(ctx, "v1", "Pod", ns)
@@ -900,7 +932,7 @@ func (p *Processor) sweepFailingPods(ctx context.Context, namespaces []string) [
 		}
 		p.logger.Debug("failure context: pod list parsed", "namespace", ns, "total_pods", len(pods))
 		for _, pod := range pods {
-			if len(out) >= maxFailingPods {
+			if full(len(out)) {
 				break
 			}
 			container, reason, failing := isFailingPod(pod, now)
@@ -922,11 +954,99 @@ func (p *Processor) sweepFailingPods(ctx context.Context, namespaces []string) [
 				container:         container,
 				reason:            reason,
 				creationTimestamp: pod.Metadata.CreationTimestamp,
+				ownerRefs:         pod.Metadata.OwnerReferences,
 			})
 		}
 	}
 	p.logger.Debug("failure context: pod sweep complete", "failing_count", len(out))
 	return out
+}
+
+// ownedFailingPods keeps the failing pods whose logs FAILURE_FETCH_LOGS_SCOPE=
+// owned allows: those owned by a workload in this Kustomization's inventory
+// (statuses — the readiness rows, HelmRelease children included). Ownership
+// is resolved like the pod scan does it (resolvePodController: Pod →
+// ReplicaSet → Deployment; StatefulSet, DaemonSet and Job directly), plus one
+// hop Job → CronJob, as a CronJob's runs are never inventory entries
+// themselves. A pod the inventory lists by name counts too. A pod whose owner
+// can't be resolved (naked, a ReplicaSet lookup that failed, a Job read that
+// failed) is left out: fail closed, an unrelated app's logs must not reach the
+// prompt on a guess. Returns at most maxFailingPods pods and the number of
+// failing pods left out for ownership.
+func (p *Processor) ownedFailingPods(ctx context.Context, failing []failingPod, statuses, podStatuses []readiness.ResourceStatus) (owned []failingPod, withheld int) {
+	inventory := make(map[string]bool, len(statuses))
+	for _, r := range statuses {
+		inventory[r.Kind+"/"+r.Namespace+"/"+r.Name] = true
+	}
+	rsCache := map[string]string{}
+	jobOwners := map[string]string{}
+	for _, fp := range failing {
+		if !p.podOwnedByInventory(ctx, fp, inventory, podStatuses, rsCache, jobOwners) {
+			withheld++
+			p.logger.Debug("failure context: logs withheld, pod not owned by the inventory",
+				"pod", fp.namespace+"/"+fp.name)
+			continue
+		}
+		if len(owned) < maxFailingPods {
+			owned = append(owned, fp)
+		}
+	}
+	return owned, withheld
+}
+
+// podOwnedByInventory reports whether a workload in the inventory set
+// ("Kind/namespace/name") owns the failing pod. podStatuses supplies the
+// controller the pod scan already resolved; other pods (other namespaces, or
+// pods the scan didn't see) are resolved here. jobOwners caches a Job's
+// owner ("Kind/name", "" for none) by "namespace/job".
+func (p *Processor) podOwnedByInventory(ctx context.Context, fp failingPod, inventory map[string]bool, podStatuses []readiness.ResourceStatus, rsCache, jobOwners map[string]string) bool {
+	listed := func(kind, name string) bool { return inventory[kind+"/"+fp.namespace+"/"+name] }
+	if listed("Pod", fp.name) {
+		return true
+	}
+	ctrl := controllerFor(podStatuses, fp.namespace, fp.name)
+	if ctrl == "" {
+		ctrl = p.resolvePodController(ctx, podInfo{Metadata: podMetadata{
+			Name: fp.name, Namespace: fp.namespace, OwnerReferences: fp.ownerRefs,
+		}}, rsCache)
+	}
+	kind, name, ok := strings.Cut(ctrl, "/")
+	if !ok {
+		return false // naked pod: no owner
+	}
+	if listed(kind, name) {
+		return true
+	}
+	if kind != "Job" {
+		return false
+	}
+	key := fp.namespace + "/" + name
+	owner, cached := jobOwners[key]
+	if !cached {
+		body, err := p.mcp.GetKubernetesResource(ctx, "batch/v1", "Job", name, fp.namespace)
+		if err != nil {
+			// Not cached: the next pod of this Job retries.
+			p.logger.Debug("failure context: Job fetch failed; pod's owner unresolved",
+				"job", key, "error", err.Error())
+			return false
+		}
+		// replicaSetController reads any object's controller ownerReference.
+		if k, n := replicaSetController(body); k != "" {
+			owner = k + "/" + n
+		}
+		jobOwners[key] = owner
+	}
+	ownerKind, ownerName, ok := strings.Cut(owner, "/")
+	return ok && ownerKind == "CronJob" && listed(ownerKind, ownerName)
+}
+
+// withheldLogsNote tells the model that FAILURE_FETCH_LOGS_SCOPE=owned left
+// some failing pods' logs out, so it doesn't invent what they would show.
+func withheldLogsNote(n int) string {
+	return fmt.Sprintf("## Pod Logs — not included\n\n"+
+		"Logs of %d failing pod(s) in the swept namespaces were not fetched: no workload in this Kustomization's "+
+		"inventory owns them, or their owner could not be resolved. Their pod status and events may still appear; "+
+		"do not guess what their logs contain or blame them for this Kustomization without other evidence.", n)
 }
 
 // podInfo is the minimal projection of a Kubernetes Pod we need for failure

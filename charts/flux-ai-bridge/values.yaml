@@ -263,6 +263,12 @@ config:
     fetchFluxInstance: false
     # Fetch logs from up to 3 failing workloads' pods (last 100 lines each).
     fetchLogs: true
+    # Which failing pods' logs are fetched (FAILURE_FETCH_LOGS_SCOPE):
+    # "owned" (default) only pods owned by a workload in the Kustomization's
+    # inventory, so logs of unrelated apps in a shared namespace never reach
+    # the LLM; "namespace" any failing pod in the swept namespaces (the
+    # behaviour before this setting existed). Other values fail startup.
+    logsScope: owned
     # Fetch resource metrics for the failing workloads. Off by default —
     # raw CPU/mem numbers are hard for the LLM to interpret without context.
     fetchMetrics: false

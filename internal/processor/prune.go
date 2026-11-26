@@ -33,6 +33,11 @@ const (
 	pruneEventReasonSucceeded   = "ReconciliationSucceeded"
 )
 
+// kustomizeRevisionAnnotation is the Event annotation in which
+// kustomize-controller records the source revision a reconcile ran
+// (`<branch>@sha1:<sha>`). Older Flux versions don't set it.
+const kustomizeRevisionAnnotation = "kustomize.toolkit.fluxcd.io/revision"
+
 // pruneSetProvider lazily resolves the set of resources THIS Kustomization
 // removed in its recent reconcile(s), keyed by ssa "Subject" form
 // (`Kind/namespace/name`, or `Kind/name` for cluster-scoped). It is a func so
@@ -46,8 +51,10 @@ type pruneSetProvider func() map[string]struct{}
 //
 // ns is the Kustomization's namespace (where its Events live — flux-system in
 // the namespace==name convention) and ksName is the Kustomization name, used to keep only
-// events emitted on THIS Kustomization object.
-func (p *Processor) newPruneSetProvider(ctx context.Context, ns, ksName string) pruneSetProvider {
+// events emitted on THIS Kustomization object. revision is the revision under
+// analysis: a prune Event recorded for another revision is ignored (see
+// parsePrunedSubjects).
+func (p *Processor) newPruneSetProvider(ctx context.Context, ns, ksName, revision string) pruneSetProvider {
 	var cached map[string]struct{}
 	loaded := false
 	return func() map[string]struct{} {
@@ -72,7 +79,7 @@ func (p *Processor) newPruneSetProvider(ctx context.Context, ns, ksName string) 
 			}
 			return cached
 		}
-		cached = parsePrunedSubjects(parseEventList(body), ksName)
+		cached = parsePrunedSubjects(parseEventList(body), ksName, revision)
 		if len(cached) > 0 {
 			p.logger.Debug("prune attribution: pruned subjects collected",
 				"namespace", ns, "kustomization", ksName, "count", len(cached))
@@ -97,7 +104,17 @@ func (p *Processor) newPruneSetProvider(ctx context.Context, ns, ksName string) 
 // reconcile's prune; ties (equal timestamps) are unioned. Events with no
 // parseable timestamp (test fixtures / sparse rendering) sort as the zero time,
 // so a set with no timestamps at all still resolves to "all of them".
-func parsePrunedSubjects(events []eventRecord, ksName string) map[string]struct{} {
+//
+// The prune Event must also belong to the analysed revision. kustomize-controller
+// annotates its Events with the revision the reconcile ran
+// (kustomizeRevisionAnnotation); an Event whose annotation names another commit
+// is a different reconcile's prune — an older revision's, still inside the
+// retention window, or a newer one's that already ran — and is dropped before
+// the freshest is picked. An Event without the annotation (older Flux versions)
+// is kept, as is every Event when revision is empty. The commit tokens are
+// compared (see revisionSHA), case-insensitively, so `dev@sha1:<sha>` matches the
+// bare SHA the webhook hands to Process.
+func parsePrunedSubjects(events []eventRecord, ksName, revision string) map[string]struct{} {
 	type pruneEvent struct {
 		when     time.Time
 		subjects []string
@@ -145,6 +162,9 @@ func parsePrunedSubjects(events []eventRecord, ksName string) map[string]struct{
 		if e.ReportingComponent != kustomizeControllerComponent && e.Source.Component != kustomizeControllerComponent {
 			continue
 		}
+		if pruneEventOtherRevision(e, revision) {
+			continue // another reconcile's prune, not the analysed revision's
+		}
 		var subjects []string
 		for _, line := range strings.Split(e.Message, "\n") {
 			if subject, ok := prunedSubjectFromLine(line); ok {
@@ -170,6 +190,16 @@ func parsePrunedSubjects(events []eventRecord, ksName string) map[string]struct{
 		}
 	}
 	return out
+}
+
+// pruneEventOtherRevision reports whether e's revision annotation confidently
+// names a commit other than revision: both commit tokens are non-empty and
+// differ. A missing or unparseable annotation, or an empty revision, is not a
+// mismatch (same stance as revisionMismatch).
+func pruneEventOtherRevision(e eventRecord, revision string) bool {
+	got := revisionSHA(e.Metadata.Annotations[kustomizeRevisionAnnotation])
+	want := revisionSHA(revision)
+	return got != "" && want != "" && !strings.EqualFold(got, want)
 }
 
 // prunedSubjectFromLine extracts the Subject from a single ssa changeset line
@@ -249,7 +279,12 @@ func inventoryIDWasPruned(pruneSet pruneSetProvider, id string) bool {
 //     is preserved in the row message;
 //   - `Unknown` (a genuine MCP read error) → also kept lingering — we couldn't
 //     verify, so we don't green on it;
-//   - `NotFound` → treated as gone (consistent with the prune assertion), no row.
+//   - `NotFound` → treated as gone (consistent with the prune assertion), no row
+//     — unless the read used a guessed apiVersion (the kind isn't in MCP's
+//     discovery cache, see readiness.ResourceStatus.VersionGuessed). Such a
+//     NotFound may only mean the bridge asked for a version the cluster doesn't
+//     serve, so the resource was never really looked up: it is kept as an
+//     `Unknown` row "pruned but deletion unverified (kind not in discovery)".
 //
 // Known limitation: readiness.Checker cannot distinguish a real 404 from a
 // degraded "No resources found" (cold MCP discovery cache) — it maps both to
@@ -272,15 +307,21 @@ func (p *Processor) verifyTeardownComplete(ctx context.Context, prunedIDs []stri
 	rows, _ := p.checker.CheckAll(ctx, dedupeStrings(prunedIDs))
 	var lingering []readiness.ResourceStatus
 	for _, r := range rows {
-		if r.Status == "NotFound" {
+		if r.Status == "NotFound" && !r.VersionGuessed {
 			continue // gone — consistent with the prune event's deletion assertion
 		}
-		// Still present, or unverifiable (Unknown = MCP read error) → keep
-		// non-green. Always annotate so the row's purpose is clear, and preserve
-		// the observed kstatus status in the message.
+		// Still present, or unverifiable (Unknown = MCP read error, or a
+		// NotFound under a guessed apiVersion) → keep non-green. Always annotate
+		// so the row's purpose is clear, and preserve the observed kstatus
+		// status in the message.
 		observed := r.Status
 		note := "pruned but still present"
 		switch r.Status {
+		case "NotFound":
+			// Read at a guessed apiVersion: the NotFound doesn't prove the
+			// object is gone. Unknown renders ⚠️ like an MCP read error.
+			r.Status = "Unknown"
+			note = "pruned but deletion unverified (kind not in discovery)"
 		case "Unknown":
 			// Not presence — we just couldn't verify. Renders ⚠️, which is the
 			// right signal, so leave the status as-is with a distinct note.

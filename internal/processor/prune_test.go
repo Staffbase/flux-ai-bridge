@@ -129,7 +129,7 @@ func TestParsePrunedSubjects(t *testing.T) {
 	events[5].InvolvedObject.Name = "batch-jobs"
 	// events[5] deliberately leaves both component fields empty.
 
-	got := parsePrunedSubjects(events, "batch-jobs")
+	got := parsePrunedSubjects(events, "batch-jobs", "")
 	want := map[string]struct{}{
 		"CronJob/batch-jobs/nightly-cleanup": {},
 		"ConfigMap/batch-jobs/old-cm":        {},
@@ -168,7 +168,7 @@ func TestParsePrunedSubjects_ProgressingReason(t *testing.T) {
 		events[i].InvolvedObject.Name = "cluster"
 		events[i].Source.Component = "kustomize-controller"
 	}
-	got := parsePrunedSubjects(events, "cluster")
+	got := parsePrunedSubjects(events, "cluster", "")
 	if _, ok := got["Kustomization/flux-system/legacy-app"]; !ok {
 		t.Errorf("Progressing prune event not parsed; got %v", got)
 	}
@@ -197,7 +197,7 @@ func TestParsePrunedSubjects_OnlyNewestEvent(t *testing.T) {
 		mk("2026-06-18T07:00:00Z", "ConfigMap/app/stale-pruned deleted"), // older reconcile
 		mk("2026-06-18T07:30:00Z", "ConfigMap/app/fresh-pruned deleted"), // current reconcile
 	}
-	got := parsePrunedSubjects(events, "app")
+	got := parsePrunedSubjects(events, "app", "")
 	if _, ok := got["ConfigMap/app/fresh-pruned"]; !ok {
 		t.Errorf("newest prune subject missing; got %v", got)
 	}
@@ -214,9 +214,58 @@ func TestParsePrunedSubjects_OnlyNewestEvent(t *testing.T) {
 		mk("2026-06-18T07:30:00Z", "ConfigMap/app/a deleted"),
 		mk("2026-06-18T07:30:00Z", "ConfigMap/app/b deleted"),
 	}
-	gotTie := parsePrunedSubjects(tie, "app")
+	gotTie := parsePrunedSubjects(tie, "app", "")
 	if len(gotTie) != 2 {
 		t.Errorf("equal-timestamp prune events should union; got %v", gotTie)
+	}
+}
+
+// Prune Events carry the revision their reconcile ran. Only the analysed
+// revision's prune counts, even when another revision's prune is fresher; an
+// Event without the annotation (older Flux) is kept. The commit token is
+// compared, so `dev@sha1:<sha>` matches a bare (upper- or lower-case) SHA.
+func TestParsePrunedSubjects_BoundToAnalysedRevision(t *testing.T) {
+	const (
+		oldSHA = "1111111111111111111111111111111111111111"
+		curSHA = "2222222222222222222222222222222222222222"
+		newSHA = "3333333333333333333333333333333333333333"
+	)
+	mk := func(ts, revision, message string) eventRecord {
+		var e eventRecord
+		e.Type = "Normal"
+		e.Reason = "Progressing"
+		e.Source.Component = "kustomize-controller"
+		e.LastTimestamp = ts
+		e.Message = message
+		e.InvolvedObject.Kind = "Kustomization"
+		e.InvolvedObject.Name = "app"
+		if revision != "" {
+			e.Metadata.Annotations = map[string]string{kustomizeRevisionAnnotation: revision}
+		}
+		return e
+	}
+
+	// An older revision's prune, still inside the retention window, while the
+	// analysed revision pruned nothing: no subject may leak in.
+	stale := []eventRecord{mk("2026-06-18T07:00:00Z", "dev@sha1:"+oldSHA, "ConfigMap/app/old deleted")}
+	if got := parsePrunedSubjects(stale, "app", curSHA); len(got) != 0 {
+		t.Errorf("an older revision's prune seeded the set: %v", got)
+	}
+
+	// A newer revision's fresher prune doesn't hide the analysed revision's.
+	events := []eventRecord{
+		mk("2026-06-18T07:00:00Z", "dev@sha1:"+curSHA, "ConfigMap/app/current deleted"),
+		mk("2026-06-18T07:30:00Z", "dev@sha1:"+newSHA, "ConfigMap/app/newer deleted"),
+	}
+	got := parsePrunedSubjects(events, "app", strings.ToUpper(curSHA))
+	if _, ok := got["ConfigMap/app/current"]; !ok || len(got) != 1 {
+		t.Errorf("want only the analysed revision's subject, got %v", got)
+	}
+
+	// No annotation (older Flux): today's behaviour, the freshest prune.
+	legacy := []eventRecord{mk("2026-06-18T07:00:00Z", "", "ConfigMap/app/legacy deleted")}
+	if got := parsePrunedSubjects(legacy, "app", curSHA); len(got) != 1 {
+		t.Errorf("an Event without the revision annotation must be kept, got %v", got)
 	}
 }
 
@@ -257,6 +306,23 @@ metadata:
   namespace: batch-jobs
 `
 
+// annotatedEventsListYAML is eventsListYAML with the revision annotation
+// kustomize-controller sets on its Events.
+func annotatedEventsListYAML(involvedName, message, revision string) []byte {
+	return []byte("items:\n" +
+		"  - metadata:\n" +
+		"      annotations:\n" +
+		"        kustomize.toolkit.fluxcd.io/revision: " + revision + "\n" +
+		"    involvedObject:\n" +
+		"      kind: Kustomization\n" +
+		"      name: " + involvedName + "\n" +
+		"    type: Normal\n" +
+		"    reason: Progressing\n" +
+		"    source:\n" +
+		"      component: kustomize-controller\n" +
+		"    message: '" + message + "'\n")
+}
+
 func eventsListYAML(involvedName, message string) []byte {
 	return []byte("items:\n" +
 		"  - involvedObject:\n" +
@@ -267,6 +333,18 @@ func eventsListYAML(involvedName, message string) []byte {
 		"    source:\n" +
 		"      component: kustomize-controller\n" +
 		"    message: '" + message + "'\n")
+}
+
+// discoveredChecker returns a Checker whose resolver knows the kinds the prune
+// tests delete, as MCP discovery would. A pruned resource that reads NotFound
+// at a known version is verified gone; at a guessed one it isn't (see
+// verifyTeardownComplete).
+func discoveredChecker(f readiness.ResourceFetcher) *readiness.Checker {
+	return readiness.NewChecker(f).WithResolver(readiness.NewResolver([]readiness.VersionEntry{
+		{Group: "batch", Kind: "CronJob", Version: "v1"},
+		{Group: "kyverno.io", Kind: "ClusterPolicy", Version: "v1"},
+		{Group: "kustomize.toolkit.fluxcd.io", Kind: "Kustomization", Version: "v1"},
+	}))
 }
 
 func lastLabel(calls []labelCall, pr int) (bridgegithub.Outcome, bool) {
@@ -303,7 +381,7 @@ func TestProcess_AttributesPrunedDeletionPR(t *testing.T) {
 		PRLabelEnabled: true, PRAttributePrunes: true,
 		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
 	}
-	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+	proc := New(cfg, mcpMock, discoveredChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
 	event := eventv1.Event{
 		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "batch-jobs", Namespace: "flux-system"},
 		Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
@@ -350,7 +428,7 @@ func TestProcess_AttributesInPlaceResourceRemoval(t *testing.T) {
 		PRLabelEnabled: true, PRAttributePrunes: true,
 		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
 	}
-	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+	proc := New(cfg, mcpMock, discoveredChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
 	event := eventv1.Event{
 		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "kyverno", Namespace: "flux-system"},
 		Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
@@ -607,6 +685,53 @@ func TestProcess_DeletionPRNotAttributedWithoutPruneEvent(t *testing.T) {
 	}
 }
 
+// A prune Event recorded for an OLDER revision (still inside the Event
+// retention window) is not evidence that the analysed revision pruned
+// anything: the deletion PR stays unattributed. The same Event recorded for
+// the analysed revision attributes it.
+func TestProcess_PruneEventOfOtherRevisionNotAttributed(t *testing.T) {
+	const (
+		oldSHA = "1111111111111111111111111111111111111111"
+		curSHA = "2222222222222222222222222222222222222222"
+	)
+	run := func(eventRevision string) (bridgegithub.Outcome, bool) {
+		t.Helper()
+		mcpMock := &fakeMCPClient{
+			data: []byte(emptyInventoryKustomization),
+			lists: map[string][]byte{
+				"v1|Event|flux-system": annotatedEventsListYAML("batch-jobs", "CronJob/batch-jobs/nightly-cleanup deleted", "dev@sha1:"+eventRevision),
+			},
+		}
+		commenterMock := &fakeCommenter{
+			prNumber: 42,
+			prFiles: []bridgegithub.PRFile{
+				{Path: "apps/batch-jobs/base/nightly-cleanup-cj.yaml", BlobSHA: "cj-blob", Status: "removed"},
+			},
+			blobs: map[string][]byte{"cj-blob": []byte(deletedCronJobBlob)},
+		}
+		cfg := &config.Config{
+			GitHubRepo: "owner/repo", LLMProvider: "none",
+			PRLabelEnabled: true, PRAttributePrunes: true,
+			ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
+		}
+		proc := New(cfg, mcpMock, discoveredChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+		event := eventv1.Event{
+			InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "batch-jobs", Namespace: "flux-system"},
+			Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
+		}
+		if err := proc.Process(context.Background(), event, curSHA); err != nil {
+			t.Fatalf("Process() error: %v", err)
+		}
+		return lastLabel(commenterMock.labelCalls, 42)
+	}
+	if got, ok := run(oldSHA); ok {
+		t.Errorf("PR attributed by an older revision's prune Event; label=%q", got)
+	}
+	if got, ok := run(curSHA); !ok || got != bridgegithub.OutcomeSuccess {
+		t.Errorf("PR not attributed by the analysed revision's prune Event; label=%q (set=%v), want success", got, ok)
+	}
+}
+
 const deletedChildKustomizationBlob = `apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 metadata:
@@ -636,7 +761,7 @@ func TestProcess_AttributesKustomizationRemovalToParent(t *testing.T) {
 		PRLabelEnabled: true, PRAttributePrunes: true,
 		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
 	}
-	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+	proc := New(cfg, mcpMock, discoveredChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
 	// The event is the PARENT app-of-apps reconcile.
 	event := eventv1.Event{
 		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "cluster", Namespace: "flux-system"},
@@ -939,5 +1064,34 @@ metadata:
 	}
 	if got != bridgegithub.OutcomeWarning {
 		t.Errorf("mixed PR with finalizer-stuck pruned deletion label = %q, want warning", got)
+	}
+}
+
+// A pruned resource whose kind isn't in MCP discovery is read at a guessed
+// apiVersion. Its NotFound may only mean the cluster doesn't serve that
+// version, so the teardown is reported as unverified (Unknown, ⚠️) instead of
+// verified gone. The same NotFound at a version discovery knows is gone.
+func TestVerifyTeardownComplete_GuessedVersionNotFoundIsUnverified(t *testing.T) {
+	const id = "batch-jobs_nightly-cleanup_example.com_Widget"
+	mcpMock := &fakeMCPClient{} // every read: not found
+	proc := New(&config.Config{}, mcpMock, readiness.NewChecker(mcpMock), nil, &fakeCommenter{}, nil, nil, slog.Default())
+
+	rows := proc.verifyTeardownComplete(context.Background(), []string{id})
+	if len(rows) != 1 {
+		t.Fatalf("guessed-version NotFound must stay as an unverified row, got %v", rows)
+	}
+	if rows[0].Status != "Unknown" {
+		t.Errorf("status = %q, want Unknown", rows[0].Status)
+	}
+	if !strings.Contains(rows[0].Message, "pruned but deletion unverified (kind not in discovery)") {
+		t.Errorf("message = %q, want the kind-not-in-discovery note", rows[0].Message)
+	}
+
+	known := readiness.NewChecker(mcpMock).WithResolver(readiness.NewResolver([]readiness.VersionEntry{
+		{Group: "example.com", Kind: "Widget", Version: "v1"},
+	}))
+	proc = New(&config.Config{}, mcpMock, known, nil, &fakeCommenter{}, nil, nil, slog.Default())
+	if rows := proc.verifyTeardownComplete(context.Background(), []string{id}); len(rows) != 0 {
+		t.Errorf("NotFound at a discovered version is gone, want no rows, got %v", rows)
 	}
 }

@@ -478,6 +478,10 @@ spec:
               value: {{ .fetchMetrics | quote }}
             - name: FAILURE_FETCH_FLUX_INSTANCE
               value: {{ .fetchFluxInstance | quote }}
+            {{- with .logsScope }}
+            - name: FAILURE_FETCH_LOGS_SCOPE
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- $hmacName := include "flux-ai-bridge.hmacSecretName" . }}
             {{- if $hmacName }}

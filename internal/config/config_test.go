@@ -44,6 +44,7 @@ var configEnvVars = []string{
 	"DEDUPE_PR_REEVAL_MAX", "DEDUPE_REEVAL_FAILED_ONLY",
 	"READINESS_POD_QUIET_PERIOD", "READINESS_EXPAND_HELMRELEASES", "READINESS_INCLUDE_PODS",
 	"FAILURE_FETCH_EVENTS", "FAILURE_FETCH_FLUX_INSTANCE", "FAILURE_FETCH_LOGS", "FAILURE_FETCH_METRICS",
+	"FAILURE_FETCH_LOGS_SCOPE",
 	"COMMENT_FAILED_RESOURCES_ONLY", "COMMENT_INCLUDE_FOOTER", "COMMENT_INCLUDE_SUMMARY", "COMMENT_ON_SUCCESS",
 	"PR_ATTRIBUTE_PRUNES", "PR_REQUIRED_LABELS",
 	"PR_LABEL_ENABLED", "PR_LABEL_SUCCESS", "PR_LABEL_FAILED", "PR_LABEL_WARNING",
@@ -626,6 +627,32 @@ func TestLoad_InstanceID(t *testing.T) {
 		}
 		if !ok && (err == nil || !strings.Contains(err.Error(), "INSTANCE_ID")) {
 			t.Errorf("INSTANCE_ID=%q: err=%v, want rejected", id, err)
+		}
+	}
+}
+
+// FAILURE_FETCH_LOGS_SCOPE defaults to owned, so logs of unrelated apps in a
+// shared namespace stay out of the prompt; any value but owned/namespace is
+// rejected at startup.
+func TestLoad_FailureFetchLogsScope(t *testing.T) {
+	for raw, want := range map[string]string{
+		"":          config.LogsScopeOwned,
+		"owned":     config.LogsScopeOwned,
+		"namespace": config.LogsScopeNamespace,
+		" Owned ":   config.LogsScopeOwned,
+		"all":       "",
+		"pods":      "",
+	} {
+		setEnv(t, mergeEnv(baseClaudeEnv(), map[string]string{"FAILURE_FETCH_LOGS_SCOPE": raw}))
+		cfg, err := config.Load()
+		if want == "" {
+			if err == nil || !strings.Contains(err.Error(), "FAILURE_FETCH_LOGS_SCOPE") {
+				t.Errorf("FAILURE_FETCH_LOGS_SCOPE=%q: err=%v, want rejected", raw, err)
+			}
+			continue
+		}
+		if err != nil || cfg.FailureFetchLogsScope != want {
+			t.Errorf("FAILURE_FETCH_LOGS_SCOPE=%q: scope=%v err=%v, want %q", raw, cfg, err, want)
 		}
 	}
 }

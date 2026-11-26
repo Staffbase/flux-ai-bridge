@@ -51,17 +51,62 @@ items:
           restartCount: 7
 `
 
+// ownedCrashloopingPodListYAML is crashloopingPodListYAML with the pod owned
+// by ReplicaSet api-7d4f9b6c8 of Deployment api (apiReplicaSetYAML), so the
+// default owned logs scope fetches its logs.
+const ownedCrashloopingPodListYAML = `apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: Pod
+    metadata:
+      name: api-abc123
+      namespace: default
+      ownerReferences:
+        - apiVersion: apps/v1
+          kind: ReplicaSet
+          name: api-7d4f9b6c8
+          controller: true
+    status:
+      phase: Running
+      containerStatuses:
+        - name: api
+          state:
+            waiting:
+              reason: CrashLoopBackOff
+              message: "back-off 5m restarting failed container"
+          restartCount: 7
+`
+
+// apiReplicaSetYAML is the ReplicaSet behind ownedCrashloopingPodListYAML's pod.
+const apiReplicaSetYAML = `apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: api-7d4f9b6c8
+  namespace: default
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: api
+      controller: true
+`
+
 // failureFixture builds a Processor + statuses scoped to one namespace
 // (default) with one InProgress Deployment in the inventory and one
-// crashlooping pod in the namespace. fetchFailureContext should:
+// crashlooping pod of that Deployment in the namespace. fetchFailureContext
+// should:
 //   - trigger on the InProgress row even for info-severity events
 //   - sweep namespace `default` for events / pods
 //   - emit a Pod Logs section for api-abc123 with reason=CrashLoopBackOff
 func failureFixture(t *testing.T, mcp *fakeMCPClient, cfg *config.Config) (*Processor, []readiness.ResourceStatus) {
 	t.Helper()
 	mcp.lists = map[string][]byte{
-		"v1|Pod|default": []byte(crashloopingPodListYAML),
+		"v1|Pod|default": []byte(ownedCrashloopingPodListYAML),
 	}
+	if mcp.resources == nil {
+		mcp.resources = map[string][]byte{}
+	}
+	mcp.resources["apps/v1|ReplicaSet|api-7d4f9b6c8|default"] = []byte(apiReplicaSetYAML)
 
 	proc := New(cfg, mcp, readiness.NewChecker(mcp),
 		&fakeAnalyzer{}, &fakeCommenter{}, nil, nil, slog.Default())
@@ -230,6 +275,94 @@ func TestFetchFailureContext_FetchesEventsAndLogsOnError(t *testing.T) {
 	// Logs fetch hits MCP once with previous=true; succeeded so no fallback.
 	if len(mcp.logsCalled) != 1 || mcp.logsCalled[0] != "default/api-abc123/api/previous" {
 		t.Errorf("expected logs fetch for default/api-abc123/api/previous, got %v", mcp.logsCalled)
+	}
+}
+
+// sharedNamespacePod is one crashlooping pod in namespace apps, owned by
+// ownerKind/ownerName ("" for a naked pod).
+func sharedNamespacePod(name, ownerKind, ownerName string) string {
+	pod := "  - metadata:\n      name: " + name + "\n      namespace: apps\n"
+	if ownerKind != "" {
+		pod += "      ownerReferences:\n        - kind: " + ownerKind + "\n          name: " + ownerName + "\n          controller: true\n"
+	}
+	return pod + "    status:\n      phase: Running\n      containerStatuses:\n        - name: main\n          restartCount: 4\n" +
+		"          state:\n            waiting:\n              reason: CrashLoopBackOff\n"
+}
+
+// sharedNamespaceFixture is a namespace shared with another app: failing pods
+// of an unrelated Deployment and a naked pod come first, then a pod of the
+// inventory's Deployment web and a run of its CronJob nightly.
+func sharedNamespaceFixture(scope string) (*Processor, *fakeMCPClient, []readiness.ResourceStatus) {
+	owner := func(kind, name string) string {
+		return "metadata:\n  ownerReferences:\n    - kind: " + kind + "\n      name: " + name + "\n      controller: true\n"
+	}
+	mcp := &fakeMCPClient{
+		logs: "boom",
+		lists: map[string][]byte{"v1|Pod|apps": []byte("items:\n" +
+			sharedNamespacePod("other-abc", "ReplicaSet", "other-5c6d") +
+			sharedNamespacePod("naked", "", "") +
+			sharedNamespacePod("web-abc", "ReplicaSet", "web-7d4f") +
+			sharedNamespacePod("nightly-29000000-xyz", "Job", "nightly-29000000"))},
+		resources: map[string][]byte{
+			"apps/v1|ReplicaSet|other-5c6d|apps": []byte(owner("Deployment", "other")),
+			"apps/v1|ReplicaSet|web-7d4f|apps":   []byte(owner("Deployment", "web")),
+			"batch/v1|Job|nightly-29000000|apps": []byte(owner("CronJob", "nightly")),
+		},
+	}
+	cfg := &config.Config{FailureFetchEvents: true, FailureFetchLogs: true, FailureFetchLogsScope: scope}
+	proc := New(cfg, mcp, readiness.NewChecker(mcp), &fakeAnalyzer{}, &fakeCommenter{}, nil, nil, slog.Default())
+	statuses := []readiness.ResourceStatus{
+		{Kind: "Deployment", Namespace: "apps", Name: "web", Status: "InProgress"},
+		{Kind: "CronJob", Namespace: "apps", Name: "nightly", Status: "Current"},
+	}
+	return proc, mcp, statuses
+}
+
+// In a shared namespace the default owned scope sends only the logs of pods
+// the inventory's workloads own (a Deployment's pod, a CronJob's run); a
+// failing pod of an unrelated Deployment and a naked pod are left out, and the
+// prompt says so. Events are unchanged: they still cover the first failing
+// pods, whoever owns them.
+func TestFetchFailureContext_OwnedScopeExcludesUnrelatedPodLogs(t *testing.T) {
+	for _, scope := range []string{config.LogsScopeOwned, ""} {
+		proc, mcp, statuses := sharedNamespaceFixture(scope)
+		out, hard := proc.fetchFailureContext(context.Background(), eventv1.Event{Severity: eventv1.EventSeverityError}, statuses, nil)
+
+		want := []string{"apps/web-abc/main/previous", "apps/nightly-29000000-xyz/main/previous"}
+		if fmt.Sprint(mcp.logsCalled) != fmt.Sprint(want) {
+			t.Errorf("scope %q: logs fetched for %v, want only the owned pods %v", scope, mcp.logsCalled, want)
+		}
+		if strings.Contains(out, "other-abc (container") || strings.Contains(out, "naked (container") {
+			t.Errorf("scope %q: an unowned pod's logs reached the prompt:\n%s", scope, out)
+		}
+		if !strings.Contains(out, "## Pod Logs — not included") || !strings.Contains(out, "Logs of 2 failing pod(s)") {
+			t.Errorf("scope %q: missing the note on the 2 withheld pods:\n%s", scope, out)
+		}
+		if !hard {
+			t.Errorf("scope %q: failing pods must still count as hard failure evidence", scope)
+		}
+		wantEvents := []string{"Pod/apps/other-abc", "Pod/apps/naked", "Pod/apps/web-abc"}
+		if fmt.Sprint(mcp.workloadEventsCalls) != fmt.Sprint(wantEvents) {
+			t.Errorf("scope %q: workload events for %v, want unchanged %v", scope, mcp.workloadEventsCalls, wantEvents)
+		}
+	}
+}
+
+// FAILURE_FETCH_LOGS_SCOPE=namespace keeps the old behaviour: the first
+// failing pods in the namespace get their logs fetched, whoever owns them.
+func TestFetchFailureContext_NamespaceScopeFetchesAnyFailingPodLogs(t *testing.T) {
+	proc, mcp, statuses := sharedNamespaceFixture(config.LogsScopeNamespace)
+	out, _ := proc.fetchFailureContext(context.Background(), eventv1.Event{Severity: eventv1.EventSeverityError}, statuses, nil)
+
+	want := []string{"apps/other-abc/main/previous", "apps/naked/main/previous", "apps/web-abc/main/previous"}
+	if fmt.Sprint(mcp.logsCalled) != fmt.Sprint(want) {
+		t.Errorf("logs fetched for %v, want the first failing pods %v", mcp.logsCalled, want)
+	}
+	if strings.Contains(out, "not included") {
+		t.Errorf("namespace scope must not withhold logs:\n%s", out)
+	}
+	if mcp.resourceCalls != 0 {
+		t.Errorf("namespace scope must not resolve pod owners, got %d resource reads", mcp.resourceCalls)
 	}
 }
 
