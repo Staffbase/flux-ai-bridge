@@ -46,15 +46,15 @@ jobs:
       # pull request would be marked successful for another branch. Take the
       # dev label off fork pull requests first. A fork's own label event runs
       # with a read-only token: the removal fails there, and so does the run,
-      # before autodev.
+      # before autodev. Every page is read; a deleted fork counts as a fork.
       - name: Remove the dev label from fork pull requests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         shell: bash
         run: |
-          forks=$(gh pr list --repo "$REPO" --label dev --state open --limit 1000 \
-            --json number,isCrossRepository --jq '.[] | select(.isCrossRepository) | .number')
+          forks=$(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+            --jq '.[] | select(any(.labels[]; .name == "dev") and .head.repo.full_name != env.REPO) | .number')
           for pr in $forks; do
             echo "::warning::#$pr is from a fork; removing its dev label"
             gh api --method DELETE "repos/$REPO/issues/$pr/labels/dev" > /dev/null
