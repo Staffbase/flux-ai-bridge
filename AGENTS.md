@@ -77,9 +77,11 @@ that test code shells out to. Never rely on the kubeconfig current-context. The 
 This repository is open source under Apache 2.0 ([LICENSE](LICENSE)). Everything in it, and every commit, branch, PR
 and issue, is public.
 
-- **License header:** every source file starts with the Apache 2.0 header from [CONTRIBUTING.md](CONTRIBUTING.md),
-  copied unchanged, in the file's comment syntax: `//` for Go, `#` for Dockerfile, Makefile and shell. In Go, a
-  blank line separates it from the package doc comment, and a `//go:build` line follows the header.
+- **License header (mandatory):** every source file starts with the Apache 2.0 header from
+  [CONTRIBUTING.md](CONTRIBUTING.md), copied unchanged, in the file's comment syntax: `//` for Go, `#` for
+  Dockerfile, Makefile and shell. This includes every new file, test files too; a change that adds a source file
+  without the header is not done. In Go, a blank line separates it from the package doc comment, and a `//go:build`
+  line follows the header.
 - **Generic placeholders** in code, comments, tests, fixtures and docs: `<component>/<env>/<region>`, `web` / `api`,
   `dev` / `prod`, `r1` / `r2`, `example.com`. Do not use real service, cluster, region, registry or repository names,
   and use no customer or personal data.
