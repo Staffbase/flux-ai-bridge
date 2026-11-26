@@ -378,80 +378,147 @@ func assertCommentBody(t *testing.T, body string) {
 	}
 }
 
-// TestPipelineProducesRealGitHubComment verifies the bridge produced a
-// marker-bearing comment for the configured PR via the **real** Flux
-// reconcile pipeline — no synthetic webhook injection. The cluster's
-// Kustomization tracks `E2E_PODINFO_GIT_REF` (default `main`); when source-
-// controller picks up the branch's head commit, kustomize-controller
-// reconciles and Notification Controller forwards the event to the bridge,
-// which posts the comment.
+// TestPipelineProducesRealGitHubComment verifies the bridge comments on the
+// configured PR for its selected head, against the real GitHub API and the
+// real Flux reconcile of the PR branch. The cluster's Kustomization tracks
+// `E2E_PODINFO_GIT_REF`, which must deploy the PR head (the PR branch, or a
+// branch that merges it).
 //
-// Required env: E2E_REAL_GITHUB=1, GITHUB_TOKEN, GITHUB_REPO. Optional:
-// GITHUB_PR_NUMBER / GITHUB_PR_SHA (auto-discovered when unset).
+// Neither the comment nor the labels name the head, and the bridge writes
+// nothing for a head it already analysed or a state its comment already
+// shows. So the test controls the analysis: once the cluster applied the
+// head, it takes the App's marker comments as the baseline and deletes them,
+// clears the bridge's dedupe and comment state for the head (restart, plus
+// the Valkey keys with persistence), and sends the Flux event for the applied
+// revision. It then requires a marker comment from the configured App that
+// is not in the baseline. This also makes repeat runs on the same cluster
+// work.
 //
-// Repeat-run caveat: the bridge's in-memory dedupe persists across `make
-// e2e` invocations against the same long-running cluster, so a reconcile of
-// an already-analyzed SHA is skipped. Between repeat invocations, run
-// `make e2e-update` (or `make e2e-up`) to rollout-restart the bridge and clear
-// the cache, and delete the bridge's comment on the PR (or push a new commit):
-// an unchanged state doesn't rewrite an existing comment. Mock-mode coverage of the synthetic webhook path is
-// retained in TestPipelineProducesGitHubComment.
+// Required env: E2E_REAL_GITHUB=1, GITHUB_TOKEN (allowed to delete the
+// App's comments on the PR), GITHUB_REPO. Optional: GITHUB_PR_NUMBER /
+// GITHUB_PR_SHA (auto-discovered when unset), GITHUB_APP_ID (read from the
+// bridge Secret when unset).
 func TestPipelineProducesRealGitHubComment(t *testing.T) {
 	if !realGitHub {
 		t.Skip("E2E_REAL_GITHUB=1 not set; skipping real-GitHub pipeline test")
 	}
 	cfg := requireRealGitHubEnv(t)
+	appID := bridgeAppID(t)
 
-	// No synthetic webhook, no comment deletion, no mock-llm reset. The
-	// real Flux pipeline drives the bridge naturally — we just poll
-	// GitHub for the bridge marker on the configured PR.
-	//
-	// The comment carries no head SHA, so tie it to the selected head
-	// another way: it must be written after that head commit was made, and,
-	// when GITHUB_APP_ID is set, by that App. A leftover comment for an
-	// earlier head (or from another bridge) doesn't count.
-	headDate, err := lookupCommitDate(cfg, cfg.sha)
+	// The analysis below must be of the selected head: wait until Flux
+	// applied it (the head itself, or a merge commit with it as a parent).
+	revision := waitAppliedHead(t, cfg)
+
+	comments, err := listPRComments(cfg)
 	if err != nil {
-		t.Fatalf("look up commit %s in %s: %v", cfg.sha, cfg.repo, err)
+		t.Fatalf("list comments on PR #%d: %v", cfg.prNumber, err)
 	}
-	appID := os.Getenv("GITHUB_APP_ID")
+	baseline := map[int64]bool{}
+	for _, c := range comments {
+		if id, ok := bridgeCommentID(c, appID); ok {
+			baseline[id] = true
+			if err := deleteComment(cfg, id); err != nil {
+				t.Fatalf("delete the App's comment %d on PR #%d (GITHUB_TOKEN needs write access to the PR's comments): %v",
+					id, cfg.prNumber, err)
+			}
+		}
+	}
+	resetBridgeHead(t, cfg)
+
+	resp := postWebhook(t, kustomizationEvent("podinfo", namespace, "ReconciliationSucceeded",
+		"Applied revision: "+revision, revision))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d", resp.StatusCode)
+	}
+
 	deadline := time.Now().Add(pipelineDeadline())
 	var found map[string]any
-	var stale int
-	for time.Now().Before(deadline) {
+	for found == nil && time.Now().Before(deadline) {
 		comments, err := listPRComments(cfg)
 		if err != nil {
 			t.Logf("listPRComments: %v (will retry)", err)
-		} else {
-			stale = 0
-			for _, c := range comments {
-				body, _ := c["body"].(string)
-				if !strings.Contains(body, "<!-- flux-ai-bridge") {
-					continue
-				}
-				if !commentByApp(c, appID) || !commentWrittenSince(c, headDate) {
-					stale++
-					continue
-				}
+		}
+		for _, c := range comments {
+			if id, ok := bridgeCommentID(c, appID); ok && !baseline[id] {
 				found = c
 				break
 			}
 		}
-		if found != nil {
-			break
+		if found == nil {
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(2 * time.Second)
 	}
 	if found == nil {
-		t.Fatalf("no bridge comment with marker for head %s on PR #%d in repo %s within %s "+
-			"(%d marker comment(s) ignored: written before the head commit, or not by App %q) — "+
-			"if the cluster is long-running and the PR head SHA was already analyzed, "+
-			"rollout-restart the bridge (`make e2e-update`) to clear in-memory dedupe, and delete its PR comment (an unchanged state isn't re-posted)",
-			cfg.sha, cfg.prNumber, cfg.repo, pipelineDeadline(), stale, appID)
+		t.Fatalf("App %s posted no new bridge comment for head %s on PR #%d in %s within %s (%d earlier comment(s) deleted as the baseline)",
+			appID, cfg.sha, cfg.prNumber, cfg.repo, pipelineDeadline(), len(baseline))
 	}
 
 	body, _ := found["body"].(string)
 	assertCommentBody(t, body)
+}
+
+// bridgeAppID returns the GitHub App ID the bridge posts as: GITHUB_APP_ID,
+// or the one in the bridge's credentials Secret.
+func bridgeAppID(t *testing.T) string {
+	t.Helper()
+	if id := strings.TrimSpace(os.Getenv("GITHUB_APP_ID")); id != "" {
+		return id
+	}
+	id := strings.TrimSpace(readBridgeSecretKey(t, "flux-ai-bridge-e2e-creds", "GITHUB_APP_ID"))
+	if id == "" {
+		t.Fatal("no GitHub App ID: set GITHUB_APP_ID, or check the flux-ai-bridge-e2e-creds Secret")
+	}
+	return id
+}
+
+// waitAppliedHead waits until the podinfo Kustomization applied the PR head
+// cfg.sha, or a commit whose parents include it, and returns that revision.
+func waitAppliedHead(t *testing.T, cfg realGHConfig) string {
+	t.Helper()
+	deadline := time.Now().Add(pipelineDeadline())
+	for {
+		revision := kubectlJSONPath(t, "kustomization", "podinfo", "{.status.lastAppliedRevision}")
+		applied := revision[strings.LastIndex(revision, ":")+1:]
+		if strings.EqualFold(applied, cfg.sha) {
+			return revision
+		}
+		if applied != "" {
+			parents, err := lookupCommitParents(cfg, applied)
+			if err != nil {
+				t.Logf("look up commit %s: %v (will retry)", applied, err)
+			}
+			for _, p := range parents {
+				if strings.EqualFold(p, cfg.sha) {
+					return revision
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("podinfo applied %q, which is neither PR #%d's head %s nor a merge of it, within %s: "+
+				"point E2E_PODINFO_GIT_REF at the PR branch", revision, cfg.prNumber, cfg.sha, pipelineDeadline())
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// resetBridgeHead makes the bridge analyse PR cfg.prNumber at cfg.sha again
+// and post its comment afresh: a restart clears the in-memory dedupe mark and
+// comment cache, and with persistence the same records go from Valkey.
+func resetBridgeHead(t *testing.T, cfg realGHConfig) {
+	t.Helper()
+	if persistenceEnabled(t) {
+		valkeyExec(t, "DEL",
+			prDedupeKey(namespace, "podinfo", cfg.prNumber, cfg.sha),
+			fmt.Sprintf("flux-ai-bridge:fetchcache:last-comment:%s/%d/%s/podinfo", cfg.repo, cfg.prNumber, namespace))
+	}
+	rolloutRestartBridge(t)
+	if err := rebuildPortForward(t); err != nil {
+		t.Fatalf("port-forward after restart: %v", err)
+	}
+	if !waitHealthy(60 * time.Second) {
+		t.Fatal("bridge did not become healthy within 60s of restart")
+	}
 }
 
 type realGHConfig struct {
@@ -539,54 +606,68 @@ var githubClient = &http.Client{
 	},
 }
 
-// lookupCommitDate returns the committer date of commit sha via
+// lookupCommitParents returns the parent SHAs of commit sha via
 // GET /commits/{sha}.
-func lookupCommitDate(cfg realGHConfig, sha string) (time.Time, error) {
+func lookupCommitParents(cfg realGHConfig, sha string) ([]string, error) {
 	url := fmt.Sprintf("%s/repos/%s/commits/%s", cfg.apiURL, cfg.repo, sha)
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := githubClient.Do(req)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("get commit: %w", err)
+		return nil, fmt.Errorf("get commit: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return time.Time{}, fmt.Errorf("GitHub returned %s", resp.Status)
+		return nil, fmt.Errorf("GitHub returned %s", resp.Status)
 	}
 	var commit struct {
-		Commit struct {
-			Committer struct {
-				Date time.Time `json:"date"`
-			} `json:"committer"`
-		} `json:"commit"`
+		Parents []struct {
+			Sha string `json:"sha"`
+		} `json:"parents"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&commit); err != nil {
-		return time.Time{}, fmt.Errorf("decode commit response: %w", err)
+		return nil, fmt.Errorf("decode commit response: %w", err)
 	}
-	if commit.Commit.Committer.Date.IsZero() {
-		return time.Time{}, errors.New("commit response has no committer date")
+	parents := make([]string, 0, len(commit.Parents))
+	for _, p := range commit.Parents {
+		parents = append(parents, p.Sha)
 	}
-	return commit.Commit.Committer.Date, nil
+	return parents, nil
 }
 
-// commentWrittenSince reports whether an issue comment was created or last
-// updated at or after t.
-func commentWrittenSince(c map[string]any, t time.Time) bool {
-	raw, _ := c["updated_at"].(string)
-	updated, err := time.Parse(time.RFC3339, raw)
-	return err == nil && !updated.Before(t)
-}
-
-// commentByApp reports whether an issue comment was posted by the GitHub App
-// appID. An empty appID accepts any author.
-func commentByApp(c map[string]any, appID string) bool {
-	if appID == "" {
-		return true
+// bridgeCommentID returns the ID of an issue comment when it carries the
+// bridge marker and was posted by the GitHub App appID.
+func bridgeCommentID(c map[string]any, appID string) (int64, bool) {
+	body, _ := c["body"].(string)
+	if !strings.Contains(body, "<!-- flux-ai-bridge") {
+		return 0, false
 	}
 	app, _ := c["performed_via_github_app"].(map[string]any)
-	id, ok := app["id"].(float64)
-	return ok && strconv.FormatInt(int64(id), 10) == strings.TrimSpace(appID)
+	appNum, ok := app["id"].(float64)
+	if !ok || strconv.FormatInt(int64(appNum), 10) != appID {
+		return 0, false
+	}
+	id, ok := c["id"].(float64)
+	return int64(id), ok
+}
+
+// deleteComment deletes issue comment id via DELETE /issues/comments/{id}. A
+// comment that is already gone counts as deleted.
+func deleteComment(cfg realGHConfig, id int64) error {
+	url := fmt.Sprintf("%s/repos/%s/issues/comments/%d", cfg.apiURL, cfg.repo, id)
+	req, _ := http.NewRequest(http.MethodDelete, url, nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := githubClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("GitHub returned %s", resp.Status)
+	}
+	return nil
 }
 
 // lookupPRHeadSHA fetches a specific PR's head SHA via GET /pulls/{number}.

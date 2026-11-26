@@ -2530,6 +2530,137 @@ func TestSetPRLabels_RenamedLabelReappliesAtSameHead(t *testing.T) {
 	}
 }
 
+// labelOpsMux records each label call on PR 42 as "add <names>" or
+// "remove <name>"; a remove of a name in failRemove answers 500.
+func labelOpsMux(mu *sync.Mutex, ops *[]string, failRemove map[string]bool) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/labels", func(w http.ResponseWriter, r *http.Request) {
+		var names []string
+		_ = json.NewDecoder(r.Body).Decode(&names)
+		mu.Lock()
+		*ops = append(*ops, "add "+strings.Join(names, ","))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]any{})
+	})
+	mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/labels/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/api/v3/repos/owner/repo/issues/42/labels/")
+		mu.Lock()
+		defer mu.Unlock()
+		*ops = append(*ops, "remove "+name)
+		if failRemove[name] {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	return mux
+}
+
+// After a label rename, the next reconcile removes the old name the bridge
+// applied: the outcome record names the labels it was written under.
+func TestSetPRLabels_RenameRemovesRetiredLabel(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		ops []string
+	)
+	shared := fetchcache.NewLRU(64) // stands for Redis across a restart
+	ctx := context.Background()
+
+	before := newCommenterWithOptions(t, labelOpsMux(&mu, &ops, nil), bridgegithub.Options{Cache: shared})
+	if err := before.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("before rename: %v", err)
+	}
+	mu.Lock()
+	ops = nil
+	mu.Unlock()
+
+	after := newCommenterWithOptions(t, labelOpsMux(&mu, &ops, nil), bridgegithub.Options{Cache: shared, PRLabelSuccess: "deploy-ok"})
+	if err := after.SetPRLabels(ctx, "owner", "repo", 42, "h2", bridgegithub.OutcomeFailure); err != nil {
+		t.Fatalf("after rename: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	got := strings.Join(ops, "; ")
+	if !strings.Contains(got, "remove "+bridgegithub.DefaultPRLabelSuccess) {
+		t.Fatalf("a failure after renaming the success label must remove the old %s; got [%s]",
+			bridgegithub.DefaultPRLabelSuccess, got)
+	}
+	if !strings.Contains(got, "add "+bridgegithub.DefaultPRLabelFailure) || !strings.Contains(got, "remove deploy-ok") {
+		t.Fatalf("the failure reconcile itself must still run; got [%s]", got)
+	}
+}
+
+// Only the label the recorded outcome applied is retired. The other old names
+// were removed by that reconcile, so if one is on the PR now, someone else put
+// it there (it may be in use for something else after the rename).
+func TestSetPRLabels_RenameKeepsLabelsTheBridgeDidNotApply(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		ops []string
+	)
+	shared := fetchcache.NewLRU(64)
+	ctx := context.Background()
+
+	before := newCommenterWithOptions(t, labelOpsMux(&mu, &ops, nil), bridgegithub.Options{Cache: shared})
+	if err := before.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("before rename: %v", err)
+	}
+	mu.Lock()
+	ops = nil
+	mu.Unlock()
+
+	after := newCommenterWithOptions(t, labelOpsMux(&mu, &ops, nil), bridgegithub.Options{Cache: shared, PRLabelFailure: "deploy-broken"})
+	if err := after.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("after rename: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	got := strings.Join(ops, "; ")
+	if strings.Contains(got, "remove "+bridgegithub.DefaultPRLabelFailure) {
+		t.Fatalf("the old failure name was never applied by the recorded outcome and must stay; got [%s]", got)
+	}
+	if strings.Contains(got, "remove "+bridgegithub.DefaultPRLabelSuccess) {
+		t.Fatalf("the success name is still configured and must not be removed; got [%s]", got)
+	}
+}
+
+// A failed removal of the retired label keeps the old record, so the next
+// reconcile still knows the old name and retries.
+func TestSetPRLabels_RetiredLabelRemovalRetries(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		ops []string
+	)
+	shared := fetchcache.NewLRU(64)
+	ctx := context.Background()
+
+	before := newCommenterWithOptions(t, labelOpsMux(&mu, &ops, nil), bridgegithub.Options{Cache: shared})
+	if err := before.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("before rename: %v", err)
+	}
+
+	failing := newCommenterWithOptions(t, labelOpsMux(&mu, &ops, map[string]bool{bridgegithub.DefaultPRLabelSuccess: true}),
+		bridgegithub.Options{Cache: shared, PRLabelSuccess: "deploy-ok"})
+	if err := failing.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err == nil {
+		t.Fatal("a failing removal of the retired label must return an error")
+	}
+	mu.Lock()
+	ops = nil
+	mu.Unlock()
+
+	retry := newCommenterWithOptions(t, labelOpsMux(&mu, &ops, nil), bridgegithub.Options{Cache: shared, PRLabelSuccess: "deploy-ok"})
+	if err := retry.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	got := strings.Join(ops, "; ")
+	if !strings.Contains(got, "remove "+bridgegithub.DefaultPRLabelSuccess) || !strings.Contains(got, "add deploy-ok") {
+		t.Fatalf("the retry must remove the retired %s and add deploy-ok; got [%s]", bridgegithub.DefaultPRLabelSuccess, got)
+	}
+}
+
 // TestSetPRLabels_RemoveLabelNotFoundIsSwallowed pins the idempotency
 // contract: a 404 on RemoveLabelForIssue means "label wasn't on the PR" —
 // the next state-transition replay must not trip on it.

@@ -142,9 +142,10 @@ export GITHUB_APP_INSTALLATION_ID=<...>
 export GITHUB_APP_PRIVATE_KEY="$(cat ~/Downloads/flux-ai-bridge.*.pem)"
 # make e2e-up errors out if any of the three are missing.
 
-# Required by `make e2e` (not the bridge): the test reads the posted comment
-# back through the API with this token. Any token that can read the repo's
-# PRs and comments works, e.g. `export GITHUB_TOKEN=$(gh auth token)`.
+# Required by `make e2e` (not the bridge): the test deletes the App's earlier
+# comment on the PR and reads the new one back with this token. A token that
+# can read the repo's PRs and delete comments on them works, e.g. the repo
+# owner's `export GITHUB_TOKEN=$(gh auth token)`.
 export GITHUB_TOKEN=<token>
 
 make e2e-down      # if a previous cluster is around
@@ -167,12 +168,15 @@ What happens:
    - **the podinfo Kustomization** with `sourceRef: flux-ai-bridge-podinfo` and `path: ./e2e/podinfo-kustomize` (or `E2E_PODINFO_PATH`)
    - The bridge's own chart code keeps coming from the in-cluster git-server — only the test workload moves to GitHub.
 2. `make e2e` runs the suite. `TestPipelineProducesGitHubComment` is **skipped** (it would target the mock); `TestPipelineProducesRealGitHubComment` becomes active.
-3. The test relies on the **real Flux reconcile pipeline** — source-controller fetches the configured branch, kustomize-controller reconciles, Notification Controller forwards the event to the bridge, which posts the comment. The test simply:
+3. The test relies on the **real Flux reconcile** of the PR branch (source-controller fetches the configured branch, kustomize-controller applies it) and then controls the bridge's analysis of it. Neither the comment nor the labels name the PR head, and the bridge writes nothing for a head it already analysed or a state its comment already shows, so a comment that is merely there proves nothing about this head. The test:
    - auto-discovers the open PR (or uses `GITHUB_PR_NUMBER` / `GITHUB_PR_SHA` when pinned)
-   - polls `GET /repos/${GITHUB_USER}/${GH_REPO}/issues/${PR}/comments` until the pipeline deadline (60 s; 3 min with a real LLM, 4 min for the broken workload)
-   - asserts a comment with the `<!-- flux-ai-bridge` marker exists and has the expected structure. The comment counts only when it was written at or after the PR head commit's committer date and, when `GITHUB_APP_ID` is set, posted by that App, so a leftover comment for an earlier head doesn't pass the test
+   - waits until the podinfo Kustomization applied the PR head (the head itself, or a merge commit with the head as a parent)
+   - takes the App's `<!-- flux-ai-bridge` marker comments on the PR as the baseline and deletes them (the App ID comes from `GITHUB_APP_ID`, or else from the bridge's Secret)
+   - clears the bridge's state for that head: a rollout restart (in-memory dedupe and comment cache) and, with `E2E_DEDUPE_PERSISTENCE=1`, the head's dedupe and comment records in Valkey
+   - sends the bridge the Flux event for the applied revision
+   - polls `GET /repos/${GITHUB_USER}/${GH_REPO}/issues/${PR}/comments` until the pipeline deadline (60 s; 3 min with a real LLM, 4 min for the broken workload) for a marker comment from that App that is not in the baseline, and checks its structure
 
-   No prior-comment deletion, no mock-llm reset — those were mock-mode artifacts. Mock-mode coverage of the synthetic-webhook path is retained in `TestPipelineProducesGitHubComment`.
+   Mock-mode coverage of the synthetic-webhook path is retained in `TestPipelineProducesGitHubComment`.
 
 When it passes, refresh the PR in your browser — you'll see the bridge's
 comment.
@@ -183,12 +187,7 @@ comment.
 
 The bridge's comment marker is idempotent: a later analysis with the same cluster state leaves the existing comment alone, and a changed state replaces it (create the new comment, then delete the old one, keyed on the per-Kustomization marker), so the PR never collects duplicates.
 
-**Repeat-run caveat:** the bridge's in-memory dedupe persists across `make e2e` invocations against the same long-running cluster. The PR head SHA doesn't change between runs, so the bridge skips reprocessing on the second `make e2e` and the test would see only the comment from the first run. A restart clears the dedupe, but with an unchanged state the bridge still keeps the old comment, and the test passes against it. To force a fresh post, delete the bridge's comment on the PR first (or push a new commit to the PR branch), then:
-
-```bash
-make e2e-update  # rebuilds + rollout-restarts the bridge → clears in-memory dedupe
-make e2e
-```
+**Repeat runs:** `make e2e` can run again on the same cluster. Each run deletes the App's comment on the PR and clears the bridge's state for the head (step 3 above), so the bridge posts its comment afresh. After a code edit, run `make e2e-update` first to load the new image.
 
 For a totally clean slate, `make e2e-down && make e2e-up && make e2e`.
 

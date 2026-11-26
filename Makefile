@@ -828,7 +828,9 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	@#      timestamp, one after the other, and wait until each has handled
 	@#      it, so the release runs the new chart before step 5 restarts it
 	@#      (instead of waiting for their poll intervals, 30s / 1m). Fail
-	@#      when the HelmRelease isn't Ready afterwards (failed upgrade).
+	@#      unless each reached the git-server's snapshot commit: the source
+	@#      artifact, the chart built from it, and a Ready HelmRelease whose
+	@#      latest release deployed that chart version.
 	@#   5. Force a deployment rollout. The image tag is unchanged and the
 	@#      chart sets pullPolicy=Never, so the kubelet has no signal that
 	@#      anything changed unless we tell it to recreate the pods.
@@ -854,15 +856,34 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	@# Reconcile source → chart → release in order and wait for each to
 	@# handle the request, so the restart below runs against the Deployment
 	@# from the new chart and values, not the one before Flux applied them.
-	@# A release that handled the request but failed the upgrade isn't Ready
-	@# (kubectl wait also checks the condition's observedGeneration): stop
-	@# there instead of restarting the old Deployment.
+	@# Handling a request isn't succeeding (a failed fetch, build or upgrade
+	@# keeps the previous artifact or release), so each step is checked
+	@# against the commit the git-server serves: the GitRepository artifact
+	@# is that commit, the HelmChart was built from it (reconcileStrategy
+	@# Revision appends the SHA's first 12 characters to the chart version),
+	@# and the HelmRelease is Ready (kubectl wait also checks the condition's
+	@# observedGeneration, so the values are current) with that chart version
+	@# as its latest, deployed release. Otherwise stop before the restart.
 	@echo "==> Reconciling the chart source, the HelmChart and the bridge HelmRelease"
 	@set -e; ts=$$(date +%s); \
+	fail() { echo "ERROR: $$2" >&2; \
+	  kubectl --context $(CONTEXT) -n "$${1%%/*}" get "$${1#*/}" \
+	    -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' >&2 || true; \
+	  exit 1; }; \
+	sha=$$(kubectl --context $(CONTEXT) -n git-server exec deployment/git-server -c git-http -- \
+	  git -C /serve/flux-ai-bridge.git rev-parse 'e2e-test^{commit}'); \
+	[ -n "$$sha" ] || { echo "ERROR: the git-server serves no e2e-test commit" >&2; exit 1; }; \
+	short=$$(printf '%.12s' "$$sha"); \
+	echo "    git-server snapshot: $$sha"; \
 	kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
 	  gitrepository/flux-ai-bridge-chart reconcile.fluxcd.io/requestedAt=$$ts; \
 	kubectl --context $(CONTEXT) -n flux-system wait gitrepository/flux-ai-bridge-chart \
 	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=2m; \
+	gitrev=$$(kubectl --context $(CONTEXT) -n flux-system get gitrepository/flux-ai-bridge-chart \
+	  -o jsonpath='{.status.artifact.revision}'); \
+	case "$$gitrev" in *":$$sha") ;; \
+	  *) fail flux-system/gitrepository/flux-ai-bridge-chart \
+	    "GitRepository flux-ai-bridge-chart is at '$$gitrev', not at the snapshot $$sha:";; esac; \
 	chart=$$(kubectl --context $(CONTEXT) -n flux-system get helmrelease/flux-ai-bridge \
 	  -o jsonpath='{.status.helmChart}'); \
 	chart="$${chart:-flux-system/flux-system-flux-ai-bridge}"; \
@@ -870,17 +891,24 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	  helmchart/"$${chart#*/}" reconcile.fluxcd.io/requestedAt=$$ts; \
 	kubectl --context $(CONTEXT) -n "$${chart%%/*}" wait helmchart/"$${chart#*/}" \
 	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=2m; \
+	built=$$(kubectl --context $(CONTEXT) -n "$${chart%%/*}" get helmchart/"$${chart#*/}" \
+	  -o jsonpath='{.status.observedSourceArtifactRevision} {.status.artifact.revision}'); \
+	chartrev="$${built#* }"; \
+	case "$$built" in "$$gitrev "*"+$$short") ;; \
+	  *) fail "$${chart%%/*}/helmchart/$${chart#*/}" \
+	    "HelmChart $$chart has '$$built' (source revision, chart version), not a chart built from $$gitrev:";; esac; \
 	kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
 	  helmrelease/flux-ai-bridge reconcile.fluxcd.io/requestedAt=$$ts; \
 	kubectl --context $(CONTEXT) -n flux-system wait helmrelease/flux-ai-bridge \
 	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=10m; \
 	kubectl --context $(CONTEXT) -n flux-system wait helmrelease/flux-ai-bridge \
-	  --for=condition=Ready --timeout=1m || { \
-	  echo "ERROR: HelmRelease flux-ai-bridge is not Ready after the reconcile, so the chart change wasn't applied:" >&2; \
-	  kubectl --context $(CONTEXT) -n flux-system get helmrelease/flux-ai-bridge \
-	    -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' >&2; \
-	  exit 1; \
-	}
+	  --for=condition=Ready --timeout=1m || fail flux-system/helmrelease/flux-ai-bridge \
+	  "HelmRelease flux-ai-bridge is not Ready after the reconcile, so the chart change wasn't applied:"; \
+	release=$$(kubectl --context $(CONTEXT) -n flux-system get helmrelease/flux-ai-bridge \
+	  -o jsonpath='{.status.history[0].chartVersion} {.status.history[0].status}'); \
+	[ "$$release" = "$$chartrev deployed" ] || fail flux-system/helmrelease/flux-ai-bridge \
+	  "HelmRelease flux-ai-bridge's latest release is '$$release' (chart version, status), not '$$chartrev deployed':"; \
+	echo "    deployed chart $$chartrev"
 	@# Also re-reconcile the test workload Kustomization so edits under
 	@# e2e/podinfo-kustomize/ land immediately (and a fresh Flux event
 	@# fires at the bridge for downstream test flows that watch for one).

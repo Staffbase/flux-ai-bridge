@@ -1695,6 +1695,11 @@ const (
 //   - OutcomeNone    → remove ALL three (the PR no longer has any attributed
 //     Kustomization — clear stale state)
 //
+// A renamed label (PR_LABEL_*) is cleaned up too: the outcome record names the
+// labels it was written under, so when the label its outcome applied is no
+// longer configured, that old name is removed first. Without a record (the
+// in-memory cache after a restart, or an expired entry) the old name stays.
+//
 // Colliding names are safe: a name in the add set is never removed, so
 // configuring labelWarning == labelFailure makes a warning apply the failed
 // label (and a merge gate keyed on it blocks) WITHOUT the add/remove pair
@@ -1815,6 +1820,19 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 	}
 	remove = dedupeNonEmpty(remove, addSet)
 
+	// A label renamed since the record was written: remove the old name the
+	// bridge applied. This runs before the record is dropped, so a failed
+	// removal keeps the old name known and the next call retries it.
+	if hit {
+		if retired := c.retiredLabel(string(cached)); retired != "" {
+			resp, err := c.client.Issues.RemoveLabelForIssue(ctx, owner, repo, prNumber, url.PathEscape(retired))
+			recordRateLimit(resp, err)
+			if err != nil && (resp == nil || resp.StatusCode != http.StatusNotFound) {
+				return fmt.Errorf("remove renamed label %q: %w", retired, err)
+			}
+		}
+	}
+
 	// The record describes the labels this reconcile is about to change. Drop
 	// it before the first mutation: if a later step fails, a call with the old
 	// outcome must reconcile again rather than trust a record the PR no
@@ -1857,9 +1875,63 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 // prOutcomeRecord is the cached value for an outcome written at a head. It
 // names the configured labels too, so renaming one (a new merge-gate label)
 // re-applies the labels at the same head instead of hitting a record written
-// under the old names.
+// under the old names, and the next reconcile removes the old name the record's
+// outcome applied (retiredLabel).
 func (c *Commenter) prOutcomeRecord(headSHA string, outcome Outcome) string {
 	return fmt.Sprintf("%s|%s|%q|%q|%q", headSHA, outcome, c.labelSuccess, c.labelFailure, c.labelWarning)
+}
+
+// retiredLabel returns the label a prOutcomeRecord's outcome applied under the
+// names it was written with, when that name is no longer configured; "" when
+// nothing was retired or the record has another format (an older record
+// without names). Only the applied label counts: the record's reconcile
+// removed the other names, so one of them on the PR was put there by someone
+// else.
+func (c *Commenter) retiredLabel(record string) string {
+	head, rest, ok := strings.Cut(record, "|")
+	if !ok || head == "" {
+		return ""
+	}
+	outcome, rest, ok := strings.Cut(rest, "|")
+	if !ok {
+		return ""
+	}
+	names := make([]string, 0, 3)
+	for i := range 3 {
+		if i > 0 {
+			if rest, ok = strings.CutPrefix(rest, "|"); !ok {
+				return ""
+			}
+		}
+		quoted, err := strconv.QuotedPrefix(rest)
+		if err != nil {
+			return ""
+		}
+		name, err := strconv.Unquote(quoted)
+		if err != nil {
+			return ""
+		}
+		names = append(names, name)
+		rest = rest[len(quoted):]
+	}
+	if rest != "" {
+		return ""
+	}
+	var applied string
+	switch Outcome(outcome) {
+	case OutcomeSuccess:
+		applied = names[0]
+	case OutcomeFailure:
+		applied = names[1]
+	case OutcomeWarning:
+		applied = names[2]
+	default:
+		return ""
+	}
+	if applied == "" || applied == c.labelSuccess || applied == c.labelFailure || applied == c.labelWarning {
+		return ""
+	}
+	return applied
 }
 
 // dedupeNonEmpty returns in with empty strings dropped, duplicates collapsed,
@@ -1892,10 +1964,10 @@ func dedupeNonEmpty(in []string, exclude map[string]struct{}) []string {
 }
 
 // prLabelLockTTL bounds how long one replica holds a PR's label lock. A
-// reconcile is at most three label calls (normally well under a second each);
-// SetPRLabels cuts its writes off at this TTL, so a lapsed lock never covers a
-// write still in flight. A crashed holder blocks the PR's labels for at most
-// this long.
+// reconcile is at most four label calls (three, plus removing a renamed
+// label's old name), normally well under a second each; SetPRLabels cuts its
+// writes off at this TTL, so a lapsed lock never covers a write still in
+// flight. A crashed holder blocks the PR's labels for at most this long.
 const prLabelLockTTL = 30 * time.Second
 
 // prLabelLockKey names the lock that serializes SetPRLabels for one PR across

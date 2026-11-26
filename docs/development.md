@@ -302,7 +302,7 @@ The internal `/_dump` and `/_reset` endpoints — used by the Go tests to scrape
 | `TestWebhookNonKustomizationIgnored` | HelmRelease event → 204 No Content |
 | `TestWebhookInvalidJSONRejected` | Malformed body → 400 Bad Request |
 | `TestPipelineProducesGitHubComment` | Full pipeline in mock mode: a Flux event ends in a comment POST against `mock-github` (skipped when `E2E_REAL_GITHUB=1`) |
-| `TestPipelineProducesRealGitHubComment` | Full pipeline against api.github.com: the bridge's marker comment lands on the real sandbox PR (active only with `E2E_REAL_GITHUB=1`) |
+| `TestPipelineProducesRealGitHubComment` | Full pipeline against api.github.com: once Flux applied the sandbox PR's head, the App's old comment is deleted and the bridge's state for the head cleared, and a new marker comment from the App must land (active only with `E2E_REAL_GITHUB=1`) |
 | `TestPipelineAttributesPrunedDeletion` | A PR that deletes a resource is attributed from the Kustomization's prune event and gets its comment (mock mode) |
 | `TestPipelineDefersUnappliedRevision` | An event for a revision the Kustomization hasn't applied yet is deferred, not analysed |
 | `TestPersistence_DedupeSurvivesBridgeRestart` | After a bridge rollout-restart, a replayed event skips the already-analysed PR head as deduped (Valkey-backed; `make e2e-persistence`) |

@@ -62,6 +62,27 @@ jobs:
           fetch-depth: 0
           fetch-tags: false
 
+      # autodev merges this repository's branch of the same name, so a fork
+      # pull request would be marked successful for another branch. Take the
+      # dev label off fork pull requests first. A fork's own label event runs
+      # with a read-only token: the removal fails there, and so does the run,
+      # before autodev.
+      - name: Remove the dev label from fork pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          forks=$(gh pr list --repo "$REPO" --label dev --state open --limit 1000 \
+            --json number,isCrossRepository --jq '.[] | select(.isCrossRepository) | .number')
+          for pr in $forks; do
+            echo "::warning::#$pr is from a fork; removing its dev label"
+            gh api --method DELETE "repos/$REPO/issues/$pr/labels/dev" > /dev/null
+            gh api "repos/$REPO/issues/$pr/comments" > /dev/null \
+              -f body="Removed the \`dev\` label: this pull request comes from a fork, and autodev merges branches of this repository by name, so it would test another branch. Push the branch to this repository and open the pull request from there to test it on \`dev\`." \
+              || echo "::warning::could not comment on #$pr"
+          done
+
       - name: Autodev
         uses: Staffbase/autodev-action@4d7207fa767390412b2febe6de0e9f4bc0e9c776 # v2.12.0
         with:
@@ -73,7 +94,7 @@ jobs:
 
 - With `labels: true`, autodev marks each pull request `successful` or `failed` for its **merge** into `dev`. The bridge's `flux-*` labels report the **deployment**; the two sets are independent.
 - Don't protect the `dev` branch against force-pushes: autodev rebuilds it on every run.
-- autodev merges each pull request's branch from this repository (`origin/<branch>`), by branch name. Don't add the `dev` label to pull requests from forks: without a branch of that name here, the merge fails; with one (a fork's `main`, for example), autodev merges this repository's branch instead and marks the fork's pull request `successful`. Their label events also get a read-only `GITHUB_TOKEN`. Push the branch to the repository instead.
+- autodev merges each pull request's branch from this repository (`origin/<branch>`), by branch name. For a pull request from a fork, that would be a branch of the same name here (a fork's `main`, for example), and autodev would mark the fork's pull request `successful` for it. So the step before autodev removes the `dev` label from every open fork pull request and comments why. The label event of a fork's pull request gets a read-only `GITHUB_TOKEN`: that run can't remove the label and fails before autodev; the next run with a write token (any push) removes it. Push the branch to the repository instead.
 - A push made with the `GITHUB_TOKEN` doesn't start other workflows. Flux pulls `dev` itself, so this doesn't matter for deployments. If a workflow must run on `dev` (an image build, for example), start it from the autodev job with `gh workflow run <workflow> --ref dev` (needs `actions: write`); see this repository's own [autodev workflow](../.github/workflows/autodev.yml).
 
 ## 2. Point the dev cluster at the dev branch

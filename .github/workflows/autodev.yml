@@ -42,6 +42,27 @@ jobs:
           sha=$(git ls-remote origin refs/heads/dev | cut -f1)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
+      # autodev merges this repository's branch of the same name, so a fork
+      # pull request would be marked successful for another branch. Take the
+      # dev label off fork pull requests first. A fork's own label event runs
+      # with a read-only token: the removal fails there, and so does the run,
+      # before autodev.
+      - name: Remove the dev label from fork pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          forks=$(gh pr list --repo "$REPO" --label dev --state open --limit 1000 \
+            --json number,isCrossRepository --jq '.[] | select(.isCrossRepository) | .number')
+          for pr in $forks; do
+            echo "::warning::#$pr is from a fork; removing its dev label"
+            gh api --method DELETE "repos/$REPO/issues/$pr/labels/dev" > /dev/null
+            gh api "repos/$REPO/issues/$pr/comments" > /dev/null \
+              -f body="Removed the \`dev\` label: this pull request comes from a fork, and autodev merges branches of this repository by name, so it would test another branch. Push the branch to this repository and open the pull request from there to test it on \`dev\`." \
+              || echo "::warning::could not comment on #$pr"
+          done
+
       - name: Autodev
         uses: Staffbase/autodev-action@4d7207fa767390412b2febe6de0e9f4bc0e9c776 # v2.12.0
         with:
