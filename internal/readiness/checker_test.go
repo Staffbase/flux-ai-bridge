@@ -99,7 +99,7 @@ func TestParseInventoryID(t *testing.T) {
 func TestResolver_APIVersion(t *testing.T) {
 	r := NewResolver([]VersionEntry{
 		{Group: "example.com", Kind: "Schedule", Version: "v1alpha1"},
-		{Group: "ricoberger.de", Kind: "VaultSecret", Version: "v1alpha1"},
+		{Group: "secrets.example.com", Kind: "VaultSecret", Version: "v1alpha1"},
 	})
 	tests := []struct {
 		group string
@@ -108,7 +108,7 @@ func TestResolver_APIVersion(t *testing.T) {
 		why   string
 	}{
 		{"example.com", "Schedule", "example.com/v1alpha1", "cache hit"},
-		{"ricoberger.de", "VaultSecret", "ricoberger.de/v1alpha1", "cache hit"},
+		{"secrets.example.com", "VaultSecret", "secrets.example.com/v1alpha1", "cache hit"},
 		{"", "Pod", "v1", "core group → bare version"},
 		{"apps", "Deployment", "apps/v1", "v1 default"},
 		// Hardcoded fallback table — covered when discovery doesn't include them.

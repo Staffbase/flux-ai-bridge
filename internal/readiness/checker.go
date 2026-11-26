@@ -690,7 +690,7 @@ var fallbackPreferredVersions = map[string]string{
 // Resolver maps (group, kind) → preferred apiVersion ("group/version", or
 // just "version" for the core group). Populated from MCP's
 // get_kubernetes_api_versions tool at bridge startup so non-v1 CRDs
-// (example.com/v1alpha1, ricoberger.de/v1alpha1, …) route to the
+// (example.com/v1alpha1, secrets.example.com/v1alpha1, …) route to the
 // correct GVR. The Flux Kustomization inventory ID format records only the
 // group with no version, which is why this lookup is necessary at all.
 //

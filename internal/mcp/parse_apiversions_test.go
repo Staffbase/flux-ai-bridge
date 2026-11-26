@@ -103,7 +103,7 @@ group: example.com
 kind: Schedule
 version: v1alpha1
 ---
-group: ricoberger.de
+group: secrets.example.com
 kind: VaultSecret
 version: v1alpha1
 ---
@@ -117,7 +117,7 @@ version: v2
 	}
 	want := []GroupKindVersion{
 		{Group: "example.com", Kind: "Schedule", Version: "v1alpha1"},
-		{Group: "ricoberger.de", Kind: "VaultSecret", Version: "v1alpha1"},
+		{Group: "secrets.example.com", Kind: "VaultSecret", Version: "v1alpha1"},
 		{Group: "helm.toolkit.fluxcd.io", Kind: "HelmRelease", Version: "v2"},
 	}
 	if len(got) != len(want) {
@@ -150,7 +150,7 @@ group: example.com
 kind: Schedule
 version: v1alpha1
 ---
-group: ricoberger.de
+group: secrets.example.com
 kind: VaultSecret
 version: v1alpha1
 
@@ -163,7 +163,7 @@ the one matching the inventory entry's group.
 	}
 	want := []GroupKindVersion{
 		{Group: "example.com", Kind: "Schedule", Version: "v1alpha1"},
-		{Group: "ricoberger.de", Kind: "VaultSecret", Version: "v1alpha1"},
+		{Group: "secrets.example.com", Kind: "VaultSecret", Version: "v1alpha1"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d entries, want %d: %+v", len(got), len(want), got)
