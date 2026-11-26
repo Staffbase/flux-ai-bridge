@@ -1,5 +1,12 @@
-# The one chart test without Valkey: the default in-memory dedupe, with only
-# the bundled flux-operator-mcp sub-chart (on by default). Ollama stays off.
+# The one chart test without Valkey: Valkey and persistent dedupe are on by
+# default, so both are switched off for the in-memory dedupe case. Only the
+# bundled flux-operator-mcp sub-chart (on by default) runs; Ollama stays off.
+config:
+  dedupe:
+    persistence:
+      enabled: false
 flux:
   notification:
     enabled: false
+valkey:
+  enabled: false

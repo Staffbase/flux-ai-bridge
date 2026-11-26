@@ -23,11 +23,14 @@ config:
     # or any Redis-compatible service like AWS ElastiCache / GCP
     # Memorystore).
     #
-    # Disabled by default → dedupe lives in-memory only. Bridge restarts
-    # wipe it, and the first event after restart for any already-handled
-    # SHA re-runs the pipeline (including an LLM call). The comment itself
-    # is only rewritten if the state changed: its embedded stability key
-    # still matches. Enable to survive restarts and skip the redundant run.
+    # Enabled by default, with the bundled Valkey (valkey.enabled). It keeps
+    # the PR label roster across restarts, which the flux-* label aggregation
+    # needs to be correct, and spares re-running analyses (and LLM calls)
+    # after a restart. For in-memory dedupe, set this and valkey.enabled to
+    # false: bridge restarts then wipe it, and the first event after a restart
+    # for an already-handled SHA re-runs the pipeline. With an external
+    # Redis/Valkey, keep this on and set url (or sentinel) with
+    # valkey.enabled=false.
     persistence:
       # ─── HA: multi-replica via persistent dedupe (active-active) ─────────────────
       #
@@ -53,7 +56,7 @@ config:
       #   - config.dedupe.persistence.{url,enabled}=...                    (external)
       # See the `valkey:` and `config.dedupe.persistence:` sections elsewhere
       # in this file.
-      enabled: false
+      enabled: true
       # Reference an existing Secret with the dedupe password instead
       # of storing it in chart values. Use passwordKey below to point at
       # the right entry when consuming a third-party Secret (e.g. one
@@ -1098,14 +1101,15 @@ ollama:
 # connects to the external endpoint (Redis, ElastiCache, Memorystore, etc.) —
 # the bundled sub-chart is just a convenience for self-contained installs.
 #
-# Disabled by default; dedupe stays in-memory until you enable persistence.
+# Enabled by default, together with config.dedupe.persistence.enabled. Set
+# both to false for in-memory dedupe.
 valkey:
   # Auth off by default — the Valkey Pod is only reachable from inside the
   # cluster (ClusterIP Service). If you want auth, enable it here AND set
   # config.dedupe.persistence.password (or existingSecret).
   auth:
     enabled: false
-  enabled: false
+  enabled: true
   # limits:
   #   memory: 128Mi
   # requests:

@@ -34,7 +34,7 @@ kubectl create secret generic flux-ai-bridge \
 
 ## 2. Install the Helm Chart
 
-The chart's sub-charts (flux-operator-mcp, plus the optional Ollama and Valkey) aren't stored in the repository. Fetch the versions pinned in `Chart.yaml` once per checkout (`make chart-deps` does the same) — Helm only resolves chart repositories that are registered:
+The chart's sub-charts (flux-operator-mcp and Valkey, both on by default, plus the optional Ollama) aren't stored in the repository. Fetch the versions pinned in `Chart.yaml` once per checkout (`make chart-deps` does the same) — Helm only resolves chart repositories that are registered:
 
 ```bash
 helm repo add otwld https://helm.otwld.com/ --force-update

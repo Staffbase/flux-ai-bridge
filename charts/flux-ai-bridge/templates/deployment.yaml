@@ -34,7 +34,7 @@ bundled `valkey` Service that doesn't exist, and the bridge — whose dedupe
 fails closed when Redis is unreachable — would skip every PR.
 */}}
 {{- if and $persistence.enabled (not .Values.valkey.enabled) (not $persistence.url) (not $sentinelBlk.enabled) }}
-{{- fail "config.dedupe.persistence.enabled=true needs a backend: set valkey.enabled=true (bundled), config.dedupe.persistence.url=redis://... (external), or config.dedupe.persistence.sentinel.enabled=true." }}
+{{- fail "config.dedupe.persistence.enabled=true needs a backend: set valkey.enabled=true (bundled), config.dedupe.persistence.url=redis://... (external) or config.dedupe.persistence.sentinel.enabled=true, or set config.dedupe.persistence.enabled=false for in-memory dedupe." }}
 {{- end }}
 {{- /*
 A zero or negative config.dedupe.ttl disables the in-memory dedupe cache, and
