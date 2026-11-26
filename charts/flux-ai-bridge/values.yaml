@@ -34,7 +34,10 @@ config:
     persistence:
       # ─── HA: multi-replica via persistent dedupe (active-active) ─────────────────
       #
-      # replicaCount > 1 (or autoscaling.enabled) requires persistent dedupe. The
+      # replicaCount > 1 (or autoscaling.enabled) requires persistent dedupe. All
+      # replicas share that one store, so for high availability the store must
+      # be highly available too: with the bundled Valkey, use its Sentinel
+      # setup (see the valkey section), not the single-pod default. The
       # chart enforces this at template time — `helm install` fails fast with a
       # clear error if you try to scale up without dedupe persistence enabled.
       #
@@ -1103,6 +1106,13 @@ ollama:
 #
 # Enabled by default, together with config.dedupe.persistence.enabled. Set
 # both to false for in-memory dedupe.
+#
+# The default is a single Valkey pod without Sentinel, which is enough for
+# dedupe state. It is a single point of failure, though: while it is down,
+# dedupe fails closed and the bridge skips events, also with several bridge
+# replicas. For high availability, use the Sentinel setup instead:
+# replica.enabled, sentinel.enabled, persistence and sentinel.password here,
+# plus config.dedupe.persistence.sentinel.enabled with the same password.
 valkey:
   # Auth off by default — the Valkey Pod is only reachable from inside the
   # cluster (ClusterIP Service). If you want auth, enable it here AND set
@@ -1142,8 +1152,9 @@ valkey:
   # (in templates/deployment.yaml) hits a stable target regardless of the
   # parent release name.
   fullnameOverride: valkey
-  # Single-replica is plenty for dedupe state. Enable replicas only if you
-  # share this Valkey with other workloads that need HA.
+  # One pod is enough for dedupe state. Replication only gives high
+  # availability together with Sentinel (sentinel.enabled, see above);
+  # without Sentinel there is no failover.
   replica:
     enabled: false
   # Pod resources. The bridge's working set is small; the default below

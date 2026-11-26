@@ -35,7 +35,7 @@ the bridge posts deterministic status comments and calls no LLM.
 | Sub-chart | Default | Purpose |
 |---|---|---|
 | `flux-operator-mcp` | enabled | Read-only MCP server the bridge reads cluster state through |
-| `valkey` | enabled | Persistent dedupe store (standalone or with Sentinel): keeps the PR label roster across restarts, which correct flux-* labels need, and spares re-running analyses and LLM calls after a restart. For in-memory dedupe, set `valkey.enabled=false` and `config.dedupe.persistence.enabled=false` |
+| `valkey` | enabled | Persistent dedupe store (standalone or with Sentinel): keeps the PR label roster across restarts, which correct flux-* labels need, and spares re-running analyses and LLM calls after a restart. A single pod by default; for high availability, use the Sentinel setup described in `values.yaml`. For in-memory dedupe, set `valkey.enabled=false` and `config.dedupe.persistence.enabled=false` |
 | `ollama` | disabled | Local LLM for a self-contained install |
 
 ## Configuration

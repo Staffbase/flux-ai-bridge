@@ -153,8 +153,10 @@ Bridges in different clusters that report on the same repositories set a distinc
 
 The chart enforces the invariant: `replicaCount > 1` (or `autoscaling.enabled`) without `config.dedupe.persistence.enabled=true` fails `helm template` with a clear error. The fix is one of:
 
-- bundled: `valkey.enabled=true` + `config.dedupe.persistence.enabled=true`
+- bundled: `valkey.enabled=true` + `config.dedupe.persistence.enabled=true` (the defaults)
 - external: `config.dedupe.persistence.url=redis://...` + `enabled=true`
+
+All replicas share that one dedupe store, and dedupe fails closed, so the store needs the same availability as the bridge. The bundled Valkey defaults to a single pod without Sentinel, which is a single point of failure. For high availability, use its Sentinel setup (`valkey.replica.enabled`, `valkey.sentinel.enabled`, `valkey.persistence`, `valkey.sentinel.password`, plus `config.dedupe.persistence.sentinel.enabled`) or an external highly available Redis/Valkey.
 
 ### GitHub-fetch caching
 
