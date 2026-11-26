@@ -1976,6 +1976,7 @@ type fakeCommenter struct {
 
 type labelCall struct {
 	Number  int
+	HeadSHA string
 	Outcome bridgegithub.Outcome
 }
 
@@ -2089,8 +2090,8 @@ func (f *fakeCommenter) RemoveComment(_ context.Context, _, _, ns, name string, 
 	return f.removeErr
 }
 
-func (f *fakeCommenter) SetPRLabels(_ context.Context, _, _ string, prNumber int, _ string, outcome bridgegithub.Outcome) error {
-	f.labelCalls = append(f.labelCalls, labelCall{Number: prNumber, Outcome: outcome})
+func (f *fakeCommenter) SetPRLabels(_ context.Context, _, _ string, prNumber int, headSHA string, outcome bridgegithub.Outcome) error {
+	f.labelCalls = append(f.labelCalls, labelCall{Number: prNumber, HeadSHA: headSHA, Outcome: outcome})
 	return f.labelErr
 }
 
