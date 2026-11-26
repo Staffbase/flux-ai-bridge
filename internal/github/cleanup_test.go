@@ -28,27 +28,51 @@ import (
 	bridgegithub "github.com/staffbase/flux-ai-bridge/internal/github"
 )
 
-// cancelOnPut wraps a cache and cancels the caller's context the first time a
-// last-comment entry is written after arming — i.e. right after a fresh
-// comment was created, before its predecessor is deleted.
-type cancelOnPut struct {
-	fetchcache.Cache
-	mu     sync.Mutex
-	armed  bool
-	cancel context.CancelFunc
+// mapCache is a plain in-memory cache whose contents a test can copy, e.g. to
+// stand for what a shared Redis holds when a replica dies.
+type mapCache struct {
+	mu sync.Mutex
+	m  map[string][]byte
 }
 
-func (c *cancelOnPut) Put(ctx context.Context, key string, value []byte, ttl time.Duration) {
-	c.Cache.Put(ctx, key, value, ttl)
+func newMapCache(m map[string][]byte) *mapCache {
+	if m == nil {
+		m = map[string][]byte{}
+	}
+	return &mapCache{m: m}
+}
+
+func (c *mapCache) Get(_ context.Context, key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.armed && c.cancel != nil {
-		c.cancel()
-		c.armed = false
+	v, ok := c.m[key]
+	return v, ok
+}
+
+func (c *mapCache) Put(_ context.Context, key string, value []byte, _ time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key] = value
+}
+
+func (c *mapCache) Delete(_ context.Context, key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, key)
+}
+
+func (c *mapCache) snapshot() map[string][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string][]byte, len(c.m))
+	for k, v := range c.m {
+		out[k] = v
 	}
+	return out
 }
 
 // commentServer is a tiny issue-comments API: list, create, delete by ID.
+// onDelete, when set, runs (under mu) as a DELETE arrives, before it applies.
 type commentServer struct {
 	mu        sync.Mutex
 	live      map[int64]string
@@ -56,6 +80,7 @@ type commentServer struct {
 	deletes   []int64
 	failDel   bool
 	listCalls int
+	onDelete  func()
 }
 
 func (s *commentServer) mux() *http.ServeMux {
@@ -91,6 +116,9 @@ func (s *commentServer) mux() *http.ServeMux {
 		id, _ := strconv.ParseInt(r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:], 10, 64)
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if s.onDelete != nil {
+			s.onDelete()
+		}
 		if s.failDel {
 			w.WriteHeader(http.StatusBadGateway)
 			return
@@ -160,11 +188,12 @@ func TestRemoveComment_ColdCacheFindsScopedComment(t *testing.T) {
 	}
 }
 
-// A cancellation landing between the create and the delete of a swap (a
-// shutdown mid-delivery) must not leave the superseded comment on the PR.
+// A cancellation landing after the create of a swap (a shutdown
+// mid-delivery) must not leave the superseded comment on the PR, and the
+// fresh comment is still recorded.
 func TestPostOrUpdateComment_SwapCleanupSurvivesCancellation(t *testing.T) {
 	srv := &commentServer{live: map[int64]string{}, nextID: 1}
-	cache := &cancelOnPut{Cache: fetchcache.NewLRU(64)}
+	cache := fetchcache.NewLRU(64)
 	c := newCommenterWithOptions(t, srv.mux(), bridgegithub.Options{Cache: cache})
 
 	if err := c.PostOrUpdateComment(context.Background(), "owner", "repo", "apps", "api", 42, "state A"); err != nil {
@@ -173,19 +202,80 @@ func TestPostOrUpdateComment_SwapCleanupSurvivesCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cache.mu.Lock()
-	cache.armed, cache.cancel = true, cancel
-	cache.mu.Unlock()
+	srv.mu.Lock()
+	// Cancel while the predecessor's DELETE is in flight, and hold the
+	// response long enough that a request bound to the cancelled context
+	// would fail instead of completing.
+	srv.onDelete = func() {
+		cancel()
+		time.Sleep(50 * time.Millisecond)
+	}
+	srv.mu.Unlock()
 	if err := c.PostOrUpdateComment(ctx, "owner", "repo", "apps", "api", 42, "state B"); err != nil {
 		t.Fatalf("swap: %v", err)
 	}
 
 	srv.mu.Lock()
-	defer srv.mu.Unlock()
+	srv.onDelete = nil
 	if len(srv.live) != 1 {
 		t.Fatalf("PR must keep exactly one bridge comment after the swap, got %d: %v", len(srv.live), srv.live)
 	}
 	for _, body := range srv.live {
+		if !strings.HasSuffix(body, "state B") {
+			t.Fatalf("surviving comment is the superseded one: %q", body)
+		}
+	}
+	lists := srv.listCalls
+	srv.mu.Unlock()
+	if !c.CommentCurrent(context.Background(), "owner", "repo", "apps", "api", 42, "state B") {
+		t.Fatalf("the fresh comment must be recorded after the cleanup (list calls so far: %d)", lists)
+	}
+}
+
+// A replica that dies between creating the fresh comment and deleting its
+// predecessor must not leave a cache record saying the swap finished: the next
+// post (from any replica sharing the cache) must sweep the leftover instead of
+// skipping the unchanged state.
+func TestPostOrUpdateComment_CrashMidSwapIsSweptByNextPost(t *testing.T) {
+	srv := &commentServer{live: map[int64]string{}, nextID: 1}
+	cache := newMapCache(nil)
+	c := newCommenterWithOptions(t, srv.mux(), bridgegithub.Options{Cache: cache})
+	if err := c.PostOrUpdateComment(context.Background(), "owner", "repo", "apps", "api", 42, "state A"); err != nil {
+		t.Fatalf("first post: %v", err)
+	}
+
+	// Capture what the shared cache and the PR hold at the moment the
+	// predecessor's DELETE goes out — the state a crash right then leaves.
+	var cacheAtCrash map[string][]byte
+	var liveAtCrash map[int64]string
+	srv.mu.Lock()
+	srv.onDelete = func() {
+		cacheAtCrash = cache.snapshot()
+		liveAtCrash = make(map[int64]string, len(srv.live))
+		for id, body := range srv.live {
+			liveAtCrash[id] = body
+		}
+	}
+	srv.mu.Unlock()
+	if err := c.PostOrUpdateComment(context.Background(), "owner", "repo", "apps", "api", 42, "state B"); err != nil {
+		t.Fatalf("swap: %v", err)
+	}
+	if len(liveAtCrash) != 2 {
+		t.Fatalf("want both comments live when the DELETE goes out, got %v", liveAtCrash)
+	}
+
+	// Restart: the PR still has both comments, the cache what it had then.
+	after := &commentServer{live: liveAtCrash, nextID: 100}
+	restarted := newCommenterWithOptions(t, after.mux(), bridgegithub.Options{Cache: newMapCache(cacheAtCrash)})
+	if err := restarted.PostOrUpdateComment(context.Background(), "owner", "repo", "apps", "api", 42, "state B"); err != nil {
+		t.Fatalf("post after restart: %v", err)
+	}
+	after.mu.Lock()
+	defer after.mu.Unlock()
+	if len(after.live) != 1 {
+		t.Fatalf("the superseded comment survived the restart: %d comments left: %v", len(after.live), after.live)
+	}
+	for _, body := range after.live {
 		if !strings.HasSuffix(body, "state B") {
 			t.Fatalf("surviving comment is the superseded one: %q", body)
 		}
@@ -250,10 +340,11 @@ func TestSetPRLabels_EscapesLabelNamesInPath(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	cm := newCommenterWithOptions(t, mux, bridgegithub.Options{PRLabelSuccess: "status/ok", PRLabelFailure: "wip#1", PRLabelWarning: "needs look"})
-	if err := cm.SetPRLabels(context.Background(), "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+	// OutcomeNone removes all three, so every name goes through the DELETE path.
+	if err := cm.SetPRLabels(context.Background(), "owner", "repo", 42, "h1", bridgegithub.OutcomeNone); err != nil {
 		t.Fatalf("SetPRLabels: %v", err)
 	}
-	want := map[string]bool{"wip%231": true, "needs%20look": true}
+	want := map[string]bool{"status%2Fok": true, "wip%231": true, "needs%20look": true}
 	if len(deleted) != len(want) {
 		t.Fatalf("DELETE paths = %v, want %v", deleted, want)
 	}

@@ -15,6 +15,8 @@
 package config_test
 
 import (
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -27,24 +29,57 @@ import (
 // — so any non-empty value is fine for verifying validation logic here.
 const fakeAppPEM = "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----"
 
+// configEnvVars lists every variable Load reads. setEnv clears them all, so a
+// variable exported in the developer's shell can't leak into a fixture;
+// TestSetEnvClearsEveryConfigVariable keeps the list complete.
+var configEnvVars = []string{
+	"WEBHOOK_PORT", "MCP_URL", "LLM_PROVIDER",
+	"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL",
+	"LLM_MODEL", "LLM_MAX_TOKENS", "LLM_SKIP_ON_HEALTHY",
+	"GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_PRIVATE_KEY_FILE",
+	"GITHUB_API_URL", "GITHUB_REPO", "GITHUB_KEEP_COMMENT_HISTORY",
+	"KUSTOMIZATIONS_INCLUDE", "KUSTOMIZATIONS_EXCLUDE",
+	"DEDUPE_PERSISTENCE_MAX_TTL", "SHUTDOWN_TIMEOUT",
+	"READINESS_POLL_INTERVAL", "READINESS_POLL_TIMEOUT", "DEDUPE_PR_REEVAL_TTL",
+	"DEDUPE_PR_REEVAL_MAX", "DEDUPE_REEVAL_FAILED_ONLY",
+	"READINESS_POD_QUIET_PERIOD", "READINESS_EXPAND_HELMRELEASES", "READINESS_INCLUDE_PODS",
+	"FAILURE_FETCH_EVENTS", "FAILURE_FETCH_FLUX_INSTANCE", "FAILURE_FETCH_LOGS", "FAILURE_FETCH_METRICS",
+	"COMMENT_FAILED_RESOURCES_ONLY", "COMMENT_INCLUDE_FOOTER", "COMMENT_INCLUDE_SUMMARY", "COMMENT_ON_SUCCESS",
+	"PR_ATTRIBUTE_PRUNES", "PR_REQUIRED_LABELS",
+	"PR_LABEL_ENABLED", "PR_LABEL_SUCCESS", "PR_LABEL_FAILED", "PR_LABEL_WARNING",
+	"INSTANCE_ID",
+}
+
 func setEnv(t *testing.T, env map[string]string) {
 	t.Helper()
-	for _, k := range []string{
-		"WEBHOOK_PORT", "MCP_URL", "LLM_PROVIDER",
-		"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL",
-		"LLM_MODEL",
-		"GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_PRIVATE_KEY_FILE",
-		"GITHUB_API_URL", "GITHUB_REPO",
-		"KUSTOMIZATIONS_INCLUDE", "KUSTOMIZATIONS_EXCLUDE",
-		"DEDUPE_PERSISTENCE_MAX_TTL", "SHUTDOWN_TIMEOUT",
-		"READINESS_POLL_INTERVAL", "READINESS_POLL_TIMEOUT", "DEDUPE_PR_REEVAL_TTL",
-		"READINESS_POD_QUIET_PERIOD",
-		"INSTANCE_ID",
-	} {
+	for _, k := range configEnvVars {
 		t.Setenv(k, "")
 	}
 	for k, v := range env {
 		t.Setenv(k, v)
+	}
+}
+
+// TestSetEnvClearsEveryConfigVariable fails when Load reads a variable that
+// setEnv doesn't clear: a value exported in the shell would then override the
+// default a test asserts.
+func TestSetEnvClearsEveryConfigVariable(t *testing.T) {
+	src, err := os.ReadFile("config.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleared := make(map[string]bool, len(configEnvVars))
+	for _, k := range configEnvVars {
+		cleared[k] = true
+	}
+	matches := regexp.MustCompile(`(?:Getenv|Env)\("([A-Z0-9_]+)"`).FindAllStringSubmatch(string(src), -1)
+	if len(matches) == 0 {
+		t.Fatal("found no environment reads in config.go; the pattern is out of date")
+	}
+	for _, m := range matches {
+		if !cleared[m[1]] {
+			t.Errorf("Load reads %s but setEnv doesn't clear it; add it to configEnvVars", m[1])
+		}
 	}
 }
 

@@ -33,8 +33,8 @@
 //     hop, and the same ancestors are walked on every subsequent merge
 //     event. Without caching, deep walks are O(depth × events).
 //
-//   - PRs-for-commit (`prs-for-commit:<owner>/<repo>/<sha>` → JSON-encoded
-//     []PRInfo): The PR numbers a commit belongs to are stable, but state
+//   - PRs-for-commit (`prs-for-commit2:<owner>/<repo>/<sha>` → JSON
+//     {"at": <fetch time>, "prs": [...]PRInfo}): The PR numbers a commit belongs to are stable, but state
 //     (open/closed/merged) and labels mutate. Cache with a short TTL so
 //     same-commit lookups within the TTL window reuse the response, and
 //     longer-term changes refresh on the next miss. The bridge's filter

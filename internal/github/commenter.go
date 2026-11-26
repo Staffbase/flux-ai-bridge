@@ -173,8 +173,10 @@ type Commenter struct {
 	// B adds failure, A removes failure, B removes success — leaving the
 	// PR with NO outcome label, while both then cache their outcome so the
 	// transition-only short-circuit never re-asserts it. Serializing makes
-	// each reconcile atomic per PR within this replica (cross-replica
-	// interleavings self-correct on the next outcome transition).
+	// each reconcile atomic per PR within this replica. Replicas are NOT
+	// serialized against each other: the same interleaving across two
+	// replicas can leave the PR without an outcome label, and the shared
+	// record then skips the repair until the outcome or the head changes.
 	//
 	// STRIPED, not per-key: unlike postLocks (bounded by the cluster's
 	// Kustomization count), PR numbers grow without bound over a deployment's
@@ -297,7 +299,7 @@ func NewCommenter(cfg AuthConfig, opts Options) (*Commenter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("github app transport: %w", err)
 	}
-	httpClient := &http.Client{Transport: tr, Timeout: requestTimeout}
+	httpClient := &http.Client{Transport: tr, Timeout: requestTimeout, CheckRedirect: sameOriginRedirect}
 	ghClient := gh.NewClient(httpClient)
 	if cfg.BaseURL != "" {
 		var err error
@@ -363,6 +365,26 @@ func NewCommenter(cfg AuthConfig, opts Options) (*Commenter, error) {
 		labelWarning:    labelWarning,
 		postLocks:       make(map[string]*sync.Mutex),
 	}, nil
+}
+
+// maxRedirects matches net/http's default redirect limit.
+const maxRedirects = 10
+
+// sameOriginRedirect refuses a redirect that leaves the origin (scheme, host
+// and port) of the original request. net/http drops the Authorization header
+// on such a hop, but ghinstallation sets it again in RoundTrip for every
+// request, so following the redirect would hand the installation token to
+// the other origin.
+func sameOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	orig := via[0].URL
+	if req.URL.Scheme != orig.Scheme || req.URL.Host != orig.Host {
+		return fmt.Errorf("refusing redirect from %s://%s to another origin %s://%s",
+			orig.Scheme, orig.Host, req.URL.Scheme, req.URL.Host)
+	}
+	return nil
 }
 
 // lockForScope returns the per-(namespace, name) mutex used to serialize
@@ -590,8 +612,8 @@ const defaultCommitTTL = time.Hour
 //
 //  1. Direct: GET /commits/{sha}/pulls — finds PRs whose head branch contains
 //     the SHA (covers fast-forward merges + still-open feature branches).
-//  2. Parent walk: if (1) is empty AND the commit is a merge commit with
-//     N parents, parents[1..N-1] are the "merged-in" branch tips. We probe
+//  2. Parent walk: if the commit is a merge commit with N parents,
+//     parents[1..N-1] are the "merged-in" branch tips. We probe
 //     each via the same /commits/.../pulls endpoint to find the open PR.
 //     Then we recurse along parents[0] up to c.parentWalkDepth so a single
 //     autodev batch (sequential merge commits) reveals every involved PR,
@@ -631,7 +653,41 @@ func (c *Commenter) FindPRsForCommit(ctx context.Context, owner, repo, sha strin
 	// reconcile cycle. (singleflight already drops the entry once the leader
 	// returns; Forget only matters for the tiny window between failure and
 	// return, but it makes the "flaky failure" recovery deterministic.)
-	v, err, shared := c.prsForCommitSF.Do(cacheKey, func() (any, error) {
+	//
+	// The walk runs under the leader's context. Each waiter stops waiting
+	// when its own context ends, and a waiter whose leader was cancelled
+	// (its pipeline deadline) retries instead of failing with the leader's
+	// cancellation while it still has time of its own.
+	for attempt := 1; ; attempt++ {
+		v, shared, led, err := c.findPRsForCommitShared(ctx, owner, repo, sha, cacheKey)
+		if err != nil && !led && ctx.Err() == nil && attempt < maxCoalescedAttempts &&
+			(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		// shared is true for every caller of a coalesced batch, INCLUDING the
+		// leader that actually walked — so this slightly over-counts (by the one
+		// leader per batch). That's an acceptable imprecision for a trend metric;
+		// the precise "real walks" figure is the prs_walk miss counter above.
+		if shared {
+			metrics.PRsForCommitCoalesced.Inc()
+		}
+		return v, nil
+	}
+}
+
+// maxCoalescedAttempts bounds how often a waiter re-joins (or starts) a
+// resolution after the one it waited on was cancelled.
+const maxCoalescedAttempts = 3
+
+// findPRsForCommitShared runs or joins the single-flight resolution for
+// cacheKey. led reports whether this caller ran the walk itself. A caller
+// whose context ends stops waiting and returns its own context error.
+func (c *Commenter) findPRsForCommitShared(ctx context.Context, owner, repo, sha, cacheKey string) (prs []PRInfo, shared, led bool, err error) {
+	ch := c.prsForCommitSF.DoChan(cacheKey, func() (any, error) {
+		led = true
 		// Double-checked read: a leader that just finished may have warmed
 		// the cache and had its single-flight entry cleared before this
 		// goroutine arrived. Re-reading here avoids a redundant walk in that
@@ -644,29 +700,31 @@ func (c *Commenter) FindPRsForCommit(ctx context.Context, owner, repo, sha strin
 		// Recorded here (leader only) so the miss count tracks actual GitHub
 		// work, not the waiters that coalesce onto it.
 		metrics.FetchCacheMisses.WithLabelValues("prs_walk").Inc()
-		result, err := c.resolvePRsForCommit(ctx, owner, repo, sha)
+		var obs observedAt
+		result, err := c.resolvePRsForCommit(ctx, owner, repo, sha, &obs)
 		if err != nil {
 			c.prsForCommitSF.Forget(cacheKey)
 			return nil, err
 		}
-		if c.prsForCommitTTL > 0 {
+		// The result is as old as the oldest per-commit lookup it reused, so
+		// it expires with that one: re-caching it for a full TTL would serve
+		// PR state up to twice the TTL old.
+		if ttl := obs.remaining(c.prsForCommitTTL); ttl > 0 {
 			if encoded, mErr := json.Marshal(result); mErr == nil {
-				c.cache.Put(ctx, cacheKey, encoded, c.prsForCommitTTL)
+				c.cache.Put(ctx, cacheKey, encoded, ttl)
 			}
 		}
 		return result, nil
 	})
-	if err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, false, false, ctx.Err()
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Shared, led, r.Err
+		}
+		return r.Val.([]PRInfo), r.Shared, led, nil
 	}
-	// shared is true for every caller of a coalesced batch, INCLUDING the
-	// leader that actually walked — so this slightly over-counts (by the one
-	// leader per batch). That's an acceptable imprecision for a trend metric;
-	// the precise "real walks" figure is the prs_walk miss counter above.
-	if shared {
-		metrics.PRsForCommitCoalesced.Inc()
-	}
-	return v.([]PRInfo), nil
 }
 
 // cachedPRsForCommit reads and decodes the whole-resolution prs-walk cache
@@ -691,35 +749,86 @@ func (c *Commenter) cachedPRsForCommit(ctx context.Context, cacheKey string) ([]
 
 // resolvePRsForCommit is the uncached direct-lookup + merge-parent-walk
 // resolution behind FindPRsForCommit's result cache.
-func (c *Commenter) resolvePRsForCommit(ctx context.Context, owner, repo, sha string) ([]PRInfo, error) {
-	direct, err := c.listPRsForCommit(ctx, owner, repo, sha)
+//
+// The walk runs even when the direct lookup finds PRs: a deployed branch can
+// itself be the head of an open PR (a promotion PR from the dev branch), and
+// stopping at that PR would hide the PRs merged into the branch. For a
+// non-merge commit the walk ends after one (cached) commit lookup.
+func (c *Commenter) resolvePRsForCommit(ctx context.Context, owner, repo, sha string, obs *observedAt) ([]PRInfo, error) {
+	direct, err := c.listPRsForCommit(ctx, owner, repo, sha, obs)
 	if err != nil {
 		return nil, err
 	}
-	if len(direct) > 0 {
-		return direct, nil
+	walked, err := c.walkMergeParents(ctx, owner, repo, sha, obs)
+	if err != nil {
+		return nil, err
 	}
-	return c.walkMergeParents(ctx, owner, repo, sha)
+	if len(direct) == 0 {
+		return walked, nil
+	}
+	seen := make(map[int]struct{}, len(direct))
+	for _, pr := range direct {
+		seen[pr.Number] = struct{}{}
+	}
+	out := direct
+	for _, pr := range walked {
+		if _, dup := seen[pr.Number]; !dup {
+			seen[pr.Number] = struct{}{}
+			out = append(out, pr)
+		}
+	}
+	return out, nil
 }
 
-func (c *Commenter) listPRsForCommit(ctx context.Context, owner, repo, sha string) ([]PRInfo, error) {
+// observedAt tracks when the oldest PR lookup a resolution used was fetched
+// from GitHub, cached or not.
+type observedAt struct{ oldest time.Time }
+
+func (o *observedAt) add(t time.Time) {
+	if o.oldest.IsZero() || t.Before(o.oldest) {
+		o.oldest = t
+	}
+}
+
+// remaining is what is left of ttl for data observed at o.oldest; ttl itself
+// when nothing was observed.
+func (o *observedAt) remaining(ttl time.Duration) time.Duration {
+	if o.oldest.IsZero() {
+		return ttl
+	}
+	return ttl - time.Since(o.oldest)
+}
+
+// prsForCommitEntry is the cached form of one commit's PR lookup. At is when
+// it was fetched from GitHub; a result built from it must not outlive it.
+type prsForCommitEntry struct {
+	At  time.Time `json:"at"`
+	PRs []PRInfo  `json:"prs"`
+}
+
+func (c *Commenter) listPRsForCommit(ctx context.Context, owner, repo, sha string, obs *observedAt) ([]PRInfo, error) {
 	// Cache lookup before the API call. The PR NUMBERS a commit belongs
 	// to are stable, but state (open/closed/merged) + labels can mutate,
 	// so the cache uses a short TTL (default 5m) — long enough to
 	// amortize the dozens of repeated lookups autodev does across one
 	// batch window, short enough that operators don't see noticeably
 	// stale state in normal flows.
-	cacheKey := "prs-for-commit:" + owner + "/" + repo + "/" + sha
+	// The "2" marks entries that carry their fetch time: a new prefix, not a
+	// format change under the old one, so replicas on either version during a
+	// rollout don't keep overwriting each other's entries.
+	cacheKey := "prs-for-commit2:" + owner + "/" + repo + "/" + sha
 	if c.prsForCommitTTL > 0 {
 		if data, hit := c.cache.Get(ctx, cacheKey); hit {
-			var cached []PRInfo
-			if err := json.Unmarshal(data, &cached); err == nil {
+			var cached prsForCommitEntry
+			if err := json.Unmarshal(data, &cached); err == nil && !cached.At.IsZero() {
 				metrics.FetchCacheHits.WithLabelValues("prs_for_commit").Inc()
-				return cached, nil
+				obs.add(cached.At)
+				return cached.PRs, nil
 			}
 		}
 		metrics.FetchCacheMisses.WithLabelValues("prs_for_commit").Inc()
 	}
+	fetchedAt := time.Now()
 	// Paginate: a single commit can be the head of arbitrarily many PRs
 	// (cherry-pick targets, dependabot batches, autodev fanouts). The
 	// default page size is 30 — without an explicit loop we'd silently
@@ -767,10 +876,11 @@ func (c *Commenter) listPRsForCommit(ctx context.Context, owner, repo, sha strin
 		// call budget. The TTL (default 5m) bounds the one case where empty
 		// could legitimately flip to non-empty (a PR opened against the
 		// commit); merge-commit empties never flip at all.
-		if encoded, err := json.Marshal(out); err == nil {
+		if encoded, err := json.Marshal(prsForCommitEntry{At: fetchedAt, PRs: out}); err == nil {
 			c.cache.Put(ctx, cacheKey, encoded, c.prsForCommitTTL)
 		}
 	}
+	obs.add(fetchedAt)
 	return out, nil
 }
 
@@ -793,7 +903,7 @@ func (c *Commenter) listPRsForCommit(ctx context.Context, owner, repo, sha strin
 // autodev where consecutive dev-branch advances re-walk the same
 // ancestors. Commit metadata is truly immutable; the entries' TTL
 // (COMMIT_TTL, default 1h) only bounds the cache's growth.
-func (c *Commenter) walkMergeParents(ctx context.Context, owner, repo, sha string) ([]PRInfo, error) {
+func (c *Commenter) walkMergeParents(ctx context.Context, owner, repo, sha string, obs *observedAt) ([]PRInfo, error) {
 	seen := map[int]struct{}{}
 	var out []PRInfo
 	current := sha
@@ -820,7 +930,7 @@ func (c *Commenter) walkMergeParents(ctx context.Context, owner, repo, sha strin
 			if headSHA == "" {
 				continue
 			}
-			prs, err := c.listPRsForCommit(ctx, owner, repo, headSHA)
+			prs, err := c.listPRsForCommit(ctx, owner, repo, headSHA, obs)
 			if err != nil {
 				return out, err
 			}
@@ -1023,17 +1133,22 @@ func (c *Commenter) PostOrUpdateCommentKeyed(ctx context.Context, owner, repo, k
 			// committed, so nothing re-posted until the next re-eval window)
 			// left the PR with NO comment while its labels still asserted a
 			// verdict — the worst case is now a duplicate (when the delete
-			// below fails), swept by the next post for this scope, instead of
-			// a missing comment. It also
-			// removes the stale-cache hazard the old order had to defend
-			// against: until the create succeeds, cache and PR still agree on
-			// the prior comment. Recreating (rather than editing in place)
-			// gives the reviewer a notification and a new timestamp for the
-			// updated verdict — GitHub sends nothing on an edit. This skips
-			// the paginated ListComments on the hot path.
-			if cerr := c.createAndCache(ctx, owner, repo, prNumber, commentBody, hash, cacheKey); cerr != nil {
-				// Old comment and cache entry are both untouched — the next
-				// event retries the whole swap cleanly.
+			// below fails, or the process dies before it), swept by the next
+			// post for this scope, instead of a missing comment. Recreating
+			// (rather than editing in place) gives the reviewer a notification
+			// and a new timestamp for the updated verdict — GitHub sends
+			// nothing on an edit. This skips the paginated ListComments on the
+			// hot path.
+			//
+			// The new comment is recorded only once its predecessor is gone
+			// (createComment clears the record first): a crash in between
+			// leaves the cache cold, so the next post lists the comments and
+			// sweeps the leftover instead of trusting a record that says the
+			// swap finished.
+			newID, cerr := c.createComment(ctx, owner, repo, prNumber, commentBody, cacheKey)
+			if cerr != nil {
+				// The old comment is untouched and the cache cold — the next
+				// event lists the comments and retries the swap.
 				return cerr
 			}
 			cctx, cancel := cleanupContext(ctx)
@@ -1042,15 +1157,16 @@ func (c *Commenter) PostOrUpdateCommentKeyed(ctx context.Context, owner, repo, k
 			recordRateLimit(delResp, derr)
 			if derr != nil && (delResp == nil || delResp.StatusCode != http.StatusNotFound) {
 				// The fresh comment is live, but its prior version is now an
-				// orphan the cached ID no longer tracks. Drop the cache entry
-				// so the NEXT post takes the slow path and its list-based
-				// sweep removes the leftover — with the cache kept hot, an
-				// unchanged stability key would short-circuit forever and the
-				// duplicate would never be cleaned.
-				c.cache.Delete(cctx, cacheKey)
-				slog.Default().Warn("prior PR comment delete failed; cache cleared so the next post sweeps the duplicate",
+				// orphan. Leave the cache cold so the NEXT post takes the slow
+				// path and its list-based sweep removes the leftover — with
+				// the cache hot, an unchanged stability key would
+				// short-circuit forever and the duplicate would never be
+				// cleaned.
+				slog.Default().Warn("prior PR comment delete failed; cache left cold so the next post sweeps the duplicate",
 					"owner", owner, "repo", repo, "pr", prNumber, "comment_id", lc.ID, "error", derr.Error())
+				return nil
 			}
+			c.recordComment(cctx, cacheKey, newID, hash)
 			return nil
 		}
 	} else {
@@ -1068,7 +1184,12 @@ func (c *Commenter) PostOrUpdateCommentKeyed(ctx context.Context, owner, repo, k
 	}
 
 	if len(mine) == 0 {
-		return c.createAndCache(ctx, owner, repo, prNumber, commentBody, hash, cacheKey)
+		newID, err := c.createComment(ctx, owner, repo, prNumber, commentBody, cacheKey)
+		if err != nil {
+			return err
+		}
+		c.recordComment(ctx, cacheKey, newID, hash)
+		return nil
 	}
 
 	// Newest = highest ID (GitHub issue-comment IDs are monotonic).
@@ -1114,21 +1235,27 @@ func (c *Commenter) PostOrUpdateCommentKeyed(ctx context.Context, owner, repo, k
 	// like the fast path: the verdict comment is already live, so failing the
 	// delivery would abort label reconciliation and roll back the admission
 	// mark — re-running the whole analysis (LLM included) just to clean a
-	// duplicate. Instead: clear the cache so the next post re-enters this
-	// sweep, warn, and report success.
-	if err := c.createAndCache(ctx, owner, repo, prNumber, commentBody, hash, cacheKey); err != nil {
+	// duplicate. Instead: leave the cache cold so the next post re-enters this
+	// sweep, warn, and report success. As on the fast path, the new comment
+	// is recorded only after every prior one is gone.
+	newID, err := c.createComment(ctx, owner, repo, prNumber, commentBody, cacheKey)
+	if err != nil {
 		return err
 	}
 	cctx, cancel := cleanupContext(ctx)
 	defer cancel()
+	swept := true
 	for _, cm := range mine {
 		delResp, err := c.client.Issues.DeleteComment(cctx, owner, repo, cm.GetID())
 		recordRateLimit(delResp, err)
 		if err != nil && (delResp == nil || delResp.StatusCode != http.StatusNotFound) {
-			c.cache.Delete(cctx, cacheKey)
-			slog.Default().Warn("prior PR comment delete failed during sweep; cache cleared so the next post re-sweeps",
+			swept = false
+			slog.Default().Warn("prior PR comment delete failed during sweep; cache left cold so the next post re-sweeps",
 				"owner", owner, "repo", repo, "pr", prNumber, "comment_id", cm.GetID(), "error", err.Error())
 		}
+	}
+	if swept {
+		c.recordComment(cctx, cacheKey, newID, hash)
 	}
 	return nil
 }
@@ -1292,19 +1419,28 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return lifecycle.Detach(ctx, cleanupTimeout)
 }
 
-// createAndCache posts a fresh comment and records its ID + body hash so the
-// next post for this scope can skip-if-unchanged and delete-by-ID on the fast
-// path.
-func (c *Commenter) createAndCache(ctx context.Context, owner, repo string, prNumber int, commentBody, hash, cacheKey string) error {
+// createComment posts a fresh comment and returns its ID. It drops the
+// scope's cached record first: until the caller records the new comment (see
+// recordComment), the record must not claim a state the PR doesn't have — a
+// stale ID, or "no comment" (which would make RemoveComment skip the new
+// one). A cold cache sends the next post or removal to the list-based path.
+func (c *Commenter) createComment(ctx context.Context, owner, repo string, prNumber int, commentBody, cacheKey string) (int64, error) {
+	c.cache.Delete(ctx, cacheKey)
 	newComment, resp, err := c.client.Issues.CreateComment(ctx, owner, repo, prNumber, &gh.IssueComment{Body: gh.String(commentBody)})
 	recordRateLimit(resp, err)
 	if err != nil {
-		return fmt.Errorf("create comment: %w", err)
+		return 0, fmt.Errorf("create comment: %w", err)
 	}
-	if newComment != nil && newComment.GetID() != 0 {
-		c.cache.Put(ctx, cacheKey, encodeLastComment(newComment.GetID(), hash), 0)
+	return newComment.GetID(), nil
+}
+
+// recordComment records the comment now live for this scope (its ID + body
+// hash) so the next post can skip-if-unchanged and delete-by-ID on the fast
+// path.
+func (c *Commenter) recordComment(ctx context.Context, cacheKey string, id int64, hash string) {
+	if id != 0 {
+		c.cache.Put(ctx, cacheKey, encodeLastComment(id, hash), 0)
 	}
-	return nil
 }
 
 // lastComment is the cached record of the comment the bridge last delivered
@@ -1426,7 +1562,9 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 	defer mu.Unlock()
 
 	cacheKey := prOutcomeCacheKey(owner, repo, prNumber)
-	if cached, hit := c.cache.Get(ctx, cacheKey); hit && string(cached) == headSHA+"|"+string(outcome) {
+	record := c.prOutcomeRecord(headSHA, outcome)
+	cached, hit := c.cache.Get(ctx, cacheKey)
+	if hit && string(cached) == record {
 		metrics.FetchCacheHits.WithLabelValues("pr_outcome").Inc()
 		return nil
 	}
@@ -1459,6 +1597,13 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 	}
 	remove = dedupeNonEmpty(remove, addSet)
 
+	// The record describes the labels this reconcile is about to change. Drop
+	// it before the first mutation: if a later step fails, a call with the old
+	// outcome must reconcile again rather than trust a record the PR no
+	// longer matches (e.g. both the old and the new label on it).
+	if hit {
+		c.cache.Delete(ctx, cacheKey)
+	}
 	if len(add) > 0 {
 		_, resp, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, prNumber, add)
 		recordRateLimit(resp, err)
@@ -1485,8 +1630,16 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 	// failure leaves the cache empty so the next call retries the full
 	// reconciliation rather than skipping based on a half-applied state.
 	// Head-scoped value: a new commit misses and re-asserts the labels.
-	c.cache.Put(ctx, cacheKey, []byte(headSHA+"|"+string(outcome)), 0)
+	c.cache.Put(ctx, cacheKey, []byte(record), 0)
 	return nil
+}
+
+// prOutcomeRecord is the cached value for an outcome written at a head. It
+// names the configured labels too, so renaming one (a new merge-gate label)
+// re-applies the labels at the same head instead of hitting a record written
+// under the old names.
+func (c *Commenter) prOutcomeRecord(headSHA string, outcome Outcome) string {
+	return fmt.Sprintf("%s|%s|%q|%q|%q", headSHA, outcome, c.labelSuccess, c.labelFailure, c.labelWarning)
 }
 
 // dedupeNonEmpty returns in with empty strings dropped, duplicates collapsed,

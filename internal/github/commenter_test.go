@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -110,6 +111,56 @@ func TestNewCommenter_EnterpriseURL(t *testing.T) {
 	}
 }
 
+// A redirect to another origin must not carry the installation token there:
+// ghinstallation sets Authorization on every hop, after net/http has dropped
+// it for the cross-origin request.
+func TestNewCommenter_RefusesCrossOriginRedirect(t *testing.T) {
+	var leaked atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			leaked.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]any{})
+	}))
+	t.Cleanup(other.Close)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/abc123/pulls", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/steal", http.StatusFound)
+	})
+	c := newCommenter(t, mux)
+
+	if _, err := c.FindPRsForCommit(context.Background(), "owner", "repo", "abc123"); err == nil {
+		t.Error("FindPRsForCommit followed a cross-origin redirect; want an error")
+	}
+	if n := leaked.Load(); n != 0 {
+		t.Fatalf("installation token sent to another origin on %d request(s)", n)
+	}
+}
+
+// A redirect within the same origin (e.g. a renamed repository) still works.
+func TestNewCommenter_FollowsSameOriginRedirect(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/abc123/pulls", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/api/v3/repos/owner/renamed/commits/abc123/pulls", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/api/v3/repos/owner/renamed/commits/abc123/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 42, "state": "open", "head": map[string]any{"sha": "abc123"}}})
+	})
+	serveNonMergeCommit(mux, "abc123")
+	c := newCommenter(t, mux)
+
+	prs, err := c.FindPRsForCommit(context.Background(), "owner", "repo", "abc123")
+	if err != nil {
+		t.Fatalf("FindPRsForCommit: %v", err)
+	}
+	if len(prs) == 0 || prs[0].Number != 42 {
+		t.Fatalf("got %+v, want PR #42 through the same-origin redirect", prs)
+	}
+}
+
 func TestFindPRsForCommit_EmptySHA(t *testing.T) {
 	c, err := bridgegithub.NewCommenter(appAuth(t, ""), bridgegithub.Options{})
 	if err != nil {
@@ -130,6 +181,7 @@ func TestFindPRsForCommit_ReturnsPRNumber(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 42, "state": "open"}})
 	})
+	serveNonMergeCommit(mux, "abc123")
 	c := newCommenter(t, mux)
 
 	prs, err := c.FindPRsForCommit(context.Background(), "owner", "repo", "abc123")
@@ -138,6 +190,49 @@ func TestFindPRsForCommit_ReturnsPRNumber(t *testing.T) {
 	}
 	if len(prs) != 1 || prs[0].Number != 42 {
 		t.Fatalf("expected [PR#42], got %+v", prs)
+	}
+}
+
+// serveNonMergeCommit serves sha as a single-parent commit, so the parent
+// walk FindPRsForCommit runs after the direct lookup ends right there.
+func serveNonMergeCommit(mux *http.ServeMux, sha string) {
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/"+sha, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"sha": sha, "parents": []map[string]any{{"sha": "older"}}})
+	})
+}
+
+// A deployed branch that is also the head of an open PR (a promotion PR from
+// the dev branch) must not hide the PRs merged into it: the direct lookup
+// returns the promotion PR, and the parent walk still finds the feature PR.
+func TestFindPRsForCommit_DirectHitStillWalksMergeParents(t *testing.T) {
+	const mergeSHA, featureHead = "merge0001", "feature1"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/"+mergeSHA+"/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 1, "state": "open"}}) // promotion PR
+	})
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/"+mergeSHA, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"sha": mergeSHA, "parents": []map[string]any{{"sha": "dev0000"}, {"sha": featureHead}}})
+	})
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/"+featureHead+"/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 7, "state": "open"}, {"number": 1, "state": "open"}})
+	})
+	serveNonMergeCommit(mux, "dev0000")
+	c := newCommenter(t, mux)
+
+	prs, err := c.FindPRsForCommit(context.Background(), "owner", "repo", mergeSHA)
+	if err != nil {
+		t.Fatalf("FindPRsForCommit: %v", err)
+	}
+	var got []int
+	for _, pr := range prs {
+		got = append(got, pr.Number)
+	}
+	if len(got) != 2 || got[0] != 1 || got[1] != 7 {
+		t.Fatalf("PR numbers = %v, want [1 7] (promotion PR, then the merged-in feature PR, each once)", got)
 	}
 }
 
@@ -205,9 +300,10 @@ func TestFindPRsForCommit_CachesWholeResult(t *testing.T) {
 // push), only ONE of them runs the direct-lookup + merge-parent walk; the
 // rest block on it and reuse the result. Without coalescing each would walk,
 // producing one full set of GitHub calls per caller. We park the leader
-// mid-walk on a barrier so the waiters provably attach to the in-flight
-// resolution before it completes, then assert exactly one walk's worth of
-// API calls and that every caller got the same PR.
+// mid-walk on a barrier and release it only once every waiter has checked
+// the result cache and missed, so no waiter can be served from a cache the
+// leader filled; then assert exactly one walk's worth of API calls and that
+// every caller got the same PR.
 func TestFindPRsForCommit_CoalescesConcurrent(t *testing.T) {
 	const mergeSHA = "merge0001"
 	const prHead = "feature1"
@@ -243,7 +339,8 @@ func TestFindPRsForCommit_CoalescesConcurrent(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"sha": sha, "parents": []map[string]any{{"sha": "older"}}})
 	})
 
-	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: fetchcache.NewLRU(64)})
+	gets := &walkGets{Cache: fetchcache.NewLRU(64)}
+	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: gets})
 	ctx := context.Background()
 
 	type result struct {
@@ -271,7 +368,10 @@ func TestFindPRsForCommit_CoalescesConcurrent(t *testing.T) {
 			results <- result{prs, err}
 		}()
 	}
-	// Give the waiters a beat to enter singleflight.Do before releasing.
+	// The leader read the result cache twice (before and inside the single
+	// flight), each waiter once: all of them missed while the leader is parked.
+	waitFor(t, func() bool { return gets.n.Load() >= callers+1 })
+	// Give the waiters a beat to join the single flight before releasing.
 	time.Sleep(50 * time.Millisecond)
 	close(release)
 
@@ -286,6 +386,197 @@ func TestFindPRsForCommit_CoalescesConcurrent(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&directMergeCalls); got != 1 {
 		t.Errorf("expected exactly 1 merge-commit walk across %d concurrent callers (single-flight); got %d", callers, got)
+	}
+}
+
+// walkGets counts reads of the whole-resolution (prs-walk) cache, so a test
+// can wait until its callers have checked that cache before it lets a parked
+// leader finish.
+type walkGets struct {
+	fetchcache.Cache
+	n atomic.Int32
+}
+
+func (c *walkGets) Get(ctx context.Context, key string) ([]byte, bool) {
+	if strings.HasPrefix(key, "prs-walk:") {
+		c.n.Add(1)
+	}
+	return c.Cache.Get(ctx, key)
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// parkedWalkMux serves a merge commit whose second parent is the head of open
+// PR #7. The first direct lookup of the merge commit parks until park returns.
+func parkedWalkMux(entered chan<- struct{}, park func(*http.Request)) *http.ServeMux {
+	const mergeSHA, prHead = "merge0001", "feature1"
+	var once sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v3/repos/owner/repo/commits/"), "/")
+		sha := parts[0]
+		if len(parts) == 2 && parts[1] == "pulls" {
+			if sha == prHead {
+				_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 7, "state": "open"}})
+				return
+			}
+			first := false
+			once.Do(func() { first = true })
+			if first {
+				close(entered)
+				park(r)
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		if sha == mergeSHA {
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha": sha, "parents": []map[string]any{{"sha": "base"}, {"sha": prHead}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"sha": sha, "parents": []map[string]any{{"sha": "older"}}})
+	})
+	return mux
+}
+
+// A caller waiting on another event's resolution stops waiting when its own
+// context ends, instead of blocking until the leader's walk finishes.
+func TestFindPRsForCommit_WaiterCancelStopsWaiting(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	gets := &walkGets{Cache: fetchcache.NewLRU(64)}
+	c := newCommenterWithOptions(t, parkedWalkMux(entered, func(*http.Request) { <-release }), bridgegithub.Options{Cache: gets})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := c.FindPRsForCommit(context.Background(), "owner", "repo", "merge0001")
+		leaderDone <- err
+	}()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := c.FindPRsForCommit(ctx, "owner", "repo", "merge0001")
+		waiterDone <- err
+	}()
+	waitFor(t, func() bool { return gets.n.Load() >= 3 })
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("waiter error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled waiter still blocked on the leader's walk")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-leaderDone; err != nil {
+		t.Errorf("leader: %v", err)
+	}
+}
+
+// When the leader's context ends mid-walk, a waiter with time left resolves
+// the PRs itself instead of failing with the leader's cancellation.
+func TestFindPRsForCommit_WaiterSurvivesLeaderCancel(t *testing.T) {
+	entered := make(chan struct{})
+	gets := &walkGets{Cache: fetchcache.NewLRU(64)}
+	c := newCommenterWithOptions(t, parkedWalkMux(entered, func(r *http.Request) { <-r.Context().Done() }), bridgegithub.Options{Cache: gets})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := c.FindPRsForCommit(leaderCtx, "owner", "repo", "merge0001")
+		leaderDone <- err
+	}()
+	<-entered
+
+	type result struct {
+		prs []bridgegithub.PRInfo
+		err error
+	}
+	waiterDone := make(chan result, 1)
+	go func() {
+		prs, err := c.FindPRsForCommit(context.Background(), "owner", "repo", "merge0001")
+		waiterDone <- result{prs, err}
+	}()
+	waitFor(t, func() bool { return gets.n.Load() >= 3 })
+	time.Sleep(20 * time.Millisecond)
+	cancelLeader()
+
+	if err := <-leaderDone; err == nil {
+		t.Error("cancelled leader returned no error")
+	}
+	select {
+	case r := <-waiterDone:
+		if r.err != nil {
+			t.Fatalf("waiter failed with the leader's cancellation: %v", r.err)
+		}
+		if len(r.prs) != 1 || r.prs[0].Number != 7 {
+			t.Fatalf("waiter got %+v, want [PR#7]", r.prs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter never returned")
+	}
+}
+
+// walkPutTTLs records the TTL of every whole-resolution (prs-walk) write.
+type walkPutTTLs struct {
+	fetchcache.Cache
+	mu   sync.Mutex
+	ttls []time.Duration
+}
+
+func (c *walkPutTTLs) Put(ctx context.Context, key string, value []byte, ttl time.Duration) {
+	if strings.HasPrefix(key, "prs-walk:") {
+		c.mu.Lock()
+		c.ttls = append(c.ttls, ttl)
+		c.mu.Unlock()
+	}
+	c.Cache.Put(ctx, key, value, ttl)
+}
+
+// A resolution built from cached per-commit lookups is as old as the oldest
+// of them, so its cache entry must expire with that lookup instead of getting
+// a fresh full TTL (which would serve PR state up to twice the TTL old).
+func TestFindPRsForCommit_WalkEntryExpiresWithItsOldestLookup(t *testing.T) {
+	const ttl, wait = 400 * time.Millisecond, 200 * time.Millisecond
+	mux := parkedWalkMux(make(chan struct{}), func(*http.Request) {})
+	cache := &walkPutTTLs{Cache: fetchcache.NewLRU(64)}
+	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: cache, PRsForCommitTTL: ttl})
+	ctx := context.Background()
+
+	if _, err := c.FindPRsForCommit(ctx, "owner", "repo", "merge0001"); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	time.Sleep(wait)
+	// A new resolution that reuses the per-commit entries cached above.
+	cache.Delete(ctx, "prs-walk:owner/repo/merge0001")
+	prs, err := c.FindPRsForCommit(ctx, "owner", "repo", "merge0001")
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 7 {
+		t.Fatalf("second: got %+v, want [PR#7]", prs)
+	}
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if len(cache.ttls) == 2 && cache.ttls[1] > ttl-wait {
+		t.Fatalf("whole-resolution entry cached for %s; its lookups were already %s old, so at most %s is left", cache.ttls[1], wait, ttl-wait)
 	}
 }
 
@@ -312,10 +603,14 @@ func TestListPRsForCommit_NegativeCaches(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"sha": sha, "parents": []map[string]any{{"sha": "base"}}})
 	})
 
-	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: fetchcache.NewLRU(16)})
+	cache := fetchcache.NewLRU(16)
+	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: cache})
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
+		// Evict the whole-resolution entry so each call reaches the direct
+		// lookup and only its own (negative) cache can save the API call.
+		cache.Delete(ctx, "prs-walk:owner/repo/"+sha)
 		prs, err := c.FindPRsForCommit(ctx, "owner", "repo", sha)
 		if err != nil {
 			t.Fatalf("call %d: %v", i, err)
@@ -1375,8 +1670,9 @@ func TestFindPRsForCommit_CachesMergeWalk(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(body)
 	})
 
+	cache := fetchcache.NewLRU(64)
 	c := newCommenterWithOptions(t, mux, bridgegithub.Options{
-		Cache:           fetchcache.NewLRU(64),
+		Cache:           cache,
 		ParentWalkDepth: 10,
 	})
 
@@ -1398,6 +1694,9 @@ func TestFindPRsForCommit_CachesMergeWalk(t *testing.T) {
 	// Second walk from the SAME head: GetCommit calls must NOT increase
 	// (every ancestor is now cached). PR-for-commit calls also reuse the
 	// cache (PRsForCommitTTL > 0 by default when Options.Cache is set).
+	// The whole-resolution entry is evicted first, so the walk really runs
+	// and only the per-commit caches can save the calls.
+	cache.Delete(ctx, "prs-walk:owner/repo/head")
 	prs2, err := c.FindPRsForCommit(ctx, "owner", "repo", "head")
 	if err != nil {
 		t.Fatalf("second walk: %v", err)
@@ -2024,6 +2323,105 @@ func TestSetPRLabels_DoesNotCacheOnPartialFailure(t *testing.T) {
 	}
 }
 
+// A transition that adds the new label but fails to remove the old one must
+// not leave the PREVIOUS outcome's record in the cache: a later call with that
+// outcome would hit it and leave both labels on the PR.
+func TestSetPRLabels_PartialTransitionInvalidatesPriorOutcome(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		failDel bool
+		ops     []string
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/labels", func(w http.ResponseWriter, r *http.Request) {
+		var names []string
+		_ = json.NewDecoder(r.Body).Decode(&names)
+		mu.Lock()
+		ops = append(ops, "add "+strings.Join(names, ","))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]any{})
+	})
+	mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/labels/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		ops = append(ops, "remove "+strings.TrimPrefix(r.URL.Path, "/api/v3/repos/owner/repo/issues/42/labels/"))
+		if failDel {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: fetchcache.NewLRU(64)})
+	ctx := context.Background()
+
+	if err := c.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("seed success: %v", err)
+	}
+	mu.Lock()
+	failDel = true
+	mu.Unlock()
+	// flux-failed is added, removing flux-success fails.
+	if err := c.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeFailure); err == nil {
+		t.Fatal("failure transition with a failing DELETE must return an error")
+	}
+	mu.Lock()
+	failDel, ops = false, nil
+	mu.Unlock()
+
+	if err := c.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("back to success: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	got := strings.Join(ops, "; ")
+	if !strings.Contains(got, "add "+bridgegithub.DefaultPRLabelSuccess) || !strings.Contains(got, "remove "+bridgegithub.DefaultPRLabelFailure) {
+		t.Fatalf("success after a partial failure transition must reconcile (add %s, remove %s); got [%s]",
+			bridgegithub.DefaultPRLabelSuccess, bridgegithub.DefaultPRLabelFailure, got)
+	}
+}
+
+// Renaming an outcome label must re-apply the labels at the same head: the
+// record written under the old names must not short-circuit the new one.
+func TestSetPRLabels_RenamedLabelReappliesAtSameHead(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		added []string
+	)
+	labelsMux := func() *http.ServeMux {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/labels", func(w http.ResponseWriter, r *http.Request) {
+			var names []string
+			_ = json.NewDecoder(r.Body).Decode(&names)
+			mu.Lock()
+			added = append(added, names...)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode([]any{})
+		})
+		mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/labels/", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		return mux
+	}
+	shared := fetchcache.NewLRU(64) // stands for Redis across a restart
+	ctx := context.Background()
+
+	before := newCommenterWithOptions(t, labelsMux(), bridgegithub.Options{Cache: shared})
+	if err := before.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("before rename: %v", err)
+	}
+	after := newCommenterWithOptions(t, labelsMux(), bridgegithub.Options{Cache: shared, PRLabelSuccess: "deploy-ok"})
+	if err := after.SetPRLabels(ctx, "owner", "repo", 42, "h1", bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("after rename: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(added) != 2 || added[1] != "deploy-ok" {
+		t.Fatalf("added labels = %v, want the renamed label deploy-ok applied at the same head", added)
+	}
+}
+
 // TestSetPRLabels_RemoveLabelNotFoundIsSwallowed pins the idempotency
 // contract: a 404 on RemoveLabelForIssue means "label wasn't on the PR" —
 // the next state-transition replay must not trip on it.
@@ -2055,6 +2453,8 @@ func TestSetPRLabels_RemoveLabelNotFoundIsSwallowed(t *testing.T) {
 func TestPostOrUpdateComment_CreateBeforeDelete(t *testing.T) {
 	var ops []string
 	var failCreate bool
+	live := map[int64]string{}
+	nextID := int64(100)
 	mu := sync.Mutex{}
 
 	mux := http.NewServeMux()
@@ -2064,26 +2464,40 @@ func TestPostOrUpdateComment_CreateBeforeDelete(t *testing.T) {
 		case http.MethodGet:
 			mu.Lock()
 			ops = append(ops, "list")
+			var out []map[string]any
+			for id, body := range live {
+				out = append(out, map[string]any{"id": float64(id), "body": body})
+			}
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			_ = json.NewEncoder(w).Encode(out)
 		case http.MethodPost:
+			var in struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
 			mu.Lock()
 			fail := failCreate
 			ops = append(ops, "create")
-			n := len(ops)
+			nextID++
+			id := nextID
+			if !fail {
+				live[id] = in.Body
+			}
 			mu.Unlock()
 			if fail {
 				w.WriteHeader(http.StatusBadGateway)
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(100 + n)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id)})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
+			id, _ := strconv.ParseInt(r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:], 10, 64)
 			mu.Lock()
 			ops = append(ops, "delete")
+			delete(live, id)
 			mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 		}
@@ -2110,8 +2524,9 @@ func TestPostOrUpdateComment_CreateBeforeDelete(t *testing.T) {
 		t.Fatalf("swap order must be create-then-delete, got [%s]", got)
 	}
 
-	// Failed create: the old comment must NOT be deleted, and the cache must
-	// still point at it so the next attempt retries the full swap.
+	// Failed create: the old comment must NOT be deleted. The cache is left
+	// cold (the create may have landed despite the error), so the next
+	// attempt lists the comments and retries the full swap.
 	mu.Lock()
 	ops, failCreate = nil, true
 	mu.Unlock()
@@ -2125,16 +2540,19 @@ func TestPostOrUpdateComment_CreateBeforeDelete(t *testing.T) {
 	if got != "create" {
 		t.Fatalf("failed create must not delete the old comment, got [%s]", got)
 	}
-	// Retry succeeds and swaps in order again — proving the cache survived
-	// the failed attempt intact.
+	// Retry succeeds and swaps in order again, removing the old comment.
 	if err := c.PostOrUpdateComment(ctx, "owner", "repo", "apps", "api", 42, "body 3"); err != nil {
 		t.Fatalf("retry post: %v", err)
 	}
 	mu.Lock()
 	got = strings.Join(ops, ",")
+	n := len(live)
 	mu.Unlock()
-	if got != "create,delete" {
-		t.Fatalf("retry must swap create-then-delete, got [%s]", got)
+	if got != "list,create,delete" {
+		t.Fatalf("retry must list, then swap create-then-delete, got [%s]", got)
+	}
+	if n != 1 {
+		t.Fatalf("retry must leave exactly one comment, got %d", n)
 	}
 }
 

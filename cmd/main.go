@@ -124,7 +124,11 @@ func run(logger *slog.Logger) error {
 	if cfg.InstanceID != "" {
 		keyPrefix += cfg.InstanceID + ":"
 	}
-	dedupeCache := newDedupe(logger, keyPrefix+"dedupe:").WithMaxTTL(cfg.DedupePersistenceMaxTTL)
+	dedupeCache, err := newDedupe(logger, keyPrefix+"dedupe:")
+	if err != nil {
+		return err
+	}
+	dedupeCache = dedupeCache.WithMaxTTL(cfg.DedupePersistenceMaxTTL)
 	fetchCache := newFetchCache(dedupeCache, keyPrefix+"fetchcache:", cfg.DedupePersistenceMaxTTL, logger)
 	commenter, err := bridgegithub.NewCommenter(authCfg, bridgegithub.Options{
 		KeepCommentHistory: cfg.GitHubKeepCommentHistory,
@@ -388,12 +392,14 @@ func newFetchCache(dedupeCache *dedupe.Cache, keyPrefix string, maxTTL time.Dura
 // "<pass>\n" to Redis AUTH returns WRONGPASS even though the password is
 // "correct."
 //
-// On Redis construction error, log loudly and fall back to in-memory
-// rather than crash-loop the bridge over a Valkey hiccup — the bridge
-// still works, it just loses dedupe state on restart. Auth errors at
-// startup are logged at ERROR (not WARN) by the dedupe package so the
-// operator notices instead of silently fail-opening.
-func newDedupe(logger *slog.Logger, keyPrefix string) *dedupe.Cache {
+// A Redis construction error (a malformed URL, a missing master name) is
+// returned and stops startup: falling back to a per-process in-memory cache
+// would let every replica admit the same PR-head on its own, which breaks
+// fail closed. A Valkey that is merely down at startup does not reach this
+// path: the client is still built, and admission fails closed per call
+// until the server answers. Auth errors at startup are logged at ERROR (not
+// WARN) by the dedupe package so the operator notices.
+func newDedupe(logger *slog.Logger, keyPrefix string) (*dedupe.Cache, error) {
 	const capacity = 4096
 	username := strings.TrimSpace(os.Getenv("DEDUPE_PERSISTENCE_USER"))
 	password := strings.TrimSpace(os.Getenv("DEDUPE_PERSISTENCE_PASSWORD"))
@@ -417,42 +423,53 @@ func newDedupe(logger *slog.Logger, keyPrefix string) *dedupe.Cache {
 			KeyPrefix:        keyPrefix,
 		}
 		c, err := dedupe.NewRedisSentinel(opts)
-		if err == nil {
-			logger.Info("dedupe: sentinel persistence enabled",
-				"master", opts.MasterName, "sentinels", len(opts.Addrs), "tls", opts.UseTLS)
-			return c
+		if err != nil {
+			return nil, fmt.Errorf("dedupe: DEDUPE_PERSISTENCE_SENTINEL_ADDRS is set but the sentinel client could not be built: %w", err)
 		}
-		logger.Warn("dedupe: sentinel construction failed; falling back to in-memory",
-			"error", err.Error())
-	} else if url := strings.TrimSpace(os.Getenv("DEDUPE_PERSISTENCE_URL")); url != "" {
+		logger.Info("dedupe: sentinel persistence enabled",
+			"master", opts.MasterName, "sentinels", len(opts.Addrs), "tls", opts.UseTLS)
+		return c, nil
+	}
+	if url := strings.TrimSpace(os.Getenv("DEDUPE_PERSISTENCE_URL")); url != "" {
 		c, err := dedupe.NewRedis(url, username, password, keyPrefix, 0)
-		if err == nil {
-			logger.Info("dedupe: persistence enabled", "url_host", redactedHost(url))
-			return c
+		if err != nil {
+			return nil, fmt.Errorf("dedupe: DEDUPE_PERSISTENCE_URL is set but the client could not be built: %w", withoutURL(err))
 		}
-		logger.Warn("dedupe: persistence URL set but client construction failed; falling back to in-memory",
-			"error", err.Error())
+		logger.Info("dedupe: persistence enabled", "url_host", redactedHost(url))
+		return c, nil
 	}
 	raw := strings.TrimSpace(os.Getenv("DEDUPE_TTL"))
 	if raw == "" {
-		return dedupe.NewNoExpiry(capacity)
+		return dedupe.NewNoExpiry(capacity), nil
 	}
 	if raw == "0" {
-		return dedupe.New(0, capacity)
+		return dedupe.New(0, capacity), nil
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
 		// Garbled value → behave like unset rather than crash.
 		logger.Warn("dedupe: DEDUPE_TTL unparseable; treating as unset (no expiry)", "value", raw)
-		return dedupe.NewNoExpiry(capacity)
+		return dedupe.NewNoExpiry(capacity), nil
 	}
 	if d <= 0 {
 		// "0s" (or any zero/negative duration) means the same as "0":
 		// dedupe disabled. Previously only the literal "0" disabled it and
 		// "0s" silently flipped to no-expiry — the exact opposite.
-		return dedupe.New(0, capacity)
+		return dedupe.New(0, capacity), nil
 	}
-	return dedupe.New(d, capacity)
+	return dedupe.New(d, capacity), nil
+}
+
+// withoutURL drops the raw URL from a URL parse error. url.Error quotes the
+// whole input, userinfo included, so a malformed DEDUPE_PERSISTENCE_URL
+// would put the Redis password into the startup log. The inner error still
+// names what is wrong (e.g. an invalid port).
+func withoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 // buildResolver populates the readiness Resolver from MCP discovery. Returns

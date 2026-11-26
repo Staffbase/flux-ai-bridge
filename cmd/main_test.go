@@ -15,7 +15,9 @@
 package main
 
 import (
+	"io"
 	"log/slog"
+	"strings"
 	"testing"
 )
 
@@ -68,5 +70,60 @@ func TestParseIntEnv(t *testing.T) {
 				t.Errorf("parseIntEnv(%q=%q, %d) = %d, want %d", key, tc.value, tc.fallback, got, tc.want)
 			}
 		})
+	}
+}
+
+// A configured but unbuildable dedupe persistence must stop startup instead
+// of falling back to a per-process in-memory cache: with several replicas,
+// each would admit the same PR-head on its own.
+func TestNewDedupe_ConfiguredPersistenceFailsClosed(t *testing.T) {
+	const secret = "s3cr3t-pw"
+	tests := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"malformed URL", map[string]string{
+			"DEDUPE_PERSISTENCE_URL": "redis://user:" + secret + "@redis.example.com:bad",
+		}},
+		{"sentinel without master name", map[string]string{
+			"DEDUPE_PERSISTENCE_SENTINEL_ADDRS": "sentinel.example.com:26379",
+		}},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range []string{"DEDUPE_PERSISTENCE_URL", "DEDUPE_PERSISTENCE_SENTINEL_ADDRS", "DEDUPE_PERSISTENCE_MASTER_NAME", "DEDUPE_TTL"} {
+				t.Setenv(k, "")
+			}
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			c, err := newDedupe(logger, "test:")
+			if err == nil {
+				t.Fatalf("newDedupe() = %v, nil; want an error, not an in-memory fallback", c)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("error leaks the persistence password: %v", err)
+			}
+		})
+	}
+}
+
+// The Redis URL parse error quotes the raw URL, userinfo included; the
+// startup error must not carry it into the log.
+func TestNewDedupe_MalformedURLErrorOmitsCredentials(t *testing.T) {
+	t.Setenv("DEDUPE_PERSISTENCE_SENTINEL_ADDRS", "")
+	t.Setenv("DEDUPE_PERSISTENCE_URL", "redis://user:s3cr3t-pw@redis.example.com:bad")
+	_, err := newDedupe(slog.New(slog.NewTextHandler(io.Discard, nil)), "test:")
+	if err == nil {
+		t.Fatal("newDedupe() returned no error for a malformed URL")
+	}
+	for _, leak := range []string{"s3cr3t-pw", "user:", "redis://"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error contains %q: %v", leak, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "port") {
+		t.Errorf("error lost the cause (invalid port): %v", err)
 	}
 }
