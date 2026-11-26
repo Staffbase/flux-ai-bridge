@@ -178,12 +178,12 @@ Typical use cases: air-gapped clusters with no LLM endpoint reachable, cost-sens
 | `config.dedupe.persistence.existingSecret` | `""` | Name of a pre-existing Secret holding the dedupe password. The chart looks up the password key via `passwordKey` below — letting you consume a third-party Secret (e.g. one provisioned by an external-secrets operator) without renaming its keys |
 | `config.dedupe.persistence.passwordKey` | `"DEDUPE_PERSISTENCE_PASSWORD"` | Key inside `existingSecret` holding the Redis-backend password. Set to `""` to skip password injection (e.g. username-only ACL flows where `user` carries auth) |
 | `config.dedupe.persistence.sentinel.enabled` | `false` | Enable Redis Sentinel mode (HA). When true, supersedes the single-node `url` field and the bridge uses go-redis's FailoverClient — connecting to the sentinel quorum and following master failover transparently |
-| `config.dedupe.persistence.sentinel.addrs` | `""` | Sentinel quorum addresses, passed straight to go-redis's FailoverClient (`DEDUPE_PERSISTENCE_SENTINEL_ADDRS`). Point at the Redis chart's **headless** Service DNS (returns every sentinel pod — one entry suffices, e.g. `redis-flux-ai-bridge-headless.flux-system.svc.cluster.local:26379`) or a comma-separated list of per-pod FQDNs for maximum robustness. The port lives in each addr. Don't use a plain ClusterIP Service — it returns one VIP and defeats the quorum. Required when `sentinel.enabled=true` |
-| `config.dedupe.persistence.sentinel.masterName` | `""` | Sentinel master label (e.g. Bitnami default `mymaster`). Required when `sentinel.enabled=true` |
+| `config.dedupe.persistence.sentinel.addrs` | `""` | Sentinel quorum addresses, passed straight to go-redis's FailoverClient (`DEDUPE_PERSISTENCE_SENTINEL_ADDRS`). Point at the Redis chart's **headless** Service DNS (returns every sentinel pod — one entry suffices, e.g. `redis-flux-ai-bridge-headless.flux-system.svc.cluster.local:26379`) or a comma-separated list of per-pod FQDNs for maximum robustness. The port lives in each addr. Don't use a plain ClusterIP Service — it returns one VIP and defeats the quorum. Required when `sentinel.enabled=true`. With the bundled Valkey in Sentinel mode (`valkey.replica.enabled` + `valkey.sentinel.enabled`), defaults to its Sentinel headless Service `<valkey>-sentinel-hl.<namespace>.svc.cluster.local:26379` |
+| `config.dedupe.persistence.sentinel.masterName` | `""` | Sentinel master label (e.g. Bitnami default `mymaster`). Required when `sentinel.enabled=true`. With the bundled Valkey in Sentinel mode, defaults to its `valkey.sentinel.masterSet` (`mymaster`) |
 | `config.dedupe.persistence.sentinel.db` | `0` | Logical Redis database number |
 | `config.dedupe.persistence.sentinel.tls` | `false` | Enable TLS on sentinel + master connections |
 | `config.dedupe.persistence.sentinel.user` | `""` | Sentinel-daemon ACL username, plaintext (usernames aren't secret) |
-| `config.dedupe.persistence.sentinel.password` | `""` | Inline sentinel-daemon ACL password. Stored in the chart-created Secret under `DEDUPE_PERSISTENCE_SENTINEL_PASSWORD`. Prefer `existingSecret` + `sentinel.passwordKey` for production |
+| `config.dedupe.persistence.sentinel.password` | `""` | Inline sentinel-daemon ACL password. Stored in the chart-created Secret under `DEDUPE_PERSISTENCE_SENTINEL_PASSWORD`. Prefer `existingSecret` + `sentinel.passwordKey` for production. Also works with the bundled Valkey when it runs Sentinel (`valkey.replica.enabled`, `valkey.sentinel.enabled`, which also needs `valkey.persistence` and `valkey.sentinel.password`); set this password to the same value |
 | `config.dedupe.persistence.sentinel.passwordKey` | `""` | Key inside `existingSecret` holding the sentinel password. Empty (default) means don't mount a sentinel password, appropriate when your sentinel quorum is unauthenticated |
 | `config.prFilter.requiredLabels` | `[]` | When non-empty, only post analysis to PRs carrying at least one of these labels (OR semantics, case-sensitive). Useful for opting individual PRs into bridge review rather than commenting on every PR a Kustomization happens to be part of — particularly in autodev flows where one merge SHA maps to many PRs. Rendered into `PR_REQUIRED_LABELS` (comma-separated) |
 | `config.prFilter.attributePrunes` | `true` | Maps to `PR_ATTRIBUTE_PRUNES`. Attribute pure-deletion PRs by what the reconcile pruned (so a clean teardown reads `flux-success`); only rendered into the Deployment when set to `false`. See `PR_ATTRIBUTE_PRUNES` above for full semantics |
@@ -340,7 +340,7 @@ The chart sets small requests so the pod isn't BestEffort and an HPA has a basel
 
 ### Probes
 
-The liveness probe hits `GET /healthz`, the readiness probe hits `GET /readyz`. Defaults:
+The startup and liveness probes hit `GET /healthz`, the readiness probe hits `GET /readyz`. The startup probe holds the liveness probe until the bridge serves `/healthz` once: startup connects to the MCP server, the dedupe store and GitHub before the HTTP server listens, and on a fresh install those start at the same time. Defaults:
 
 | Value | Default |
 |---|---|
@@ -350,6 +350,9 @@ The liveness probe hits `GET /healthz`, the readiness probe hits `GET /readyz`. 
 | `readinessProbe.initialDelaySeconds` | `3` |
 | `readinessProbe.periodSeconds` | `5` |
 | `readinessProbe.timeoutSeconds` | `3` |
+| `startupProbe.periodSeconds` | `5` |
+| `startupProbe.timeoutSeconds` | `3` |
+| `startupProbe.failureThreshold` | `24` (two minutes) |
 
 ---
 

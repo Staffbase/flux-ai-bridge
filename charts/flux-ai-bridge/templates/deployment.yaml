@@ -15,21 +15,15 @@ The fix is one of:
 {{- if and $multiReplica (not $dedupePersisted) }}
 {{- fail "replicaCount > 1 (or autoscaling.enabled) requires persistent dedupe so the replicas coordinate via Redis/Valkey SETNX. Set config.dedupe.persistence.enabled=true plus either valkey.enabled=true (bundled) or config.dedupe.persistence.url=redis://... (external). See chart/values.yaml ─── HA ─── section." }}
 {{- end }}
-{{- /*
-Misconfig guards for dedupe persistence:
-  - valkey.enabled (bundled single-node Valkey) + sentinel.enabled is a
-    confused configuration: sentinel mode points at a user-managed
-    Redis+Sentinel cluster, so the bundled Valkey would deploy AND be
-    ignored. Fail fast — the operator likely meant one or the other.
-  - sentinel.{addrs/user/password/passwordKey/masterName} set while
-    sentinel.enabled=false silently drops those values. Most often happens
-    when copy-pasting a sentinel block then forgetting the toggle. Fail with
-    a pointer so the operator notices.
-*/}}
+{{- /* Dedupe persistence guards; see config.dedupe.persistence.sentinel in values.yaml. */}}
 {{- $persistence := .Values.config.dedupe.persistence | default dict }}
 {{- $sentinelBlk := $persistence.sentinel | default dict }}
-{{- if and .Values.valkey.enabled $sentinelBlk.enabled }}
-{{- fail "Both valkey.enabled=true (bundled single-node Valkey) AND config.dedupe.persistence.sentinel.enabled=true are set. Sentinel mode points at a user-managed Redis+Sentinel cluster; the bundled Valkey would be deployed but ignored. Pick one." }}
+{{- $bundledSentinel := and .Values.valkey.enabled (dig "replica" "enabled" false .Values.valkey) (dig "sentinel" "enabled" false .Values.valkey) }}
+{{- if and .Values.valkey.enabled $sentinelBlk.enabled (not $bundledSentinel) }}
+{{- fail "config.dedupe.persistence.sentinel.enabled=true with valkey.enabled=true needs the bundled Valkey in Sentinel mode: set valkey.replica.enabled=true and valkey.sentinel.enabled=true. To use an external Sentinel cluster instead, set valkey.enabled=false." }}
+{{- end }}
+{{- if and $bundledSentinel $persistence.enabled (not $sentinelBlk.enabled) (not $persistence.url) }}
+{{- fail "The bundled Valkey runs Sentinel (valkey.sentinel.enabled=true): set config.dedupe.persistence.sentinel.enabled=true so the bridge finds the master through Sentinel; the plain Service balances across master and replicas." }}
 {{- end }}
 {{- if and (not $sentinelBlk.enabled) (or $sentinelBlk.addrs $sentinelBlk.masterName $sentinelBlk.user $sentinelBlk.password $sentinelBlk.passwordKey) }}
 {{- fail "config.dedupe.persistence.sentinel.* fields are set but sentinel.enabled=false — those values would be silently ignored. Either set sentinel.enabled=true or remove the sentinel sub-block from your values." }}
@@ -193,13 +187,22 @@ spec:
             without a dedicated field; a plain Service VIP would only ever
             return one IP and defeat the quorum, so use the headless name.
             */}}
-            {{- if not (and $sentinel.addrs $sentinel.masterName) }}
+            {{- /* Bundled Valkey in Sentinel mode: default addrs and masterName from it. */}}
+            {{- $sentinelAddrs := $sentinel.addrs }}
+            {{- $sentinelMaster := $sentinel.masterName }}
+            {{- if .Values.valkey.enabled }}
+              {{- $valkeyName := .Values.valkey.fullnameOverride | default "valkey" }}
+              {{- $sentinelPort := dig "sentinel" "port" 26379 .Values.valkey }}
+              {{- $sentinelAddrs = $sentinelAddrs | default (printf "%s-sentinel-hl.%s.svc.cluster.local:%v" $valkeyName .Release.Namespace $sentinelPort) }}
+              {{- $sentinelMaster = $sentinelMaster | default (dig "sentinel" "masterSet" "mymaster" .Values.valkey) }}
+            {{- end }}
+            {{- if not (and $sentinelAddrs $sentinelMaster) }}
               {{- fail "config.dedupe.persistence.sentinel.enabled=true requires `addrs` AND `masterName`. addrs is the sentinel quorum (e.g. \"redis-headless.<ns>.svc.cluster.local:26379\", or a comma-separated list of pod DNS names); masterName matches the sentinel `monitor <name> …` config line (often \"mymaster\"). See chart values.yaml `sentinel:` block." }}
             {{- end }}
             - name: DEDUPE_PERSISTENCE_SENTINEL_ADDRS
-              value: {{ $sentinel.addrs | quote }}
+              value: {{ $sentinelAddrs | quote }}
             - name: DEDUPE_PERSISTENCE_MASTER_NAME
-              value: {{ $sentinel.masterName | quote }}
+              value: {{ $sentinelMaster | quote }}
             {{- if $sentinel.db }}
             - name: DEDUPE_PERSISTENCE_DB
               value: {{ $sentinel.db | quote }}
@@ -517,6 +520,10 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "flux-ai-bridge.secretName" . }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- with .Values.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}

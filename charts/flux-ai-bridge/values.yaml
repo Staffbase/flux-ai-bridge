@@ -2,8 +2,8 @@ affinity: {}
 
 autoscaling:
   enabled: false
-  minReplicas: 1
   maxReplicas: 3
+  minReplicas: 1
   targetCPUUtilizationPercentage: 80
   # Optional second HPA metric; unset = CPU only.
   # targetMemoryUtilizationPercentage: 80
@@ -121,14 +121,26 @@ config:
         # The sentinel port lives in each addr (":26379" is the Bitnami /
         # canonical default), so it's configurable here without a separate
         # field. Required when enabled.
+        # With the bundled Valkey in Sentinel mode (valkey.replica.enabled +
+        # valkey.sentinel.enabled), empty means its Sentinel headless Service.
         addrs: ""
         # Logical Redis database (SELECT <n>). 0 unless you cohabit with
         # other workloads on the same Redis cluster.
         db: 0
+        # Sentinel mode, for an external Sentinel cluster or the bundled
+        # Valkey. With valkey.enabled=true it requires the bundled Valkey to
+        # run Sentinel itself (valkey.replica.enabled, valkey.sentinel.enabled,
+        # plus valkey.persistence and valkey.sentinel.password, set to the same
+        # value as `password` below); the chart refuses the mix otherwise.
+        # The reverse is enforced too: a bundled Valkey running Sentinel
+        # balances its data Service across master and replicas, so the bridge
+        # must use Sentinel mode there.
         enabled: false
         # Name configured in the sentinel `sentinel monitor <name> …`
         # line. Bitnami's default is "mymaster"; if you provisioned the
         # cluster by hand it's whatever you chose. Required when enabled.
+        # With the bundled Valkey in Sentinel mode, empty means its
+        # valkey.sentinel.masterSet ("mymaster").
         masterName: ""
         # Sentinel-daemon ACL password (inline). Stored in the chart-
         # created Secret as DEDUPE_PERSISTENCE_SENTINEL_PASSWORD, or
@@ -161,7 +173,6 @@ config:
       # alongside the URL regardless of whether the password is sourced
       # from existingSecret or inline.
       user: ""
-
     # Per-PR-head RE-EVALUATION controls.
     reEval:
       # failedOnly (env DEDUPE_REEVAL_FAILED_ONLY) narrows re-evaluation to
@@ -188,6 +199,26 @@ config:
       # AND flipping green PRs when unrelated siblings in the same Kustomization
       # break.
       failedOnly: true
+      # maxRetries (env DEDUPE_PR_REEVAL_MAX) caps how many re-evaluations a
+      # single PR-head gets. Only consulted when ttl is set. Default 0 =
+      # unlimited: a deploy that stays broken forever is re-polled (readiness +
+      # LLM + comment refresh) EVERY window for as long as the PR lives. Set a
+      # positive count (e.g. 8) to stop re-evaluating a head once its budget is
+      # spent — the head then stops TRIGGERING analyses until a new commit
+      # lands (a new head always starts with a fresh budget). It still
+      # piggybacks on analyses other PRs of the same Kustomization trigger, so
+      # its comment tracks the current verdict at zero extra analysis cost;
+      # with no siblings it freezes at the last analysis. The budget caps
+      # CONSECUTIVE failing re-evals, not the head's lifetime: healthy skips
+      # don't count, and the counter self-cleans after ~two windows without
+      # increments — a head that drifts unhealthy days later still gets a
+      # fresh analysis and a new budget. Skips are
+      # visible as flux_ai_bridge_prs_skipped_total{reason="reeval_exhausted"}.
+      # Only re-evals whose ANALYSIS concludes failed/warning count: healthy
+      # skips (failedOnly) and re-evals that conclude healthy are both free —
+      # a recovery is the news re-eval exists for. With ttl 15m and maxRetries 8, a broken PR costs at
+      # most ~2h of re-polling per push, instead of polling until it's closed.
+      maxRetries: 0
       # ttl is the re-evaluation floor (env DEDUPE_PR_REEVAL_TTL). By default
       # ("" / unset → 0) the bridge analyses each PR exactly ONCE per its head
       # commit: a Flux reconcile that re-fires for an unchanged PR is skipped
@@ -214,27 +245,6 @@ config:
       # sub-chart. On older Redis the bridge logs a warning and only PR-heads
       # analysed AFTER enabling the ttl re-evaluate.
       ttl: ""
-      # maxRetries (env DEDUPE_PR_REEVAL_MAX) caps how many re-evaluations a
-      # single PR-head gets. Only consulted when ttl is set. Default 0 =
-      # unlimited: a deploy that stays broken forever is re-polled (readiness +
-      # LLM + comment refresh) EVERY window for as long as the PR lives. Set a
-      # positive count (e.g. 8) to stop re-evaluating a head once its budget is
-      # spent — the head then stops TRIGGERING analyses until a new commit
-      # lands (a new head always starts with a fresh budget). It still
-      # piggybacks on analyses other PRs of the same Kustomization trigger, so
-      # its comment tracks the current verdict at zero extra analysis cost;
-      # with no siblings it freezes at the last analysis. The budget caps
-      # CONSECUTIVE failing re-evals, not the head's lifetime: healthy skips
-      # don't count, and the counter self-cleans after ~two windows without
-      # increments — a head that drifts unhealthy days later still gets a
-      # fresh analysis and a new budget. Skips are
-      # visible as flux_ai_bridge_prs_skipped_total{reason="reeval_exhausted"}.
-      # Only re-evals whose ANALYSIS concludes failed/warning count: healthy
-      # skips (failedOnly) and re-evals that conclude healthy are both free —
-      # a recovery is the news re-eval exists for. With ttl 15m and maxRetries 8, a broken PR costs at
-      # most ~2h of re-polling per push, instead of polling until it's closed.
-      maxRetries: 0
-
     # Expiry of the IN-MEMORY dedupe entries (one per Kustomization, PR and
     # PR head commit); ignored when persistence is enabled (see
     # persistence.maxTTL for Redis). Three modes:
@@ -265,25 +275,25 @@ config:
     fetchFluxInstance: false
     # Fetch logs from up to 3 failing workloads' pods (last 100 lines each).
     fetchLogs: true
+    # Fetch resource metrics for the failing workloads. Off by default —
+    # raw CPU/mem numbers are hard for the LLM to interpret without context.
+    fetchMetrics: false
     # Which failing pods' logs are fetched (FAILURE_FETCH_LOGS_SCOPE):
     # "owned" (default) only pods owned by a workload in the Kustomization's
     # inventory, so logs of unrelated apps in a shared namespace never reach
     # the LLM; "namespace" any failing pod in the swept namespaces (the
     # behaviour before this setting existed). Other values fail startup.
     logsScope: owned
-    # Fetch resource metrics for the failing workloads. Off by default —
-    # raw CPU/mem numbers are hard for the LLM to interpret without context.
-    fetchMetrics: false
 
   # ─── GitHub target + API endpoint ──────────────────────────────────────
   github:
-    # Override the GitHub API base URL (useful for GitHub Enterprise or
-    # testing). Leave empty to use the default github.com API endpoint.
-    apiUrl: ""
     # Accept a plain-HTTP apiUrl (env GITHUB_API_ALLOW_INSECURE). The bridge
     # refuses an http:// URL by default, as it would send the GitHub App JWT
     # and installation tokens unencrypted. Only for an in-cluster test mock.
     allowInsecure: false
+    # Override the GitHub API base URL (useful for GitHub Enterprise or
+    # testing). Leave empty to use the default github.com API endpoint.
+    apiUrl: ""
     # GitHub fetch-cache tuning. The fetch cache is what keeps the bridge
     # under GitHub's API rate limit; these knobs trade a little
     # freshness/depth for fewer calls. All optional — empty = bridge default.
@@ -341,7 +351,6 @@ config:
       # when the cache has no record, none after that).
       # Suppressing also skips the LLM call on healthy outcomes.
       onSuccess: true
-
     # Outcome-driven PR labels — a merge gate can key on them. Reconciled on
     # every PR the bridge processes, independent of whether a comment was posted
     # (so `comments.onSuccess: false` + `labels.enabled: true` labels healthy PRs
@@ -375,7 +384,6 @@ config:
         failed: flux-failed
         success: flux-success
         warning: flux-warning
-
     # Cap on the merge-parent walk in FindPRsForCommit (env
     # PARENT_WALK_DEPTH). Empty = bridge default (200). The walk normally
     # stops earlier, at the merge base with the default branch; the cap
@@ -383,11 +391,19 @@ config:
     # (https://github.com/Staffbase/autodev-action) batches merge more PRs
     # than this in one push. See docs/caching.md.
     parentWalkDepth: ""
-
     # GitHub repository in "owner/repo" format.
     # Optional: auto-discovered from the Flux GitRepository spec.url when
     # left empty.
     repo: ""
+  # Instance ID (env INSTANCE_ID) for running bridges in several clusters
+  # against the same repositories. It goes into every comment marker and the
+  # Redis key prefixes, so each instance keeps its own comment per
+  # Kustomization and its own dedupe/cache state. PR labels can't be scoped
+  # this way — give each instance its own config.github.labels.names, or the
+  # instances overwrite each other's verdict. A DNS label (lowercase letters,
+  # digits, '-'). Empty = single instance; existing comments keep matching.
+  # Changing it later orphans the comments posted under the old value.
+  instanceId: ""
 
   # ─── Kustomization admission filter ────────────────────────────────────
   # Glob lists (Go path.Match syntax — `*`, `?`, `[abc]`) selecting which
@@ -474,27 +490,9 @@ config:
     # body wouldn't carry, or simply want every reconcile annotated by the
     # model. Ignored when provider=none (no LLM to skip).
     skipOnHealthy: true
-
   # Log level: debug | info | warn | error.
   # Transverse — affects every code path rather than a single domain group.
   logLevel: ""
-
-  # Total shutdown budget on SIGTERM (env SHUTDOWN_TIMEOUT): in-flight
-  # pipelines get it minus a 10s unwind reserve to finish, then they are
-  # cancelled and roll back the dedupe marks of PRs they didn't deliver.
-  # Must stay below terminationGracePeriodSeconds, or the kubelet's SIGKILL
-  # cuts the rollback short. Empty = bridge default 30s.
-  shutdownTimeout: ""
-
-  # Instance ID (env INSTANCE_ID) for running bridges in several clusters
-  # against the same repositories. It goes into every comment marker and the
-  # Redis key prefixes, so each instance keeps its own comment per
-  # Kustomization and its own dedupe/cache state. PR labels can't be scoped
-  # this way — give each instance its own config.github.labels.names, or the
-  # instances overwrite each other's verdict. A DNS label (lowercase letters,
-  # digits, '-'). Empty = single instance; existing comments keep matching.
-  # Changing it later orphans the comments posted under the old value.
-  instanceId: ""
 
   # ─── flux-operator-mcp client ──────────────────────────────────────────
   mcp:
@@ -509,6 +507,7 @@ config:
     # namespace (http://flux-operator-mcp.<release-namespace>.svc.cluster.local:9090/mcp).
     # Required when flux-operator-mcp.enabled=false.
     url: ""
+
   # ─── PR admission filter ───────────────────────────────────────────────
   # After the SHA lookup returns candidate PRs, gate which ones receive a
   # comment by their GitHub labels. Combined with the always-on inventory
@@ -531,12 +530,6 @@ config:
   #   BEFORE the per-PR ListPRFiles + GetBlobContent calls, so a PR
   #   missing the required label costs zero extra GitHub API spend.
   prFilter:
-    requiredLabels: []
-    # Example:
-    # requiredLabels:
-    #   - flux-review
-    #   - needs-review
-
     # attributePrunes (PR_ATTRIBUTE_PRUNES, default true) — attribute a
     # pure-deletion PR by what the reconcile PRUNED, not only by what's currently
     # in status.inventory. A `removed` file whose declared resource the
@@ -547,7 +540,11 @@ config:
     # child CR. The failure floor is safe: a missed prune event just leaves the PR
     # unlabelled, never wrong. Set false to disable (inventory-membership only).
     attributePrunes: true
-
+    requiredLabels: []
+    # Example:
+    # requiredLabels:
+    #   - flux-review
+    #   - needs-review
   # ─── Readiness polling after Flux events ──────────────────────────────
   # After an event arrives, poll the inventory until every resource
   # reaches a terminal kstatus (Current/Failed/Terminating) before
@@ -593,8 +590,6 @@ config:
     # workloads in that namespace those pods show up too. Disable in
     # shared-namespace environments where the noise outweighs the value.
     includePods: true
-    pollInterval: ""
-    pollTimeout: ""
     # How long the namespace must stay quiet before settled pods count as
     # settled: no workload pod appearing (a new pod, or one recreated under
     # the same name) and none shutting down or disappearing. Counted from
@@ -609,12 +604,42 @@ config:
     # Empty = bridge default (60s, or half of pollTimeout when that is under
     # 2m).
     podQuietPeriod: ""
+    pollInterval: ""
+    pollTimeout: ""
+  # Total shutdown budget on SIGTERM (env SHUTDOWN_TIMEOUT): in-flight
+  # pipelines get it minus a 10s unwind reserve to finish, then they are
+  # cancelled and roll back the dedupe marks of PRs they didn't deliver.
+  # Must stay below terminationGracePeriodSeconds, or the kubelet's SIGKILL
+  # cuts the rollback short. Empty = bridge default 30s.
+  shutdownTimeout: ""
 
   # ─── Webhook / HTTP server ──────────────────────────────────────────────
   webhook:
     # Maximum number of webhook events processed concurrently.
     # Empty = bridge default (16).
     maxConcurrent: ""
+
+# Credentials placed into a Secret created by this chart.
+# Ignored when existingSecret is set.
+# WARNING: prefer existingSecret + external secret management in production.
+#
+# GitHub auth is via a GitHub App — set all three credentials.githubApp
+# fields. See docs/github-app.md for App setup + required permissions.
+credentials:
+  anthropicApiKey: "" # only required when config.llm.provider=claude
+  # All three fields must be set together. Partial config fails at bridge
+  # startup with a clear error. See docs/github-app.md.
+  githubApp:
+    appId: "" # e.g. "12345"
+    installationId: "" # e.g. "67890"
+    # The full PEM contents of the App's private key. Use --set-file when
+    # bootstrapping by hand:  --set-file credentials.githubApp.privateKey=key.pem
+    privateKey: ""
+  # API key for the OpenAI-compatible LLM endpoint (Azure AI Foundry,
+  # Azure OpenAI Service, OpenRouter, self-hosted vLLM, etc.). Only used when
+  # config.llm.provider=openai-compatible. Leave empty when targeting Ollama
+  # (no auth required).
+  openaiApiKey: ""
 
 # Reference an existing Secret instead of having the chart create one.
 # The Secret must contain the keys: GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID,
@@ -640,111 +665,6 @@ existingSecret: ""
 # referenced here needs a reloader to restart the pod when it changes.
 extraEnv: []
 
-# Credentials placed into a Secret created by this chart.
-# Ignored when existingSecret is set.
-# WARNING: prefer existingSecret + external secret management in production.
-#
-# GitHub auth is via a GitHub App — set all three credentials.githubApp
-# fields. See docs/github-app.md for App setup + required permissions.
-credentials:
-  anthropicApiKey: ""  # only required when config.llm.provider=claude
-  # API key for the OpenAI-compatible LLM endpoint (Azure AI Foundry,
-  # Azure OpenAI Service, OpenRouter, self-hosted vLLM, etc.). Only used when
-  # config.llm.provider=openai-compatible. Leave empty when targeting Ollama
-  # (no auth required).
-  openaiApiKey: ""
-  # All three fields must be set together. Partial config fails at bridge
-  # startup with a clear error. See docs/github-app.md.
-  githubApp:
-    appId: ""           # e.g. "12345"
-    installationId: ""  # e.g. "67890"
-    # The full PEM contents of the App's private key. Use --set-file when
-    # bootstrapping by hand:  --set-file credentials.githubApp.privateKey=key.pem
-    privateKey: ""
-
-# NetworkPolicy lockdown for the bridge pod. On by default; it only takes
-# effect where the CNI enforces NetworkPolicy (Cilium, Calico, recent kindnet,
-# …) and is inert elsewhere. The bundled flux-operator-mcp has its own policy
-# (flux-operator-mcp.networkPolicy below).
-#
-# Ingress:
-#   - flux-system namespace by default (so the Notification Controller can POST)
-#   - monitoring namespace when serviceMonitor.enabled=true
-#   - networkPolicy.ingress.extra, appended
-#   - networkPolicy.ingress.from replaces the flux-system source
-#
-# Egress:
-#   - cluster DNS (pods labelled k8s-app: kube-dns in any namespace)
-#   - flux-system namespace (source-controller artifacts; MCP if it runs there)
-#   - pods in the release namespace (bundled flux-operator-mcp, Valkey, Ollama)
-#   - bundled Ollama in ollama.namespaceOverride, when set
-#   - external Redis/Valkey/Sentinel when config.dedupe.persistence is on
-#     without the bundled Valkey (ports from networkPolicy.egress.redis, plus
-#     any port written in the url / sentinel.addrs)
-#   - the endpoints in config.llm.openaiBaseUrl / anthropicBaseUrl and
-#     config.github.apiUrl, derived from the URL: an in-cluster Service
-#     (<name>.<namespace>.svc…) allows its namespace on any port, an IP
-#     address that address on the URL's port, any other host the URL's port
-#     to any destination
-#   - ports 443 and 6443 to anywhere (GitHub + LLM endpoints — NetPol can't
-#     express FQDN allow-lists, use a CNI like Cilium with FQDN policies or an
-#     egress proxy for stricter controls)
-#
-# Anything else needs networkPolicy.egress.extra — e.g. an endpoint set
-# through extraEnv instead of the values above, an in-cluster Service named
-# <name>.<namespace> without ".svc", or a DNS service with different labels.
-networkPolicy:
-  enabled: true
-  # Namespace label value used to select Flux's namespace for both ingress
-  # (Notification Controller → bridge) and egress (bridge → MCP).
-  fluxNamespace: flux-system
-  # Namespace label value used to allow Prometheus scrapes when
-  # serviceMonitor.enabled=true.
-  monitoringNamespace: monitoring
-  ingress:
-    # Replace the default flux-system ingress rule with a custom `from:` list.
-    # Each entry uses the standard NetworkPolicyPeer schema (namespaceSelector,
-    # podSelector, ipBlock).
-    from: []
-    # Example — also allow a separate test namespace:
-    # from:
-    #   - namespaceSelector:
-    #       matchLabels:
-    #         kubernetes.io/metadata.name: flux-system
-    #   - namespaceSelector:
-    #       matchLabels:
-    #         kubernetes.io/metadata.name: e2e
-    # Extra ingress rules appended verbatim (standard NetworkPolicy ingress
-    # rules: from + ports). Unlike `from`, they add to the default rules —
-    # e.g. a debugging namespace or a gateway that forwards webhooks:
-    # extra:
-    #   - from:
-    #       - namespaceSelector:
-    #           matchLabels:
-    #             kubernetes.io/metadata.name: tools
-    #     ports:
-    #       - protocol: TCP
-    #         port: 8080
-    extra: []
-  egress:
-    # External Redis/Valkey dedupe backend (config.dedupe.persistence enabled,
-    # and bundled valkey disabled or overridden by persistence.url).
-    # NetworkPolicy can't select hosts outside the cluster, so these ports are
-    # opened to any destination. Ports written in persistence.url or
-    # sentinel.addrs are opened as well.
-    redis:
-      # Data ports: the single-node server, or in Sentinel mode the master
-      # Sentinel hands out (not known up front, so it must be listed here).
-      ports:
-        - 6379
-      # Sentinel ports, opened in Sentinel mode only.
-      sentinelPorts:
-        - 26379
-    # Extra egress rules appended verbatim. Use when the bridge needs to reach
-    # additional in-cluster services (e.g., self-hosted Anthropic-compatible
-    # gateway running outside flux-system or the release namespace).
-    extra: []
-
 # Flux Notification Controller integration.
 # When enabled, creates a Flux Provider and Alert that point to the bridge webhook,
 # so the Notification Controller automatically forwards Kustomization events.
@@ -758,6 +678,11 @@ networkPolicy:
 flux:
   notification:
     enabled: true
+    # Extra namespaces whose Kustomizations the Alert subscribes to. The Alert
+    # always covers its own namespace; Kustomizations elsewhere are only seen
+    # when listed here. Requires notification-controller to allow cross-
+    # namespace references (it does unless run with --no-cross-namespace-refs).
+    eventSourceNamespaces: []
     # HMAC-SHA256 signing of webhook payloads between Flux Notification Controller
     # and the bridge. Without it, any pod in the cluster network can POST fake
     # events to /webhook and trigger real LLM + GitHub API calls.
@@ -792,52 +717,33 @@ flux:
     #   #  a stray newline makes the bridge's and Flux's tokens differ → every
     #   #  signature fails with "webhook signature verification failed".)
     hmac:
+      existingSecret: ""
       generate: true
       token: ""
-      existingSecret: ""
     # Namespace where the Flux Provider and Alert are created.
     # Defaults to the Helm release namespace.
     namespace: ""
-    # Extra namespaces whose Kustomizations the Alert subscribes to. The Alert
-    # always covers its own namespace; Kustomizations elsewhere are only seen
-    # when listed here. Requires notification-controller to allow cross-
-    # namespace references (it does unless run with --no-cross-namespace-refs).
-    eventSourceNamespaces: []
 
-# ─── Skills system ──────────────────────────────────────────────────────────
-#
-# The bridge inlines a SKILL.md prompt-prefix into every LLM call. The chart
-# composes its content from up to two sources:
-#
-#   - default.enabled (default true): the bundled skill content (inlined in
-#     templates/configmap-skill.yaml), a deduped distillation of Flux MCP
-#     guidance + troubleshooting patterns scoped to the bridge's
-#     diagnostician role.
-#   - custom: a multi-line string. When default.enabled is also true, this
-#     is appended after the bundled content. When default.enabled is false,
-#     this becomes the entire skill prompt.
-#
-# When both are empty the ConfigMap is still rendered, with an empty SKILL.md,
-# and the LLM gets no skill prefix.
-skill:
-  # Operator-supplied skill content. Multi-line YAML string; appended to (or
-  # replaces) the bundled SKILL.md. Examples:
-  #
-  # custom: |
-  #   ## Local conventions
-  #   - All HelmReleases in this org go through the platform team's chart
-  #     registry at oci://registry.internal/charts/.
-  #   - Treat any condition mentioning "policy violation" as a Kyverno
-  #     enforcement; the fix is usually in the manifest, not the policy.
-  custom: ""
-  default:
-    enabled: true
+flux-operator-mcp:
+  enabled: true
+  # Pin the Service name to "flux-operator-mcp" regardless of release name.
+  # The bridge derives its default MCP URL (and the mcpRbac subject) from
+  # this name. Mirrors the ollama sub-chart pattern below.
+  fullnameOverride: flux-operator-mcp
+  networkPolicy:
+    create: true
+    ingress:
+      namespaces: []
+  rbac:
+    create: false
+  readonly: true
+  transport: http
 
 fullnameOverride: ""
 
 image:
-  repository: ghcr.io/staffbase/flux-ai-bridge
   pullPolicy: IfNotPresent
+  repository: ghcr.io/staffbase/flux-ai-bridge
   # Overrides the image tag. Defaults to the chart appVersion.
   tag: ""
 
@@ -850,85 +756,6 @@ livenessProbe:
   initialDelaySeconds: 5
   periodSeconds: 10
   timeoutSeconds: 3
-
-nameOverride: ""
-
-nodeSelector: {}
-
-podAnnotations: {}
-
-podLabels: {}
-
-podSecurityContext:
-  runAsNonRoot: true
-  runAsUser: 65532
-  fsGroup: 65532
-
-readinessProbe:
-  httpGet:
-    path: /readyz
-    port: http
-  initialDelaySeconds: 3
-  periodSeconds: 5
-  timeoutSeconds: 3
-
-replicaCount: 1
-
-# Pod termination grace period. Leaves headroom above the bridge's 30s
-# shutdown budget (config.shutdownTimeout); raise both together.
-terminationGracePeriodSeconds: 45
-
-# Requests are set so the pod isn't BestEffort and an HPA on CPU/memory has a
-# baseline to compute utilization against. No CPU limit; add a memory limit
-# that fits your workload.
-resources:
-  requests:
-    cpu: 50m
-    memory: 64Mi
-  # limits:
-  #   memory: 256Mi
-
-securityContext:
-  allowPrivilegeEscalation: false
-  capabilities:
-    drop:
-      - ALL
-  privileged: false
-  readOnlyRootFilesystem: true
-  runAsNonRoot: true
-  runAsUser: 65532
-  seccompProfile:
-    type: RuntimeDefault
-
-service:
-  type: ClusterIP
-  port: 8080
-
-serviceAccount:
-  # Create a dedicated ServiceAccount for the bridge.
-  create: true
-  # The bridge never calls the Kubernetes API (all cluster reads go through
-  # flux-operator-mcp), so no token is mounted.
-  automount: false
-  annotations: {}
-  # Override the generated name.
-  name: ""
-
-# Prometheus Operator ServiceMonitor. Off by default — VictoriaMetrics users
-# can define their own VMServiceScrape outside the chart pointing at the
-# bridge Service's `http` port + `/metrics` path.
-serviceMonitor:
-  enabled: false
-  # namespace: monitoring        # default: render in release namespace
-  # labels: {}                   # extra labels for Prom-Operator selector
-  interval: 30s
-  scrapeTimeout: 10s
-
-tolerations: []
-
-volumes: []
-
-volumeMounts: []
 
 # ─── Optional bundled flux-operator-mcp sub-chart ────────────────────────────
 #
@@ -972,20 +799,92 @@ mcpRbac:
   #       resources: ["*"]
   extraRules: []
 
-flux-operator-mcp:
+nameOverride: ""
+
+# NetworkPolicy lockdown for the bridge pod. On by default; it only takes
+# effect where the CNI enforces NetworkPolicy (Cilium, Calico, recent kindnet,
+# …) and is inert elsewhere. The bundled flux-operator-mcp has its own policy
+# (flux-operator-mcp.networkPolicy below).
+#
+# Ingress:
+#   - flux-system namespace by default (so the Notification Controller can POST)
+#   - monitoring namespace when serviceMonitor.enabled=true
+#   - networkPolicy.ingress.extra, appended
+#   - networkPolicy.ingress.from replaces the flux-system source
+#
+# Egress:
+#   - cluster DNS (pods labelled k8s-app: kube-dns in any namespace)
+#   - flux-system namespace (source-controller artifacts; MCP if it runs there)
+#   - pods in the release namespace (bundled flux-operator-mcp, Valkey, Ollama)
+#   - bundled Ollama in ollama.namespaceOverride, when set
+#   - external Redis/Valkey/Sentinel when config.dedupe.persistence is on
+#     without the bundled Valkey (ports from networkPolicy.egress.redis, plus
+#     any port written in the url / sentinel.addrs)
+#   - the endpoints in config.llm.openaiBaseUrl / anthropicBaseUrl and
+#     config.github.apiUrl, derived from the URL: an in-cluster Service
+#     (<name>.<namespace>.svc…) allows its namespace on any port, an IP
+#     address that address on the URL's port, any other host the URL's port
+#     to any destination
+#   - ports 443 and 6443 to anywhere (GitHub + LLM endpoints — NetPol can't
+#     express FQDN allow-lists, use a CNI like Cilium with FQDN policies or an
+#     egress proxy for stricter controls)
+#
+# Anything else needs networkPolicy.egress.extra — e.g. an endpoint set
+# through extraEnv instead of the values above, an in-cluster Service named
+# <name>.<namespace> without ".svc", or a DNS service with different labels.
+networkPolicy:
+  egress:
+    # Extra egress rules appended verbatim. Use when the bridge needs to reach
+    # additional in-cluster services (e.g., self-hosted Anthropic-compatible
+    # gateway running outside flux-system or the release namespace).
+    extra: []
+    # External Redis/Valkey dedupe backend (config.dedupe.persistence enabled,
+    # and bundled valkey disabled or overridden by persistence.url).
+    # NetworkPolicy can't select hosts outside the cluster, so these ports are
+    # opened to any destination. Ports written in persistence.url or
+    # sentinel.addrs are opened as well.
+    redis:
+      # Data ports: the single-node server, or in Sentinel mode the master
+      # Sentinel hands out (not known up front, so it must be listed here).
+      ports:
+        - 6379
+      # Sentinel ports, opened in Sentinel mode only.
+      sentinelPorts:
+        - 26379
   enabled: true
-  # Pin the Service name to "flux-operator-mcp" regardless of release name.
-  # The bridge derives its default MCP URL (and the mcpRbac subject) from
-  # this name. Mirrors the ollama sub-chart pattern below.
-  fullnameOverride: flux-operator-mcp
-  networkPolicy:
-    create: true
-    ingress:
-      namespaces: []
-  rbac:
-    create: false
-  readonly: true
-  transport: http
+  # Namespace label value used to select Flux's namespace for both ingress
+  # (Notification Controller → bridge) and egress (bridge → MCP).
+  fluxNamespace: flux-system
+  ingress:
+    # Example — also allow a separate test namespace:
+    # from:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: flux-system
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: e2e
+    # Extra ingress rules appended verbatim (standard NetworkPolicy ingress
+    # rules: from + ports). Unlike `from`, they add to the default rules —
+    # e.g. a debugging namespace or a gateway that forwards webhooks:
+    # extra:
+    #   - from:
+    #       - namespaceSelector:
+    #           matchLabels:
+    #             kubernetes.io/metadata.name: tools
+    #     ports:
+    #       - protocol: TCP
+    #         port: 8080
+    extra: []
+    # Replace the default flux-system ingress rule with a custom `from:` list.
+    # Each entry uses the standard NetworkPolicyPeer schema (namespaceSelector,
+    # podSelector, ipBlock).
+    from: []
+  # Namespace label value used to allow Prometheus scrapes when
+  # serviceMonitor.enabled=true.
+  monitoringNamespace: monitoring
+
+nodeSelector: {}
 
 # ─── Optional bundled local LLM (otwld/ollama-helm) ─────────────────────────
 #
@@ -1069,6 +968,120 @@ ollama:
   persistentVolume:
     enabled: false
 
+podAnnotations: {}
+
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 65532
+  runAsNonRoot: true
+  runAsUser: 65532
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  timeoutSeconds: 3
+
+replicaCount: 1
+
+# Requests are set so the pod isn't BestEffort and an HPA on CPU/memory has a
+# baseline to compute utilization against. No CPU limit; add a memory limit
+# that fits your workload.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  # limits:
+  #   memory: 256Mi
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  privileged: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+service:
+  port: 8080
+  type: ClusterIP
+
+serviceAccount:
+  annotations: {}
+  # The bridge never calls the Kubernetes API (all cluster reads go through
+  # flux-operator-mcp), so no token is mounted.
+  automount: false
+  # Create a dedicated ServiceAccount for the bridge.
+  create: true
+  # Override the generated name.
+  name: ""
+
+# Prometheus Operator ServiceMonitor. Off by default — VictoriaMetrics users
+# can define their own VMServiceScrape outside the chart pointing at the
+# bridge Service's `http` port + `/metrics` path.
+serviceMonitor:
+  enabled: false
+  # namespace: monitoring        # default: render in release namespace
+  # labels: {}                   # extra labels for Prom-Operator selector
+  interval: 30s
+  scrapeTimeout: 10s
+
+# ─── Skills system ──────────────────────────────────────────────────────────
+#
+# The bridge inlines a SKILL.md prompt-prefix into every LLM call. The chart
+# composes its content from up to two sources:
+#
+#   - default.enabled (default true): the bundled skill content (inlined in
+#     templates/configmap-skill.yaml), a deduped distillation of Flux MCP
+#     guidance + troubleshooting patterns scoped to the bridge's
+#     diagnostician role.
+#   - custom: a multi-line string. When default.enabled is also true, this
+#     is appended after the bundled content. When default.enabled is false,
+#     this becomes the entire skill prompt.
+#
+# When both are empty the ConfigMap is still rendered, with an empty SKILL.md,
+# and the LLM gets no skill prefix.
+skill:
+  # Operator-supplied skill content. Multi-line YAML string; appended to (or
+  # replaces) the bundled SKILL.md. Examples:
+  #
+  # custom: |
+  #   ## Local conventions
+  #   - All HelmReleases in this org go through the platform team's chart
+  #     registry at oci://registry.internal/charts/.
+  #   - Treat any condition mentioning "policy violation" as a Kyverno
+  #     enforcement; the fix is usually in the manifest, not the policy.
+  custom: ""
+  default:
+    enabled: true
+
+# Holds the liveness probe until the bridge serves /healthz once. Startup
+# connects to dependencies before the HTTP server listens: the MCP server
+# (up to 30s), the dedupe Redis/Valkey (up to 5s) and GitHub's App lookup (up
+# to 10s). On a fresh install those start at the same time, and without this
+# probe the liveness probe would restart the bridge before it ever listens.
+# 24 × 5s allows two minutes.
+startupProbe:
+  failureThreshold: 24
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+
+# Pod termination grace period. Leaves headroom above the bridge's 30s
+# shutdown budget (config.shutdownTimeout); raise both together.
+terminationGracePeriodSeconds: 45
+
+tolerations: []
+
 # ─── Optional bundled Valkey sub-chart (dedupe persistence) ──────────────────
 #
 # Optional bundled Valkey for persistent dedupe state. Valkey speaks the
@@ -1090,23 +1103,11 @@ valkey:
   auth:
     enabled: false
   enabled: false
-  # Pin the Service name so config.dedupe.persistence.url auto-derivation
-  # (in templates/deployment.yaml) hits a stable target regardless of the
-  # parent release name.
-  fullnameOverride: valkey
-  # Single-replica is plenty for dedupe state. Enable replicas only if you
-  # share this Valkey with other workloads that need HA.
-  replica:
-    enabled: false
-  # Pod resources. The bridge's working set is small; the default below
-  # comfortably holds it. If you lower the memory limit, set `maxmemory` in
-  # extraConfig to ~75% of it (see above).
-  resources:
-    # limits:
-    #   memory: 128Mi
-    # requests:
-    #   cpu: 50m
-    #   memory: 64Mi
+  # limits:
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 50m
+  #   memory: 64Mi
   # Raw config appended to the sub-chart's generated valkey.conf.
   #
   # The eviction policy is the one setting you MUST NOT get wrong. The bridge's
@@ -1130,3 +1131,18 @@ valkey:
   extraConfig: |
     maxmemory-policy allkeys-lru
     # maxmemory 96mb   # uncomment + size to ~75% of resources.limits.memory
+  # Pin the Service name so config.dedupe.persistence.url auto-derivation
+  # (in templates/deployment.yaml) hits a stable target regardless of the
+  # parent release name.
+  fullnameOverride: valkey
+  # Single-replica is plenty for dedupe state. Enable replicas only if you
+  # share this Valkey with other workloads that need HA.
+  replica:
+    enabled: false
+  # Pod resources. The bridge's working set is small; the default below
+  # comfortably holds it. If you lower the memory limit, set `maxmemory` in
+  # extraConfig to ~75% of it (see above).
+  resources:
+volumeMounts: []
+
+volumes: []
