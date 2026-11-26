@@ -94,6 +94,15 @@ and issue, is public.
   [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md).
 - Exception: "autodev" stays. Link it to <https://github.com/Staffbase/autodev-action> where it is introduced.
 
+## Helm chart
+
+Document chart settings in `charts/flux-ai-bridge/values.yaml`, next to the value they describe: what it does, its
+default, and how it interacts with other values. Templates carry no documentation comments. When a template needs a
+comment (a non-obvious guard or derivation), keep it to one or two lines and leave the explanation to `values.yaml`.
+
+Keys in `values.yaml` and `ci/*.yaml` are sorted alphabetically at every level; list items keep their order, and a
+key's comment moves with it. `Chart.yaml` keeps Helm's field order.
+
 ## Chart releases
 
 `ct lint` checks that the chart version goes up. A change under `charts/` bumps `version` in `Chart.yaml`, as a
