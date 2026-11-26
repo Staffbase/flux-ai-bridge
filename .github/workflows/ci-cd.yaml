@@ -1,0 +1,110 @@
+---
+name: ci
+
+permissions: read-all
+
+on:
+  push:
+    # Dependabot branches run on pull_request instead: the auto-merge job
+    # needs the pull_request event payload.
+    branches-ignore:
+      - 'dependabot/**'
+    paths-ignore:
+      - 'charts/**'
+      - 'docs/**'
+  pull_request:
+  release:
+    types: [published]
+  # Started by the autodev workflow after it rebuilt dev: its GITHUB_TOKEN
+  # push doesn't trigger the push event.
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: ci
+    # pull_request runs for Dependabot PRs and for PRs from forks, which get no
+    # push run here; branches of this repository are covered by their push run.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+
+      - name: go test
+        run: make test
+
+      - name: govulncheck
+        run: make vuln
+
+      # Validation only: the cd job builds and pushes the real image to GHCR.
+      - name: Build (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          platforms: linux/amd64
+          push: false
+          tags: flux-ai-bridge:ci
+
+  cd:
+    name: Continuous Delivery
+    runs-on: ubuntu-24.04
+    needs: ci
+    # Only app releases (v*) build an image; chart releases (flux-ai-bridge-*)
+    # share the repository's releases.
+    if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: GitOps (build, push and deploy a new Docker image)
+        uses: Staffbase/gitops-github-action@73841d33fbc4db3e53764d816eaaa490dd2b57ed # v11.0.0
+        with:
+          docker-registries: |
+            ghcr.io|${{ github.actor }}|${{ secrets.GITHUB_TOKEN }}
+          docker-tag-keep-v-prefix: true
+          docker-image: staffbase/flux-ai-bridge
+          # Release runs build the image instead of retagging the main build:
+          # the action's retag path uses HTTP Basic auth on the registry API,
+          # which GHCR doesn't accept.
+          docker-disable-retagging: true
+
+  # Approves Dependabot PRs and enables auto-merge once CI is green. The PR
+  # author check is the trusted one; the actor check additionally skips runs
+  # triggered by someone else pushing to a Dependabot branch.
+  dependabot-auto-merge:
+    if: >- # zizmor: ignore[bot-conditions]
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.actor == 'dependabot[bot]' &&
+      !github.event.pull_request.draft
+    needs:
+      - ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Approve and enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr review "$PR_URL" --approve
+          gh pr merge "$PR_URL" --auto --merge

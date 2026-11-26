@@ -1,0 +1,60 @@
+---
+# mock-llm — bridge → Anthropic Messages API stub. Skipped when
+# E2E_LLM is non-empty (ollama / azure / none / 1). Pairs with the
+# mock-server-scripts ConfigMap in 02-mock-common.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-llm
+  namespace: mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-llm
+  template:
+    metadata:
+      labels:
+        app: mock-llm
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mock-llm
+          image: python:3-alpine
+          command: [python3, /scripts/mock-llm.py]
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: mock-server-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-llm
+  namespace: mock
+spec:
+  selector:
+    app: mock-llm
+  ports:
+    - port: 80
+      targetPort: 8080

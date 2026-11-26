@@ -1,0 +1,64 @@
+# This version of the CLA Assistant uses a GitHub action and local
+# storage of the signatures.
+# https://github.com/cla-assistant/github-action/
+
+name: "CLA Assistant"
+# The CLA bot reacts to the signing comment and must write statuses and
+# comments on fork PRs, so it needs issue_comment and pull_request_target.
+# It never checks out or runs PR code.
+on:
+  issue_comment: # zizmor: ignore[dangerous-triggers]
+    types: [created]
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [opened,reopened,closed,synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  CLAssistant:
+    # Only signing comments, `recheck` and PR events; other comments skip the
+    # job (and so never take a place in the concurrency group below).
+    if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    # Signatures are commits to one branch: one CLA job at a time, so
+    # concurrent signings can't race. `queue: max` keeps every waiting job
+    # (up to 100) instead of cancelling an older one, so a signing comment
+    # isn't dropped when another PR event queues behind it.
+    concurrency:
+      group: cla-signatures
+      queue: max
+    steps:
+      # The action stores signatures on the signatures branch but doesn't
+      # create it. Create it from the default branch when it's missing.
+      - name: Ensure the signatures branch exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ! gh api "repos/$REPO/branches/signatures" --silent 2>/dev/null; then
+            sha=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
+            # A concurrent run may have created it in the meantime.
+            gh api "repos/$REPO/git/refs" -f ref=refs/heads/signatures -f sha="$sha" --silent \
+              || gh api "repos/$REPO/branches/signatures" --silent
+          fi
+
+      - name: "CLA Assistant"
+        uses: iainmcgin/cla-github-action@0d27e5a16278d4adb6b0c4b92f08ad27b0a21dc8 # v3.2.0
+        env:
+          # Signatures live in this repository, so the GITHUB_TOKEN is enough;
+          # the action reads a PERSONAL_ACCESS_TOKEN only for a remote
+          # signatures repository.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: 'signatures/version1/cla.json'
+          path-to-document: 'https://github.com/Staffbase/flux-ai-bridge/blob/main/CLA.md'
+          # branch should not be protected
+          branch: 'signatures'
+          # Suppress synthetic AI identities surfaced via Co-authored-by
+          # trailers. The PR opener still has to sign.
+          allowlist: 'noreply@anthropic.com,noreply@opencode.ai,copilot@noreply.github.com,*[bot]'

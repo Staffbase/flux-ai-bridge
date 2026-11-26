@@ -1,0 +1,67 @@
+# Values for the bundled Bitnami Valkey chart, deployed by `make e2e-up`
+# when E2E_DEDUPE_PERSISTENCE=1. Spawns a single-replica replication
+# topology with the Sentinel sidecar enabled in each pod and password
+# auth on BOTH the Valkey backend and the Sentinel daemons.
+#
+# The names below (fullnameOverride: valkey → StatefulSet `valkey-node` +
+# headless Service `valkey-headless`) are what the flux-ai-bridge chart's
+# `config.dedupe.persistence.sentinel.*` auto-derive expects. Don't rename
+# without updating the Makefile that wires the bridge HelmRelease values.
+fullnameOverride: valkey
+
+# Replication topology is the only one Bitnami ships with Sentinel
+# support — `architecture: standalone` doesn't expose the sentinel.* keys.
+architecture: replication
+
+auth:
+  enabled: true
+  # `auth.password` is the ADMIN (default-user) password. It's used by:
+  #   - Sentinel ↔ Valkey master/replicas (via `sentinel auth-pass`
+  #     monitoring auth)
+  #   - Sentinel ↔ Sentinel inter-daemon ACL (via `requirepass` on each
+  #     sentinel when auth.sentinel=true)
+  #   - The chart's own bootstrap probes
+  # The ai-bridge does NOT use this password — it authenticates with a
+  # separate application user (`bridge`) that `make e2e-valkey-setup`
+  # creates via `ACL SETUSER` after the chart finishes installing. That
+  # separation is the point of the test: production deployments should
+  # never give an application the admin credentials.
+  sentinel: true
+  password: "valkey-admin-pw-e2e"
+
+sentinel:
+  enabled: true
+  # Primary alias the sentinel `sentinel monitor <name> …` line uses
+  # (Bitnami renamed master→primary in their values schema; the
+  # underlying sentinel config still says "master" because sentinel
+  # itself hasn't renamed). The bridge chart's
+  # config.dedupe.persistence.sentinel.masterName must match this
+  # value verbatim or the FailoverClient won't find the master.
+  primarySet: myprimary
+  # 3 sentinels with quorum=2 is the canonical production split-brain-
+  # safe configuration: a majority is required to mark the master down
+  # and elect a new one, so a single sentinel partitioned from the
+  # cluster can't unilaterally fail over.
+  quorum: 2
+
+# 3 pods total. Bitnami's `architecture: replication` + `sentinel.enabled`
+# creates a unified StatefulSet `valkey-node` where each pod runs both
+# valkey-server (one of the 3 is the primary at any time) and a sentinel
+# daemon — so the cluster has 3 sentinels for the quorum-2 configuration
+# above.
+#
+# Persistence off — the test only cares about live dedupe state, not
+# durability across pod evictions, and disabling it makes e2e teardown
+# instant.
+master:
+  persistence:
+    enabled: false
+replica:
+  replicaCount: 3
+  persistence:
+    enabled: false
+
+# Skip the chart's network policies — kind clusters don't run a CNI
+# that enforces them and they only add noise to `kubectl describe`.
+networkPolicy:
+  enabled: false

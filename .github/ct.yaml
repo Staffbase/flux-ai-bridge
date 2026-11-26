@@ -1,0 +1,9 @@
+chart-repos:
+  - ollama=https://helm.otwld.com/
+check-version-increment: true
+debug: true
+helm-extra-args: --timeout 600s
+target-branch: main
+# upgrade: true
+validate-chart-schema: false
+validate-maintainers: false

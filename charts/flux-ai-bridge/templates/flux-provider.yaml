@@ -1,0 +1,21 @@
+{{- if .Values.flux.notification.enabled }}
+apiVersion: {{ include "flux-ai-bridge.notificationAPIVersion" (dict "ctx" . "kind" "Provider") }}
+kind: Provider
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}
+  namespace: {{ include "flux-ai-bridge.notificationNamespace" . }}
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+spec:
+  {{- $hmacName := include "flux-ai-bridge.hmacSecretName" . }}
+  {{- if $hmacName }}
+  type: generic-hmac
+  {{- else }}
+  type: generic
+  {{- end }}
+  address: "http://{{ include "flux-ai-bridge.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/webhook"
+  {{- if $hmacName }}
+  secretRef:
+    name: {{ $hmacName }}
+  {{- end }}
+{{- end }}

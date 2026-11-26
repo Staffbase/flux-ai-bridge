@@ -1,0 +1,58 @@
+---
+# Host-backed PV that lets Ollama keep its model cache across kind cluster
+# lifecycles. The hostPath here resolves inside the kind node, which has the
+# user's host cache directory mounted via kind's extraMounts (see Makefile).
+#
+# Applied only when E2E_LLM=ollama, before the bridge HelmRelease (which
+# triggers Ollama install as a chart sub-dependency with
+# ollama.namespaceOverride=ollama and
+# ollama.persistentVolume.existingClaim=ollama-cache).
+#
+# Ollama runs in its own namespace (not flux-system) so cluster operators can
+# scope NetworkPolicies / RBAC at it independently. The chart sub-dependency
+# inherits the parent release namespace by default; namespaceOverride is the
+# escape hatch.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ollama
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ollama-cache
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ollama-cache
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ollama-cache
+  hostPath:
+    # Path inside the kind node; bound to OLLAMA_CACHE_DIR on the host by the
+    # Makefile's kind cluster config.
+    path: /var/lib/ollama-cache
+    type: DirectoryOrCreate
+---
+# PVC must live in the same namespace as the Ollama pod (PVCs are namespace-
+# scoped). The PV itself is cluster-scoped so the binding works.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-cache
+  namespace: ollama
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: ollama-cache
+  volumeName: ollama-cache

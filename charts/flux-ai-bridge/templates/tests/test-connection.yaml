@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "flux-ai-bridge.fullname" . }}-test-connection"
+  labels:
+    # Not the selector labels: with them this pod would become an endpoint of
+    # the bridge Service. The chart-test label lets the NetworkPolicy admit it.
+    helm.sh/chart: {{ include "flux-ai-bridge.chart" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: chart-test
+  annotations:
+    "helm.sh/hook": test
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: wget
+      image: busybox:1.37
+      command: ['wget']
+      args: ['--spider', '{{ include "flux-ai-bridge.fullname" . }}:{{ .Values.service.port }}/healthz']
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+  restartPolicy: Never

@@ -1,0 +1,36 @@
+# The LLM API key comes from its own Secret via extraEnv; the rest from
+# existingSecret. `make ct-install` (the helm-ci install job) creates both
+# Secrets before the install.
+#
+# The Sentinel chart test: the bundled Valkey runs with replication and
+# Sentinel, and the bridge finds the master through Sentinel (address and
+# master name derived from the sub-chart). flux-operator-mcp is on by
+# default; Ollama stays off. Throwaway test password.
+config:
+  dedupe:
+    persistence:
+      enabled: true
+      sentinel:
+        enabled: true
+        password: ci-sentinel
+  llm:
+    openaiBaseUrl: "http://llm-gateway.example.com:8787"
+    provider: openai-compatible
+existingSecret: flux-ai-bridge
+extraEnv:
+  - name: OPENAI_API_KEY
+    valueFrom:
+      secretKeyRef:
+        key: api-key
+        name: flux-ai-bridge-llm
+valkey:
+  enabled: true
+  # Replication requires persistent storage (kind's default storage class).
+  persistence:
+    enabled: true
+    size: 100Mi
+  replica:
+    enabled: true
+  sentinel:
+    enabled: true
+    password: ci-sentinel

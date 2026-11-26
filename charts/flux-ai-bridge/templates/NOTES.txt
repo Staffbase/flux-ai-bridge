@@ -1,0 +1,83 @@
+flux-ai-bridge has been deployed successfully!
+
+Webhook endpoint (internal cluster address):
+
+  http://{{ include "flux-ai-bridge.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/webhook
+
+Health check:
+
+  http://{{ include "flux-ai-bridge.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/healthz
+
+{{- if contains "ClusterIP" .Values.service.type }}
+
+To verify the health endpoint locally (replace <your-context> with the kube
+context you installed into):
+
+  export POD_NAME=$(kubectl --context <your-context> get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "flux-ai-bridge.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  kubectl --context <your-context> --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:{{ .Values.service.port }}
+  curl http://127.0.0.1:8080/healthz
+
+{{- end }}
+
+{{- if .Values.flux.notification.enabled }}
+
+Flux Notification Controller integration:
+  A Provider and Alert have been created automatically in namespace
+  "{{ include "flux-ai-bridge.notificationNamespace" . }}".
+  The Notification Controller will forward Kustomization events to the bridge.
+{{- if include "flux-ai-bridge.hmacSecretName" . }}
+  Webhooks are HMAC-signed with the token in Secret "{{ include "flux-ai-bridge.hmacSecretName" . }}".
+{{- else }}
+
+  WARNING: webhook HMAC signing is disabled (flux.notification.hmac.generate=false
+  and no token/existingSecret) — any pod that can reach the bridge Service can
+  post forged events.
+{{- end }}
+
+{{- else }}
+
+Flux Notification Controller integration (manual):
+  flux.notification.enabled is false. Create a Provider and Alert manually,
+  or re-install with --set flux.notification.enabled=true
+
+  Example Provider:
+    apiVersion: {{ include "flux-ai-bridge.notificationAPIVersion" (dict "ctx" . "kind" "Provider") }}
+    kind: Provider
+    metadata:
+      name: flux-ai-bridge
+      namespace: flux-system
+    spec:
+      type: generic-hmac
+      secretRef:
+        name: flux-ai-bridge-webhook-hmac   # key `token`; give the bridge the same value
+      address: http://{{ include "flux-ai-bridge.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/webhook
+
+{{- end }}
+
+LLM provider configured: {{ .Values.config.llm.provider }}
+MCP endpoint:            {{ include "flux-ai-bridge.mcpURL" . }}
+{{- if .Values.networkPolicy.enabled }}
+{{- $fluxNs := .Values.networkPolicy.fluxNamespace | default "flux-system" }}
+
+NetworkPolicy: on. The bridge may reach DNS,
+{{- if eq $fluxNs .Release.Namespace }} the "{{ $fluxNs }}" namespace,
+{{- else }} the "{{ $fluxNs }}" and "{{ .Release.Namespace }}" namespaces,
+{{- end }}
+ports 443/6443, the configured Redis ports, and the endpoints set in
+config.llm.openaiBaseUrl / anthropicBaseUrl and config.github.apiUrl. Add
+other endpoints via networkPolicy.egress.extra.
+{{- end }}
+{{- if eq .Values.config.llm.provider "none" }}
+
+You're running with provider=none — the bridge posts deterministic kstatus
+comments without contacting any LLM. To add an LLM-written analysis on top:
+
+  helm upgrade {{ .Release.Name }} oci://ghcr.io/staffbase/charts/flux-ai-bridge \
+    --kube-context <your-context> \
+    --version {{ .Chart.Version }} --namespace {{ .Release.Namespace }} \
+    --reset-then-reuse-values \
+    --set config.llm.provider=claude   # or openai-compatible
+
+…and add ANTHROPIC_API_KEY (claude) or OPENAI_API_KEY (openai-compatible)
+to the existing Secret. See docs/getting-started.md.
+{{- end }}

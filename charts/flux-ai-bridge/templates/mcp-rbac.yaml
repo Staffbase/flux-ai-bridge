@@ -1,0 +1,115 @@
+{{- /*
+Read-only RBAC for the bundled flux-operator-mcp sub-chart, replacing its
+default cluster-admin binding (flux-operator-mcp.rbac.create=false in
+values.yaml). The bridge only calls read tools, but it polls every object in
+a Kustomization's inventory — which can be any kind, CRDs included — so the
+role grants get/list/watch on everything (subresources such as pods/log
+included). The MCP server masks Secret values in its responses by default.
+The wildcard also grants `get` on nodes/proxy, which the kubelet accepts for
+exec over WebSocket: RBAC can't exclude it without listing API groups.
+mcpRbac.excludeNodeProxy=true renders such a list instead: the core group
+resource by resource (without nodes/proxy, pods/exec, pods/attach,
+pods/portforward, pods/proxy and services/proxy), the built-in and Flux groups
+by name. A CRD group it misses shows up as unreadable resources, so users add
+theirs through mcpRbac.extraRules. Set mcpRbac.create=false to bind a role of
+your own.
+*/ -}}
+{{- $mcp := index .Values "flux-operator-mcp" | default dict }}
+{{- if and $mcp.enabled .Values.mcpRbac.create }}
+{{- $read := list "get" "list" "watch" }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}-mcp-read
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+rules:
+  {{- if .Values.mcpRbac.excludeNodeProxy }}
+  # Core group, listed so the role leaves out the subresources that reach into
+  # a node or a container: nodes/proxy, pods/exec, pods/attach,
+  # pods/portforward, pods/proxy, services/proxy.
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
+      - persistentvolumeclaims
+      - persistentvolumes
+      - pods
+      - pods/log
+      - podtemplates
+      - replicationcontrollers
+      - resourcequotas
+      - secrets
+      - serviceaccounts
+      - services
+    verbs: ["get", "list", "watch"]
+  # Built-in groups that Kustomizations apply or the bridge reads (Jobs,
+  # ReplicaSets, events, pod metrics). None of them has a subresource that
+  # proxies to the kubelet.
+  - apiGroups:
+      - admissionregistration.k8s.io
+      - apiextensions.k8s.io
+      - apiregistration.k8s.io
+      - apps
+      - autoscaling
+      - batch
+      - discovery.k8s.io
+      - events.k8s.io
+      - metrics.k8s.io
+      - networking.k8s.io
+      - policy
+      - rbac.authorization.k8s.io
+      - scheduling.k8s.io
+      - storage.k8s.io
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Flux and the Flux Operator.
+  - apiGroups:
+      - fluxcd.controlplane.io
+      - helm.toolkit.fluxcd.io
+      - image.toolkit.fluxcd.io
+      - kustomize.toolkit.fluxcd.io
+      - notification.toolkit.fluxcd.io
+      - source.extensions.fluxcd.io
+      - source.toolkit.fluxcd.io
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  {{- else }}
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  {{- range $i, $rule := .Values.mcpRbac.extraRules }}
+  {{- $verbs := $rule.verbs | default $read }}
+  {{- range $verbs }}
+  {{- if not (has . $read) }}
+  {{- fail (printf "mcpRbac.extraRules[%d]: verb %q is not allowed; the MCP role is read-only (get, list, watch)" $i .) }}
+  {{- end }}
+  {{- end }}
+  - apiGroups: {{ required (printf "mcpRbac.extraRules[%d].apiGroups is required" $i) $rule.apiGroups | toJson }}
+    resources: {{ required (printf "mcpRbac.extraRules[%d].resources is required" $i) $rule.resources | toJson }}
+    {{- with $rule.resourceNames }}
+    resourceNames: {{ toJson . }}
+    {{- end }}
+    verbs: {{ toJson $verbs }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}-mcp-read
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "flux-ai-bridge.fullname" . }}-mcp-read
+subjects:
+  - kind: ServiceAccount
+    name: {{ (($mcp.serviceAccount | default dict).name) | default ($mcp.fullnameOverride | default "flux-operator-mcp") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

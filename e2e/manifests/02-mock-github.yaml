@@ -1,0 +1,60 @@
+---
+# mock-github — bridge → GitHub REST API stub. Skipped when
+# E2E_REAL_GITHUB=1. Pairs with the mock-server-scripts ConfigMap in
+# 02-mock-common.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-github
+  namespace: mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-github
+  template:
+    metadata:
+      labels:
+        app: mock-github
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mock-github
+          image: python:3-alpine
+          command: [python3, /scripts/mock-github.py]
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: mock-server-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-github
+  namespace: mock
+spec:
+  selector:
+    app: mock-github
+  ports:
+    - port: 80
+      targetPort: 8080

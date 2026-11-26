@@ -1,0 +1,339 @@
+---
+# Mock servers live in their own namespace so the dev surface in
+# flux-system stays limited to Flux + the bridge under test. The
+# bridge reaches them via cluster DNS (`mock-llm.mock.svc.cluster.local`,
+# `mock-github.mock.svc.cluster.local`); see the Makefile e2e env block.
+#
+# Applied whenever at least one side is mocked. The mock-llm and
+# mock-github Deployments live in separate files (02-mock-llm.yaml,
+# 02-mock-github.yaml) so each can be skipped independently when its
+# real counterpart is used. Both Deployments mount this ConfigMap.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mock
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-server-scripts
+  namespace: mock
+data:
+  mock-llm.py: |
+    #!/usr/bin/env python3
+    import json, re, sys
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    LLM_TEXT = '## Kustomization Status\n\n**Status:** OK\n\nAll resources ready (E2E mock).'
+    RESPONSE = {
+        'id': 'msg_e2e',
+        'type': 'message',
+        'role': 'assistant',
+        'content': [{'type': 'text', 'text': LLM_TEXT}],
+        'model': 'claude-sonnet-4-6',
+        'stop_reason': 'end_turn',
+        'stop_sequence': None,
+        'usage': {'input_tokens': 10, 'output_tokens': 20},
+    }
+    # Bumped on every accepted bridge→mock-llm call so each request/response
+    # pair carries a stable ordinal in its log header. Makes greppable IDs
+    # when multiple pipelines fire in one e2e run.
+    call_seq = 0
+    requests = []  # captured POST bodies — read via GET /_dump
+
+    # _dump / _reset are e2e plumbing — noisy and uninteresting. Skip them
+    # in the log so what surfaces in `kubectl logs` is just bridge→mock-llm
+    # traffic.
+    NOISY = {'/_dump', '/_reset'}
+
+    def _summary(body):
+        """Extract a one-liner like `flux-system/podinfo Kustomization rev=27168b55 reason=ReconciliationSucceeded`
+        from the bridge's prompt. Falls back to '?' for any field the
+        Anthropic body shape doesn't expose. Best-effort — the mock keeps
+        running even if the bridge changes prompt format."""
+        try:
+            obj = json.loads(body)
+            prompt = obj['messages'][0]['content'][0]['text']
+        except Exception:
+            return 'unparseable-body'
+        def pick(pat, default='?'):
+            m = re.search(pat, prompt)
+            return m.group(1) if m else default
+        resource = pick(r'Resource:\s*([^\s(]+)')
+        kind     = pick(r'Resource:\s*\S+\s*\(([^)]+)\)')
+        reason   = pick(r'Reason:\s*(\S+)')
+        rev      = pick(r'Git Revision:\s*([a-f0-9]+)')
+        rev_short = rev[:8] if rev != '?' else '?'
+        return f'{resource} {kind} rev={rev_short} reason={reason}'
+
+    def _log(label, payload):
+        print(f'--- {label} ---\n{payload}', flush=True)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/_dump':
+                self._json(requests, log=False)
+                return
+            self._json({})
+
+        def do_POST(self):
+            global call_seq
+            if self.path == '/_reset':
+                requests.clear()
+                self._json({'ok': True}, log=False)
+                return
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode('utf-8', errors='replace')
+            call_seq += 1
+            tag = f'#{call_seq:03d} {_summary(body)}'
+            requests.append({'path': self.path, 'body': body})
+            _log(f'IN  POST {self.path} | {tag}', body)
+            # Echo the Git revision into the response so each event yields a
+            # DISTINCT comment body — like a real LLM, whose narrative reflects
+            # the specific analysis. With a fixed body, every podinfo comment was
+            # byte-identical, so the bridge's skip-if-unchanged suppressed every
+            # repost after the first (incl. the cluster's own reconcile) and the
+            # per-event POST the pipeline test waits for never happened. The
+            # asserted "All resources ready (E2E mock)" text stays in LLM_TEXT.
+            rev = '?'
+            try:
+                prompt = json.loads(body)['messages'][0]['content'][0]['text']
+                m = re.search(r'Git Revision:\s*(\S+)', prompt)
+                if m:
+                    rev = m.group(1)
+            except Exception:
+                pass
+            resp = dict(RESPONSE)
+            resp['content'] = [{'type': 'text', 'text': LLM_TEXT + f'\n\nRevision: {rev}'}]
+            payload = json.dumps(resp).encode()
+            _log(f'OUT 200 {self.path} | {tag}', payload.decode())
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _json(self, data, code=200, log=True):
+            payload = json.dumps(data).encode()
+            if log and self.path not in NOISY:
+                _log(f'OUT {code} {self.command} {self.path}', payload.decode())
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, fmt, *args):
+            # Suppress the default-formatted access log line; we emit our
+            # own IN/OUT block above with the full body.
+            pass
+
+    HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
+
+  mock-github.py: |
+    #!/usr/bin/env python3
+    import base64, json, re, sys
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    requests = []  # captured non-GET bodies — read via GET /_dump
+
+    # Bumped per non-noisy call so each IN/OUT pair carries a stable ordinal
+    # in its log header. Helps correlate when many pipelines fire in one run.
+    call_seq = 0
+
+    # _dump / _reset are e2e plumbing — noisy and uninteresting. Skip them
+    # in the log so what surfaces in `kubectl logs` is just bridge→mock-github
+    # traffic.
+    NOISY = {'/_dump', '/_reset'}
+
+    # Fixture blob: declares the podinfo Namespace, which IS in the e2e
+    # podinfo Kustomization's status.inventory. Two things admit PR #42: the
+    # file path is inside the Kustomization's build (it resolves from spec.path
+    # `./e2e/podinfo-kustomize` in the source-controller artifact), and the blob
+    # declares the Namespace that's in the inventory. The path is the realistic
+    # repo-root-relative one GitHub returns from /pulls/N/files — it MUST match a
+    # file in the build set or the artifact-scope gate drops the PR. Keep the
+    # manifest minimal — apiVersion/kind/metadata.name is everything
+    # resourceIDsFromYAML parses. The blob SHA below is the value mock-github
+    # returns from /pulls/N/files and looks up on /git/blobs/<sha>.
+    PR_FILE_SHA = 'fc1ae123456789abcdef0000000000000000beef'
+    PR_FILE_PATH = 'e2e/podinfo-kustomize/namespace.yaml'
+    PR_FILE_CONTENT = (
+        'apiVersion: v1\n'
+        'kind: Namespace\n'
+        'metadata:\n'
+        '  name: podinfo\n'
+    )
+
+    # Prune-deletion scenario (case (a) teardown attribution). When the test
+    # POSTs `/_scenario` with body "prune", the next PR lookups return
+    # PRUNE_PR_NUMBER, whose sole changed file is a `removed` CronJob that is NOT
+    # in podinfo's status.inventory. The bridge can only attribute that PR by
+    # reading the kustomize-controller prune event from the cluster (a Kubernetes
+    # Event the e2e test injects), exercising PR_ATTRIBUTE_PRUNES end-to-end.
+    # Routing is via this flag (not the SHA) so the webhook can carry the
+    # Kustomization's REAL lastAppliedRevision — required now that the bridge
+    # gates analysis on the revision actually being applied. `/_reset` clears it.
+    scenario = ['default']
+    PRUNE_PR_NUMBER = 43
+    # PR numbers served with the prune fixture: 43, plus any "prune:<n>".
+    prune_prs = {PRUNE_PR_NUMBER}
+    PRUNE_FILE_SHA = 'c4030bdeadbeef00000000000000000000feed01'
+    PRUNE_FILE_PATH = 'podinfo/legacy-cron.yaml'
+    PRUNE_FILE_CONTENT = (
+        'apiVersion: batch/v1\n'
+        'kind: CronJob\n'
+        'metadata:\n'
+        '  name: legacy-cron\n'
+        '  namespace: podinfo\n'
+    )
+
+    # GET /app answers with this slug, and the comments mock-github returns are
+    # authored by `<slug>[bot]`, like real GitHub does for an App's comments.
+    APP_SLUG = 'flux-ai-bridge-e2e'
+    APP_USER = {'login': APP_SLUG + '[bot]', 'type': 'Bot'}
+
+    # The GitHub endpoints the bridge hits map to specific pipeline phases.
+    # Tag each so you can grep for a phase across calls.
+    def _phase(method, path):
+        if re.search(r'/commits/[^/]+/pulls', path):
+            return 'pr-lookup'
+        if re.search(r'/pulls/\d+/files', path):
+            return 'pr-files'
+        if re.search(r'/git/blobs/', path):
+            return 'blob-fetch'
+        if re.search(r'/issues/\d+/comments', path) and method == 'GET':
+            return 'comment-list'
+        if re.search(r'/issues/\d+/comments', path) and method == 'POST':
+            return 'comment-create'
+        if re.search(r'/issues/comments/\d+', path) and method == 'PATCH':
+            return 'comment-update'
+        if '/app/installations/' in path:
+            return 'app-token'
+        if path.split('?')[0].endswith('/app'):
+            return 'app-identity'
+        return method.lower()
+
+    def _log(label, payload):
+        print(f'--- {label} ---\n{payload}', flush=True)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            global call_seq
+            if self.path == '/_dump':
+                self._json(requests, log=False)
+                return
+            call_seq += 1
+            tag = f'#{call_seq:03d} {_phase("GET", self.path)}'
+            _log(f'IN  GET {self.path} | {tag}', '')
+            if re.search(r'/commits/[^/]+/pulls', self.path):
+                # Echo the looked-up commit as the PR's head.sha. The bridge
+                # dedups analysis per (Kustomization, PR, head.sha), so without
+                # a head the field is "" and EVERY commit collapses into one
+                # dedup key — the first event (incl. the cluster's own
+                # force-reconcile) wins and every later one is skipped
+                # ("PR already analysed at this head"). Real GitHub always
+                # returns head.sha; mirroring that here keeps each unique test
+                # SHA a distinct dedup identity. (Re-firing the SAME sha still
+                # dedups, preserving the dedup contract.)
+                m = re.search(r'/commits/([^/]+)/pulls', self.path)
+                head_sha = m.group(1) if m else ''
+                if scenario[0] == 'prune' or scenario[0].startswith('prune:'):
+                    # Prune-deletion scenario → a distinct PR whose only file is
+                    # a removed CronJob absent from podinfo's inventory.
+                    # "prune:<n>" serves it under PR number n (see "pr:<n>").
+                    n = int(scenario[0][6:]) if scenario[0].startswith('prune:') else PRUNE_PR_NUMBER
+                    prune_prs.add(n)
+                    self._json([{'number': n, 'state': 'open', 'html_url': 'https://github.com/test-owner/test-repo/pull/%d' % n, 'head': {'sha': head_sha}}], tag=tag)
+                elif scenario[0].startswith('pr:'):
+                    # "pr:<n>" → the default fixture under PR number n. The
+                    # bridge keeps one current comment per (PR, Kustomization)
+                    # and doesn't re-post an unchanged state, so a test that
+                    # must SEE a comment POST uses a PR number nothing has
+                    # commented on yet.
+                    n = int(scenario[0][3:])
+                    self._json([{'number': n, 'state': 'open', 'html_url': 'https://github.com/test-owner/test-repo/pull/%d' % n, 'head': {'sha': head_sha}}], tag=tag)
+                else:
+                    self._json([{'number': 42, 'state': 'open', 'html_url': 'https://github.com/test-owner/test-repo/pull/42', 'head': {'sha': head_sha}}], tag=tag)
+            elif re.search(r'/pulls/\d+/files', self.path):
+                # The bridge's inventory-membership filter walks each PR
+                # file and admits the PR iff at least one file declares a
+                # resource in the Kustomization's status.inventory. Return
+                # exactly one file pointing at PR_FILE_SHA so /git/blobs
+                # below can satisfy the next call with a matching manifest.
+                m = re.search(r'/pulls/(\d+)/files', self.path)
+                if m and int(m.group(1)) in prune_prs:
+                    self._json([{'filename': PRUNE_FILE_PATH, 'sha': PRUNE_FILE_SHA, 'status': 'removed'}], tag=tag)
+                else:
+                    self._json([{'filename': PR_FILE_PATH, 'sha': PR_FILE_SHA, 'status': 'modified'}], tag=tag)
+            elif re.search(r'/git/blobs/', self.path):
+                # go-github auto-decodes encoding=base64; the bridge
+                # unwraps it in GetBlobContent.
+                if self.path.endswith(PRUNE_FILE_SHA):
+                    blob_sha, blob_content = PRUNE_FILE_SHA, PRUNE_FILE_CONTENT
+                else:
+                    blob_sha, blob_content = PR_FILE_SHA, PR_FILE_CONTENT
+                self._json({
+                    'sha': blob_sha,
+                    'content': base64.b64encode(blob_content.encode()).decode(),
+                    'encoding': 'base64',
+                }, tag=tag)
+            elif re.search(r'/issues/\d+/comments', self.path):
+                self._json([], tag=tag)
+            elif self.path.split('?')[0].endswith('/app'):
+                # The App the bridge authenticates as. The bridge reads its
+                # slug at startup and then only treats comments by
+                # `<slug>[bot]` as its own.
+                self._json({'id': 1, 'slug': APP_SLUG, 'name': APP_SLUG}, tag=tag)
+            else:
+                self._json({}, tag=tag)
+
+        def do_POST(self):
+            global call_seq
+            if self.path == '/_reset':
+                requests.clear()
+                scenario[0] = 'default'
+                self._json({'ok': True}, log=False)
+                return
+            if self.path == '/_scenario':
+                length = int(self.headers.get('Content-Length', 0))
+                scenario[0] = self.rfile.read(length).decode('utf-8', errors='replace').strip() or 'default'
+                self._json({'ok': True, 'scenario': scenario[0]}, log=False)
+                return
+            call_seq += 1
+            tag = f'#{call_seq:03d} {_phase("POST", self.path)}'
+            self._capture('POST', tag)
+            self._json({'id': 1, 'body': 'ok', 'user': APP_USER}, 201, tag=tag)
+
+        def do_PATCH(self):
+            global call_seq
+            call_seq += 1
+            tag = f'#{call_seq:03d} {_phase("PATCH", self.path)}'
+            self._capture('PATCH', tag)
+            self._json({'id': 1, 'body': 'ok', 'user': APP_USER}, tag=tag)
+
+        def _capture(self, method, tag):
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode('utf-8', errors='replace')
+            requests.append({'method': method, 'path': self.path, 'body': body})
+            _log(f'IN  {method} {self.path} | {tag}', body)
+
+        def _json(self, data, code=200, log=True, tag=None):
+            body = json.dumps(data).encode()
+            if log and self.path not in NOISY:
+                header = f'OUT {code} {self.command} {self.path}'
+                if tag:
+                    header += f' | {tag}'
+                _log(header, body.decode())
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            # Suppress the default-formatted access log line; we emit our
+            # own IN/OUT block above with the full body.
+            pass
+
+    HTTPServer(('0.0.0.0', 8080), Handler).serve_forever()

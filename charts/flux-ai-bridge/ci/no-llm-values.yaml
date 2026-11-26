@@ -1,0 +1,27 @@
+# LLM_PROVIDER=none — the bridge posts a deterministic comment built from
+# kstatus output alone. No API key required. Verifies the chart renders
+# cleanly without anthropicApiKey / openaiApiKey set. The placeholder key only
+# renders: `make ct-install` (the helm-ci install job) replaces it with a
+# generated RSA key, as the bridge parses the key at startup.
+#
+# Chart tests run with the bundled sub-charts flux-operator-mcp (on by
+# default) and Valkey, used for persistent dedupe. Ollama stays off.
+config:
+  dedupe:
+    persistence:
+      enabled: true
+  llm:
+    provider: none
+credentials:
+  githubApp:
+    appId: "1"
+    installationId: "1"
+    privateKey: |
+      -----BEGIN PRIVATE KEY-----
+      placeholder
+      -----END PRIVATE KEY-----
+flux:
+  notification:
+    enabled: false
+valkey:
+  enabled: true
