@@ -741,25 +741,35 @@ func discoverOpenPR(cfg realGHConfig) (realGHConfig, error) {
 }
 
 func listPRComments(cfg realGHConfig) ([]map[string]any, error) {
-	url := fmt.Sprintf("%s/repos/%s/issues/%d/comments?per_page=100",
-		cfg.apiURL, cfg.repo, cfg.prNumber)
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	req.Header.Set("Authorization", "Bearer "+cfg.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	resp, err := githubClient.Do(req)
-	if err != nil {
-		return nil, err
+	// Every page: a check that only saw the first one could miss a comment,
+	// or see an older one move up after a deletion.
+	var all []map[string]any
+	for page := 1; ; page++ {
+		url := fmt.Sprintf("%s/repos/%s/issues/%d/comments?per_page=100&page=%d",
+			cfg.apiURL, cfg.repo, cfg.prNumber, page)
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("Authorization", "Bearer "+cfg.token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		resp, err := githubClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var out []map[string]any
+		if resp.StatusCode/100 != 2 {
+			err = fmt.Errorf("status %d listing comments", resp.StatusCode)
+		} else {
+			err = json.NewDecoder(resp.Body).Decode(&out)
+		}
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, out...)
+		if len(out) < 100 {
+			return all, nil
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("status %d listing comments", resp.StatusCode)
-	}
-	var out []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // pipelineDeadline gives the bridge time to finish MCP → LLM → GitHub. A real
