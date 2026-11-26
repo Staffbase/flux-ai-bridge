@@ -84,6 +84,9 @@ func newTestPool(t *testing.T, responses map[string]string) *bridgemcp.Pool {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
+	// Cleanups run last-in first-out, so the pool's sessions close before
+	// the server does. Close is idempotent and bounds itself (5s).
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
 	return c
 }
 

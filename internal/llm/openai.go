@@ -39,6 +39,12 @@ type OpenAIAnalyzer struct {
 	client    openai.Client
 	model     string
 	maxTokens int64
+	// legacyMaxTokens sends the output cap as max_tokens instead of
+	// max_completion_tokens. Ollama's OpenAI-compatible API reads only
+	// max_tokens and ignores the newer field, so without this LLM_MAX_TOKENS
+	// would not bound its output. OpenAI's reasoning models reject
+	// max_tokens, so every other endpoint keeps max_completion_tokens.
+	legacyMaxTokens bool
 }
 
 func NewOpenAIAnalyzer(cfg *config.Config) *OpenAIAnalyzer {
@@ -67,7 +73,24 @@ func NewOpenAIAnalyzer(cfg *config.Config) *OpenAIAnalyzer {
 	if max <= 0 {
 		max = defaultMaxTokens
 	}
-	return &OpenAIAnalyzer{client: openai.NewClient(options...), model: cfg.LLMModel, maxTokens: max}
+	return &OpenAIAnalyzer{
+		client:          openai.NewClient(options...),
+		model:           cfg.LLMModel,
+		maxTokens:       max,
+		legacyMaxTokens: isOllamaEndpoint(cfg.OpenAIBaseURL),
+	}
+}
+
+// ollamaPort is the port Ollama listens on by default, and the one the
+// bundled sub-chart and docs/local-llm.md use.
+const ollamaPort = "11434"
+
+// isOllamaEndpoint reports whether baseURL addresses an Ollama server, told
+// apart by Ollama's default port: the OpenAI-compatible API has no capability
+// discovery for the token-limit field.
+func isOllamaEndpoint(baseURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	return err == nil && u.Port() == ollamaPort
 }
 
 // azureDeploymentsEndpoint returns the resource endpoint to hand to
@@ -108,14 +131,19 @@ func (a *OpenAIAnalyzer) Analyze(ctx context.Context, systemPrefix, userPayload 
 		sb.WriteString(systemPrefix)
 	}
 
-	completion, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model:               openai.ChatModel(a.model),
-		MaxCompletionTokens: openai.Int(a.maxTokens),
+	params := openai.ChatCompletionNewParams{
+		Model: openai.ChatModel(a.model),
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(sb.String()),
 			openai.UserMessage(userPayload),
 		},
-	})
+	}
+	if a.legacyMaxTokens {
+		params.MaxTokens = openai.Int(a.maxTokens)
+	} else {
+		params.MaxCompletionTokens = openai.Int(a.maxTokens)
+	}
+	completion, err := a.client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		// Classify 429 separately from generic LLM errors so quota-exhaustion
 		// alerts don't false-positive on schema/parsing failures. The OpenAI

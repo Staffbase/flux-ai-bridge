@@ -47,7 +47,11 @@ type ClaudeAnalyzer struct {
 }
 
 func NewClaudeAnalyzer(cfg *config.Config) *ClaudeAnalyzer {
-	opts := []option.RequestOption{option.WithAPIKey(cfg.AnthropicAPIKey), option.WithRequestTimeout(requestTimeout)}
+	opts := []option.RequestOption{
+		option.WithAPIKey(cfg.AnthropicAPIKey),
+		option.WithRequestTimeout(requestTimeout),
+		option.WithHTTPClient(sameOriginHTTPClient()),
+	}
 	if cfg.AnthropicBaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.AnthropicBaseURL))
 	}

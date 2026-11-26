@@ -44,6 +44,7 @@
 package dedupe
 
 import (
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -256,8 +257,14 @@ func (c *Cache) MarkPRIfNew(ns, name string, pr int, headSHA string, ttl time.Du
 		}
 		return false, nil
 	}
-	// A cooldown left over from a mark the LRU since evicted must not cut
-	// this fresh mark short.
+	// The cooldown is the mark's expiry, like a Redis EXPIRE: a mark the
+	// TTL cache dropped (its global ttl shorter than the cooldown) still
+	// dedupes until the cooldown ends, so a rate-limited PR doesn't hit
+	// GitHub again before the limit resets.
+	if until, cooling := c.cooldowns.Get(key); cooling && time.Now().Before(until) {
+		return false, nil
+	}
+	// A lapsed cooldown must not cut this fresh mark short.
 	c.cooldowns.Remove(key)
 	c.s.Add(key, time.Now())
 	return true, nil
@@ -565,15 +572,32 @@ func (c *Cache) RemovePRScope(owner, repo string, pr int, scope string) bool {
 }
 
 // PRScopes returns the PR roster: every Kustomization scope the bridge has
-// attributed this PR to, across heads. Order is unspecified.
+// attributed this PR to, across heads. Order is unspecified. Best-effort: a
+// backend read error returns an empty roster (logged); callers that must not
+// mistake an unreadable roster for an empty one use ReadPRScopes.
 func (c *Cache) PRScopes(owner, repo string, pr int) []string {
+	scopes, err := c.ReadPRScopes(owner, repo, pr)
+	if err != nil {
+		slog.Default().Warn("dedupe: redis HGETALL roster failed, treating as empty (best-effort)",
+			"owner", owner, "repo", repo, "pr", pr, "error", err.Error())
+	}
+	return scopes
+}
+
+// ReadPRScopes is PRScopes with the backend read error. Deciding that every
+// known scope has reported (the gate for a flux-success label) must fail
+// closed on an error: an unreadable roster is not an empty one.
+func (c *Cache) ReadPRScopes(owner, repo string, pr int) ([]string, error) {
 	if c == nil || c.s == nil {
-		return nil
+		return nil, nil
 	}
 	key := rosterKey(owner, repo, pr)
 	var m map[string]string
 	if r, ok := c.s.(*redisStore); ok {
-		m = r.hgetallScopeOutcomes(key)
+		var err error
+		if m, err = r.hgetall(key); err != nil {
+			return nil, err
+		}
 	} else {
 		c.mu.Lock()
 		if c.labels != nil {
@@ -590,5 +614,5 @@ func (c *Cache) PRScopes(owner, repo string, pr int) []string {
 	for k := range m {
 		out = append(out, k)
 	}
-	return out
+	return out, nil
 }

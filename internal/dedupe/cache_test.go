@@ -17,6 +17,7 @@ package dedupe_test
 import (
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/staffbase/flux-ai-bridge/internal/dedupe"
@@ -208,21 +209,26 @@ func TestPROutcome_NilSafe(t *testing.T) {
 
 // TestMarkPRIfNew_TTLFloor pins the per-PR re-evaluation floor on the
 // non-expirable in-memory cache: within the ttl the same PR head is a
-// duplicate; once the ttl elapses the same head is re-admitted.
+// duplicate; once the ttl elapses the same head is re-admitted. Fake time
+// (synctest) keeps a scheduler pause from expiring the floor before the
+// duplicate check.
 func TestMarkPRIfNew_TTLFloor(t *testing.T) {
 	t.Parallel()
-	c := dedupe.NewNoExpiry(16)
-	const ttl = 30 * time.Millisecond
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", ttl); !isNew {
-		t.Fatal("first mark must be new")
-	}
-	if dup, _ := c.MarkPRIfNew("ns", "k", 7, "head", ttl); dup {
-		t.Fatal("within the ttl floor the same head must be a duplicate")
-	}
-	time.Sleep(ttl + 10*time.Millisecond)
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", ttl); !isNew {
-		t.Fatal("after the ttl floor elapses the same head must be re-admitted")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		c := dedupe.NewNoExpiry(16)
+		const ttl = 30 * time.Millisecond
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", ttl); !isNew {
+			t.Fatal("first mark must be new")
+		}
+		time.Sleep(ttl - time.Millisecond)
+		if dup, _ := c.MarkPRIfNew("ns", "k", 7, "head", ttl); dup {
+			t.Fatal("within the ttl floor the same head must be a duplicate")
+		}
+		time.Sleep(time.Millisecond)
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", ttl); !isNew {
+			t.Fatal("after the ttl floor elapses the same head must be re-admitted")
+		}
+	})
 }
 
 func TestKeyTupleSeparation(t *testing.T) {
@@ -357,34 +363,61 @@ func TestPRReEvalCount_PeeksWithoutTouching(t *testing.T) {
 
 // In-memory ExpirePR mirrors the Redis EXPIRE: the mark dedupes until the
 // cooldown lapses, re-admits once, and a cooldown never outlives its mark.
+// Fake time (synctest) keeps a scheduler pause from lapsing the cooldown
+// before the in-cooldown check.
 func TestExpirePR_InMemoryCooldown(t *testing.T) {
-	c := dedupe.NewNoExpiry(16)
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); !isNew {
-		t.Fatal("first mark must be new")
-	}
-	c.ExpirePR("ns", "k", 7, "head", 30*time.Millisecond)
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); isNew {
-		t.Fatal("mark must dedupe during the cooldown")
-	}
-	time.Sleep(40 * time.Millisecond)
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); !isNew {
-		t.Fatal("mark must re-admit once the cooldown lapsed")
-	}
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); isNew {
-		t.Fatal("the re-admitted mark must dedupe again (no cooldown left)")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		c := dedupe.NewNoExpiry(16)
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); !isNew {
+			t.Fatal("first mark must be new")
+		}
+		c.ExpirePR("ns", "k", 7, "head", 30*time.Millisecond)
+		time.Sleep(29 * time.Millisecond)
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); isNew {
+			t.Fatal("mark must dedupe during the cooldown")
+		}
+		time.Sleep(time.Millisecond)
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); !isNew {
+			t.Fatal("mark must re-admit once the cooldown lapsed")
+		}
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 7, "head", 0); isNew {
+			t.Fatal("the re-admitted mark must dedupe again (no cooldown left)")
+		}
 
-	// A cooldown on an absent mark is ignored, so it can't cut a later
-	// fresh mark short.
-	c.ExpirePR("ns", "k", 8, "head", time.Millisecond)
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 8, "head", 0); !isNew {
-		t.Fatal("first mark must be new")
+		// A cooldown on an absent mark is ignored, so it can't cut a later
+		// fresh mark short.
+		c.ExpirePR("ns", "k", 8, "head", time.Millisecond)
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 8, "head", 0); !isNew {
+			t.Fatal("first mark must be new")
+		}
+		time.Sleep(5 * time.Millisecond)
+		if isNew, _ := c.MarkPRIfNew("ns", "k", 8, "head", 0); isNew {
+			t.Fatal("fresh mark must not inherit a cooldown set before it existed")
+		}
+		if !c.Available() {
+			t.Fatal("in-memory cache is always available")
+		}
+	})
+}
+
+// With a TTL cache whose global ttl is shorter than a rate-limit cooldown,
+// the cooldown still holds after the mark itself expired: the next event
+// must not retry GitHub before the limit resets. Once the cooldown ends,
+// the PR is admitted again. Real time, not synctest: the expirable LRU runs
+// a cleanup goroutine that never exits.
+func TestExpirePR_CooldownOutlivesTTL(t *testing.T) {
+	t.Parallel()
+	c := dedupe.New(20*time.Millisecond, 16)
+	markPRNew(t, c, "ns", "k", 7, "head", 0)
+	markPRNew(t, c, "ns", "k", 8, "head", 0)
+	c.ExpirePR("ns", "k", 7, "head", time.Hour)
+	c.ExpirePR("ns", "k", 8, "head", 40*time.Millisecond)
+	time.Sleep(100 * time.Millisecond) // past the ttl and PR 8's cooldown
+
+	if markPRNew(t, c, "ns", "k", 7, "head", 0) {
+		t.Fatal("PR re-admitted while its cooldown still runs, because the TTL dropped the mark")
 	}
-	time.Sleep(5 * time.Millisecond)
-	if isNew, _ := c.MarkPRIfNew("ns", "k", 8, "head", 0); isNew {
-		t.Fatal("fresh mark must not inherit a cooldown set before it existed")
-	}
-	if !c.Available() {
-		t.Fatal("in-memory cache is always available")
+	if !markPRNew(t, c, "ns", "k", 8, "head", 0) {
+		t.Fatal("PR must be admitted again once its cooldown ended")
 	}
 }

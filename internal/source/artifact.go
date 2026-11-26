@@ -164,9 +164,11 @@ func cleanArtifactPath(name string) (string, bool) {
 }
 
 // cleanRel normalises a path the same way entries are stored, so external
-// callers (PR file paths, spec.path) compare consistently.
+// callers (PR file paths, spec.path) compare consistently. Whitespace is part
+// of the name: archive entries, GitHub file names and kustomize references
+// all keep it, so trimming it could match a different file.
 func cleanRel(p string) string {
-	p = strings.TrimPrefix(strings.TrimSpace(p), "./")
+	p = strings.TrimPrefix(p, "./")
 	p = path.Clean(p)
 	return strings.TrimPrefix(p, "/")
 }

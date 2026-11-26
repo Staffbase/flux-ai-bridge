@@ -250,6 +250,139 @@ func TestBuildFileSet_PluginAndReplacementRefs(t *testing.T) {
 	}
 }
 
+// An inline patchesStrategicMerge entry is the patch itself, not a path: it
+// must not make the overlay unresolvable. A missing patch file still is.
+func TestBuildFileSet_InlineStrategicMergePatch(t *testing.T) {
+	files := map[string]string{
+		"apps/web/kustomization.yaml": "resources:\n  - deploy.yaml\n" +
+			"patchesStrategicMerge:\n  - patch.yaml\n" +
+			"  - |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n      name: web\n" +
+			"  - '{\"apiVersion\": \"apps/v1\", \"kind\": \"Deployment\", \"metadata\": {\"name\": \"web\"}}'\n",
+		"apps/web/deploy.yaml": "kind: Deployment\n",
+		"apps/web/patch.yaml":  "kind: Deployment\n",
+		"apps/bad/kustomization.yaml": "resources:\n  - deploy.yaml\n" +
+			"patchesStrategicMerge:\n  - missing.yaml\n",
+		"apps/bad/deploy.yaml": "kind: Deployment\n",
+	}
+	tree, err := ReadTarGz(bytes.NewReader(makeTarGz(t, files)))
+	if err != nil {
+		t.Fatalf("ReadTarGz: %v", err)
+	}
+	set, err := tree.BuildFileSet("apps/web")
+	if err != nil {
+		t.Fatalf("BuildFileSet with inline patches: %v", err)
+	}
+	for _, p := range []string{"apps/web/kustomization.yaml", "apps/web/deploy.yaml", "apps/web/patch.yaml"} {
+		if _, ok := set[p]; !ok {
+			t.Errorf("missing %s; set = %v", p, keys(set))
+		}
+	}
+	if _, err := tree.BuildFileSet("apps/bad"); err == nil {
+		t.Error("a missing patchesStrategicMerge file must still fail the build set")
+	}
+}
+
+// Kustomize loads a local path before it tries a remote base, so an in-repo
+// directory or file whose path looks like a remote host is a build input.
+func TestBuildFileSet_LocalPathLookingRemote(t *testing.T) {
+	files := map[string]string{
+		"apps/web/kustomization.yaml":                     "resources:\n  - github.com/org/base\n  - gitlab.com/cm.yaml\n  - github.com/org/remote?ref=v1\n",
+		"apps/web/github.com/org/base/kustomization.yaml": "resources:\n  - deploy.yaml\n",
+		"apps/web/github.com/org/base/deploy.yaml":        "kind: Deployment\n",
+		"apps/web/gitlab.com/cm.yaml":                     "kind: ConfigMap\n",
+	}
+	tree, err := ReadTarGz(bytes.NewReader(makeTarGz(t, files)))
+	if err != nil {
+		t.Fatalf("ReadTarGz: %v", err)
+	}
+	set, err := tree.BuildFileSet("apps/web")
+	if err != nil {
+		t.Fatalf("BuildFileSet: %v", err)
+	}
+	for p := range files {
+		if _, ok := set[p]; !ok {
+			t.Errorf("missing %s; set = %v", p, keys(set))
+		}
+	}
+}
+
+// A file name's whitespace is part of it: a reference to "config.yaml " is
+// that file, not its unspaced sibling, and CleanPath keeps the space so a PR
+// file name matches the build set.
+func TestBuildFileSet_PathWhitespaceIsLiteral(t *testing.T) {
+	files := map[string]string{
+		"apps/web/kustomization.yaml": "resources:\n  - \"config.yaml \"\n",
+		"apps/web/config.yaml ":       "kind: ConfigMap\n",
+		"apps/web/config.yaml":        "kind: ConfigMap\n",
+	}
+	tree, err := ReadTarGz(bytes.NewReader(makeTarGz(t, files)))
+	if err != nil {
+		t.Fatalf("ReadTarGz: %v", err)
+	}
+	set, err := tree.BuildFileSet("apps/web")
+	if err != nil {
+		t.Fatalf("BuildFileSet: %v", err)
+	}
+	if _, ok := set[CleanPath("apps/web/config.yaml ")]; !ok {
+		t.Errorf("referenced file with trailing space missing; set = %q", keys(set))
+	}
+	if _, ok := set["apps/web/config.yaml"]; ok {
+		t.Errorf("unreferenced sibling without the space attributed; set = %q", keys(set))
+	}
+}
+
+// spec.components on the Flux Kustomization adds component directories to the
+// build at spec.path: their files are build inputs. A missing component fails
+// the build set unless ignoreMissingComponents is set.
+func TestBuildFileSetWithComponents(t *testing.T) {
+	files := map[string]string{
+		"apps/web/dev/kustomization.yaml":     "resources:\n  - deploy.yaml\n",
+		"apps/web/dev/deploy.yaml":            "kind: Deployment\n",
+		"components/tls/kustomization.yaml":   "kind: Component\npatches:\n  - path: tls.yaml\n",
+		"components/tls/tls.yaml":             "kind: Deployment\n",
+		"components/other/kustomization.yaml": "kind: Component\n",
+		"apps/plain/deploy.yaml":              "kind: Deployment\n",
+	}
+	tree, err := ReadTarGz(bytes.NewReader(makeTarGz(t, files)))
+	if err != nil {
+		t.Fatalf("ReadTarGz: %v", err)
+	}
+
+	// One spec.path with its own kustomization, one Flux generates one for;
+	// component paths are relative to spec.path.
+	for start, component := range map[string]string{
+		"apps/web/dev": "../../../components/tls",
+		"apps/plain":   "../../components/tls",
+	} {
+		set, err := tree.BuildFileSetWithComponents(start, Components{Paths: []string{component}})
+		if err != nil {
+			t.Fatalf("%s: BuildFileSetWithComponents: %v", start, err)
+		}
+		for _, p := range []string{"components/tls/kustomization.yaml", "components/tls/tls.yaml"} {
+			if _, ok := set[p]; !ok {
+				t.Errorf("%s: component file %s missing; set = %v", start, p, keys(set))
+			}
+		}
+		if _, ok := set["components/other/kustomization.yaml"]; ok {
+			t.Errorf("%s: unlisted component attributed", start)
+		}
+	}
+
+	missing := Components{Paths: []string{"../../../components/gone"}}
+	if _, err := tree.BuildFileSetWithComponents("apps/web/dev", missing); err == nil {
+		t.Error("a missing component must fail the build set without ignoreMissingComponents")
+	}
+	missing.IgnoreMissing = true
+	if _, err := tree.BuildFileSetWithComponents("apps/web/dev", missing); err != nil {
+		t.Errorf("ignoreMissingComponents must skip a missing component: %v", err)
+	}
+	for _, c := range []string{"https://example.com/c", "/components/tls"} {
+		if _, err := tree.BuildFileSetWithComponents("apps/web/dev", Components{Paths: []string{c}}); err == nil {
+			t.Errorf("component %q must be rejected like Flux does", c)
+		}
+	}
+}
+
 func keys(m map[string]struct{}) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

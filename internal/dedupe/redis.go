@@ -277,15 +277,19 @@ func (r *redisStore) hdelScopeOutcome(key, field string) bool {
 }
 
 func (r *redisStore) hgetallScopeOutcomes(key string) map[string]string {
-	ctx, cancel := r.ctx()
-	defer cancel()
-	m, err := r.client.HGetAll(ctx, r.labelKeyOf(key)).Result()
+	m, err := r.hgetall(key)
 	if err != nil {
 		slog.Default().Warn("dedupe: redis HGETALL label-state failed, treating as empty (best-effort)",
 			"key", key, "error", err.Error())
 		return nil
 	}
 	return m
+}
+
+func (r *redisStore) hgetall(key string) (map[string]string, error) {
+	ctx, cancel := r.ctx()
+	defer cancel()
+	return r.client.HGetAll(ctx, r.labelKeyOf(key)).Result()
 }
 
 // markIfNewAtomic is the Redis-specific atomic check-and-set used by the

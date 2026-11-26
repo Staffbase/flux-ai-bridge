@@ -304,14 +304,18 @@ var mcpTipMarkers = []string{
 	"\n\nWhen asked",
 }
 
+// The tip is the LAST marker of any kind: an earlier one is user data, even
+// when it's a different marker than the tip's.
 func stripMCPTip(data []byte) []byte {
 	s := string(data)
+	tip := -1
 	for _, marker := range mcpTipMarkers {
-		if idx := strings.LastIndex(s, marker); idx >= 0 {
-			return data[:idx]
-		}
+		tip = max(tip, strings.LastIndex(s, marker))
 	}
-	return data
+	if tip < 0 {
+		return data
+	}
+	return data[:tip]
 }
 
 // GetKustomizationStatus is a back-compat shim — the processor's

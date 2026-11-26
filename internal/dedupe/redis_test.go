@@ -107,7 +107,15 @@ func TestRedis_ConcurrentMarkIfNew(t *testing.T) {
 	const goroutines = 32
 	results := make(chan bool, goroutines)
 	for range goroutines {
-		go func() { results <- markNew(t, c, "ns", "k", "sha") }()
+		// Not markNew: its t.Fatalf would end the worker before it sends,
+		// leaving the loop below waiting forever on a backend error.
+		go func() {
+			isNew, err := c.MarkPRIfNew("ns", "k", 1, "sha", 0)
+			if err != nil {
+				t.Errorf("MarkPRIfNew: %v", err)
+			}
+			results <- isNew
+		}()
 	}
 	wins := 0
 	for range goroutines {
@@ -517,5 +525,26 @@ func TestRedis_AvailableProbe(t *testing.T) {
 	}
 	if !markPRNew(t, c, "ns", "k", 1, "head", 0) {
 		t.Fatal("admission must work again after recovery")
+	}
+}
+
+// A roster that can't be read is not an empty roster: ReadPRScopes surfaces
+// the error, so the label gate can hold flux-success instead of taking "no
+// known scopes" as "every scope reported". PRScopes stays best-effort.
+func TestRedis_ReadPRScopesSurfacesReadError(t *testing.T) {
+	t.Parallel()
+	c, mr := newRedis(t)
+	c.AddPRScope("o", "r", 1, "apps/web", 0)
+	c.AddPRScope("o", "r", 1, "infra/db", 0)
+	if got, err := c.ReadPRScopes("o", "r", 1); err != nil || len(got) != 2 {
+		t.Fatalf("ReadPRScopes = %v, %v; want both scopes, nil", got, err)
+	}
+
+	mr.SetError("LOADING simulated outage")
+	if got, err := c.ReadPRScopes("o", "r", 1); err == nil {
+		t.Fatalf("ReadPRScopes during an outage = %v, nil; want an error", got)
+	}
+	if got := c.PRScopes("o", "r", 1); len(got) != 0 {
+		t.Fatalf("PRScopes during an outage = %v, want empty (best-effort)", got)
 	}
 }

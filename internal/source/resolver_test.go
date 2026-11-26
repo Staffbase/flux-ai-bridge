@@ -161,6 +161,37 @@ func TestResolver_BuildFiles_RevisionMismatchSkips(t *testing.T) {
 	}
 }
 
+// Without a digest, a source that serves every revision at the same URL must
+// not get the tree cached for the previous revision: the new revision's
+// build inputs are what attribution needs.
+func TestResolver_BuildFiles_DigestlessCacheKeyedByRevision(t *testing.T) {
+	revA := makeTarGz(t, map[string]string{"apps/web/kustomization.yaml": "resources:\n  - a.yaml\n", "apps/web/a.yaml": "kind: A\n"})
+	revB := makeTarGz(t, map[string]string{"apps/web/kustomization.yaml": "resources:\n  - b.yaml\n", "apps/web/b.yaml": "kind: B\n"})
+	var serving atomic.Pointer[[]byte]
+	serving.Store(&revA)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(*serving.Load())
+	}))
+	defer srv.Close()
+	url := srv.URL + "/latest.tar.gz"
+	getter := &fakeGetter{yaml: sourceYAML(url, "main@sha1:aaaaaaaa00000001", "")}
+	r := NewResolver(getter, nil, srv.Client())
+	ref := Ref{Kind: "GitRepository", Name: "cluster"}
+
+	if _, err := r.BuildFiles(context.Background(), ref, "apps/web", "aaaaaaaa00000001"); err != nil {
+		t.Fatalf("BuildFiles at revision A: %v", err)
+	}
+	serving.Store(&revB)
+	getter.yaml = sourceYAML(url, "main@sha1:bbbbbbbb00000002", "")
+	set, err := r.BuildFiles(context.Background(), ref, "apps/web", "bbbbbbbb00000002")
+	if err != nil {
+		t.Fatalf("BuildFiles at revision B: %v", err)
+	}
+	if _, ok := set["apps/web/b.yaml"]; !ok {
+		t.Fatalf("revision B got a stale tree: set = %v, want apps/web/b.yaml", keys(set))
+	}
+}
+
 func TestResolver_BuildFiles_NoArtifact(t *testing.T) {
 	getter := &fakeGetter{yaml: "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nstatus: {}\n"}
 	r := NewResolver(getter, nil, http.DefaultClient)
@@ -210,11 +241,19 @@ func TestResolver_BuildFiles_ShutdownStopsSharedDownload(t *testing.T) {
 
 	shutdown, stopProcess := context.WithCancel(context.Background())
 	defer stopProcess()
+	buildErr := make(chan error, 1)
 	go func() {
-		_, _ = r.BuildFiles(lifecycle.WithShutdown(context.Background(), shutdown),
+		_, err := r.BuildFiles(lifecycle.WithShutdown(context.Background(), shutdown),
 			Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", "deadbeefcafe0001")
+		buildErr <- err
 	}()
-	<-arrived
+	select {
+	case <-arrived:
+	case err := <-buildErr:
+		t.Fatalf("BuildFiles returned before requesting the artifact: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the artifact request never arrived")
+	}
 	stopProcess()
 	select {
 	case <-aborted:
@@ -227,12 +266,20 @@ func TestResolver_BuildFiles_ShutdownStopsSharedDownload(t *testing.T) {
 // same shared download, and must itself return promptly.
 func TestResolver_BuildFiles_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 	tarball := makeTarGz(t, overlayFixture())
-	release := make(chan struct{})
+	arrived, release := make(chan struct{}, 1), make(chan struct{})
+	releaseHandler := sync.OnceFunc(func() { close(release) })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
 		<-release
 		_, _ = w.Write(tarball)
 	}))
 	defer srv.Close()
+	// Runs before srv.Close: a failed assertion must not leave the handler
+	// blocked, or srv.Close waits for it forever.
+	defer releaseHandler()
 	getter := &fakeGetter{yaml: sourceYAML(srv.URL, "dev@sha1:deadbeefcafe0001", digestOf(tarball))}
 	r := NewResolver(getter, nil, srv.Client())
 	ref := Ref{Kind: "GitRepository", Name: "cluster"}
@@ -243,7 +290,13 @@ func TestResolver_BuildFiles_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 		_, err := r.BuildFiles(leaderCtx, ref, "apps/web/dev/r1", "deadbeefcafe0001")
 		leaderErr <- err
 	}()
-	time.Sleep(20 * time.Millisecond) // leader is now inside the shared download
+	select { // leader is now inside the shared download
+	case <-arrived:
+	case err := <-leaderErr:
+		t.Fatalf("leader returned before requesting the artifact: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the artifact request never arrived")
+	}
 	followerErr := make(chan error, 1)
 	go func() {
 		_, err := r.BuildFiles(context.Background(), ref, "apps/web/dev/r1", "deadbeefcafe0001")
@@ -260,7 +313,7 @@ func TestResolver_BuildFiles_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancelled leader kept waiting on the shared download")
 	}
-	close(release)
+	releaseHandler()
 	if err := <-followerErr; err != nil {
 		t.Fatalf("follower failed because the leader was cancelled: %v", err)
 	}

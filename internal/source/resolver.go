@@ -97,6 +97,12 @@ func NewResolver(getter ResourceGetter, apiVersionFor func(group, kind string) s
 // revisionSHA (the event's revision). Otherwise it returns ErrRevisionMismatch
 // / ErrNoArtifact and the caller skips the event.
 func (r *Resolver) BuildFiles(ctx context.Context, ref Ref, specPath, revisionSHA string) (map[string]struct{}, error) {
+	return r.BuildFilesWithComponents(ctx, ref, specPath, Components{}, revisionSHA)
+}
+
+// BuildFilesWithComponents is BuildFiles for a Kustomization that also sets
+// spec.components (see Tree.BuildFileSetWithComponents).
+func (r *Resolver) BuildFilesWithComponents(ctx context.Context, ref Ref, specPath string, comps Components, revisionSHA string) (map[string]struct{}, error) {
 	if ref.Kind == "" || ref.Name == "" {
 		return nil, fmt.Errorf("kustomization has no usable sourceRef")
 	}
@@ -124,11 +130,11 @@ func (r *Resolver) BuildFiles(ctx context.Context, ref Ref, specPath, revisionSH
 		return nil, fmt.Errorf("%w: artifact=%q event=%q", ErrRevisionMismatch, art.Revision, revisionSHA)
 	}
 
-	tree, err := r.treeFor(ctx, art.Digest, art.URL)
+	tree, err := r.treeFor(ctx, art.Digest, art.URL, art.Revision)
 	if err != nil {
 		return nil, err
 	}
-	return tree.BuildFileSet(specPath)
+	return tree.BuildFileSetWithComponents(specPath, comps)
 }
 
 // artifactFetchTimeout bounds one artifact download + parse.
@@ -138,19 +144,21 @@ const artifactFetchTimeout = 2 * time.Minute
 // the source's status advertises.
 var ErrDigestMismatch = errors.New("artifact digest mismatch")
 
-// treeFor returns the parsed artifact tree, cached by digest (falling back to
-// the URL when no digest is reported). Concurrent misses for the same key are
-// collapsed via singleflight so the tarball is fetched + parsed once.
+// treeFor returns the parsed artifact tree, cached by digest. Without a digest
+// the URL alone doesn't name the content (a server may serve another revision
+// at the same URL), so the key is the URL plus the revision the source status
+// reports. Concurrent misses for the same key are collapsed via singleflight
+// so the tarball is fetched + parsed once.
 //
 // The shared download runs on its own context (detached from the caller that
 // happened to start it, bounded by artifactFetchTimeout): otherwise the first
 // caller's cancellation failed every caller waiting on the same artifact.
 // Each caller still stops waiting at its own deadline, and shutdown stops the
 // download itself (see lifecycle) so it doesn't outlive the drain.
-func (r *Resolver) treeFor(ctx context.Context, digest, url string) (*Tree, error) {
+func (r *Resolver) treeFor(ctx context.Context, digest, url, revision string) (*Tree, error) {
 	key := digest
 	if key == "" {
-		key = url
+		key = url + "@" + revision
 	}
 
 	if t := r.cached(key); t != nil {

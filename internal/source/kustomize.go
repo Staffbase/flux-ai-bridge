@@ -68,7 +68,11 @@ func (k kustomization) dirOrFileRefs() []string {
 	refs = append(refs, k.Components...)
 	refs = append(refs, k.CRDs...)
 	refs = append(refs, k.Configurations...)
-	refs = append(refs, k.PatchesStrategicMerge...)
+	for _, p := range k.PatchesStrategicMerge {
+		if !isInlinePatch(p) {
+			refs = append(refs, p)
+		}
+	}
 	for _, p := range k.Patches {
 		if p.Path != "" {
 			refs = append(refs, p.Path)
@@ -98,6 +102,14 @@ func (k kustomization) dirOrFileRefs() []string {
 		refs = append(refs, k.OpenAPI.Path)
 	}
 	return refs
+}
+
+// isInlinePatch reports whether a patchesStrategicMerge entry is the patch
+// itself rather than a file path. Kustomize accepts both and treats an entry
+// that is a YAML object as an inline patch. A path never parses as one.
+func isInlinePatch(entry string) bool {
+	var obj map[string]any
+	return yaml.Unmarshal([]byte(entry), &obj) == nil && len(obj) > 0
 }
 
 // generatorFiles extracts the source paths a generator reads. A `files` entry
@@ -134,6 +146,25 @@ func generatorFiles(g generator) []string {
 // that can't be resolved is returned as an error, so the caller can skip rather
 // than attribute against an incomplete view (the exact-or-skip contract).
 func (t *Tree) BuildFileSet(startDir string) (map[string]struct{}, error) {
+	return t.BuildFileSetWithComponents(startDir, Components{})
+}
+
+// Components are a Flux Kustomization's spec.components: component
+// directories, relative to spec.path, that kustomize-controller adds to the
+// kustomization it builds there. With IgnoreMissing
+// (spec.ignoreMissingComponents) a component the source doesn't contain is
+// left out instead of failing the build.
+type Components struct {
+	Paths         []string
+	IgnoreMissing bool
+}
+
+// BuildFileSetWithComponents is BuildFileSet for a Kustomization that also
+// sets spec.components: the files those components read are build inputs too.
+// A component Flux would reject (remote or absolute, outside the source,
+// missing without IgnoreMissing, or without a kustomization file) is an error,
+// as for any other unresolvable reference.
+func (t *Tree) BuildFileSetWithComponents(startDir string, comps Components) (map[string]struct{}, error) {
 	start := cleanRel(startDir)
 	out := make(map[string]struct{})
 	visited := make(map[string]struct{})
@@ -158,9 +189,6 @@ func (t *Tree) BuildFileSet(startDir string) (map[string]struct{}, error) {
 		}
 
 		for _, ref := range k.dirOrFileRefs() {
-			if isRemoteRef(ref) {
-				continue
-			}
 			// Normalise to the same repo-root-relative form used by CleanPath /
 			// HasPath membership checks (strips a leading "./" or "/"), so an
 			// absolute or oddly-formed ref can't produce a key that later lookups
@@ -179,6 +207,12 @@ func (t *Tree) BuildFileSet(startDir string) (map[string]struct{}, error) {
 				out[target] = struct{}{} // leaf input: resource / patch / generator / config file
 				continue
 			}
+			// Kustomize loads a local file or directory before it tries a
+			// remote base, so only a remote-looking ref that isn't in the
+			// tree is remote.
+			if isRemoteRef(ref) {
+				continue
+			}
 			return fmt.Errorf("unresolved reference %q from %q", ref, dir)
 		}
 		return nil
@@ -188,21 +222,54 @@ func (t *Tree) BuildFileSet(startDir string) (map[string]struct{}, error) {
 		if err := walk(start); err != nil {
 			return nil, err
 		}
-		return out, nil
+	} else {
+		files, kustDirs := t.generatedInputs(start)
+		if len(files) == 0 && len(kustDirs) == 0 {
+			return nil, fmt.Errorf("no kustomization or manifests at %q", start)
+		}
+		for _, f := range files {
+			out[f] = struct{}{}
+		}
+		for _, d := range kustDirs {
+			if err := walk(d); err != nil {
+				return nil, err
+			}
+		}
 	}
-	files, kustDirs := t.generatedInputs(start)
-	if len(files) == 0 && len(kustDirs) == 0 {
-		return nil, fmt.Errorf("no kustomization or manifests at %q", start)
-	}
-	for _, f := range files {
-		out[f] = struct{}{}
-	}
-	for _, d := range kustDirs {
-		if err := walk(d); err != nil {
-			return nil, err
+
+	for _, c := range comps.Paths {
+		if path.IsAbs(c) || isRemoteRef(c) {
+			return nil, fmt.Errorf("component %q must be local and relative", c)
+		}
+		target := cleanRel(path.Join(start, c))
+		if target == ".." || strings.HasPrefix(target, "../") {
+			return nil, fmt.Errorf("component %q is outside the source", c)
+		}
+		if comps.IgnoreMissing && !t.exists(target) {
+			continue
+		}
+		if err := walk(target); err != nil {
+			return nil, fmt.Errorf("component %q: %w", c, err)
 		}
 	}
 	return out, nil
+}
+
+// exists reports whether p is a file or a directory in the tree.
+func (t *Tree) exists(p string) bool {
+	if _, ok := t.kustomizations[p]; ok || t.HasPath(p) {
+		return true
+	}
+	prefix := p + "/"
+	if p == "." {
+		prefix = ""
+	}
+	for f := range t.paths {
+		if strings.HasPrefix(f, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // generatedInputs mirrors the kustomization Flux generates for a directory
@@ -255,8 +322,9 @@ func (t *Tree) topKustomizationDir(start, dir string) (string, bool) {
 }
 
 // isRemoteRef reports whether a kustomization reference points outside this
-// repo (a URL or a kustomize remote-base spec). Such refs can never be one of
-// this repo's changed files, so they're excluded from attribution.
+// repo (a URL or a kustomize remote-base spec). BuildFileSet asks only after
+// the ref didn't resolve inside the tree, the order kustomize uses; a remote
+// ref is never one of this repo's changed files, so it's skipped.
 func isRemoteRef(ref string) bool {
 	return strings.Contains(ref, "://") ||
 		strings.HasPrefix(ref, "git::") ||

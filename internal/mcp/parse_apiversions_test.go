@@ -75,6 +75,14 @@ func TestStripMCPTip(t *testing.T) {
 			in:   "data: stuff\n\nIf asked for recommendations: this is user data.\nmore: payload\n\nIf asked for recommendations: this is the real tip.\n",
 			want: "data: stuff\n\nIf asked for recommendations: this is user data.\nmore: payload",
 		},
+		{
+			name: "one marker in user data AND the other marker as the real tip → only the tip is stripped",
+			// The tip is the last marker of either kind: checking the
+			// markers one after the other would cut at the user-data
+			// "If asked" and drop the payload before the "When asked" tip.
+			in:   "data: stuff\n\nIf asked for recommendations: this is user data.\nmore: payload\n\nWhen asked about Y, do Z.\n",
+			want: "data: stuff\n\nIf asked for recommendations: this is user data.\nmore: payload",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
