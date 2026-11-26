@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -769,6 +770,37 @@ func listPRComments(cfg realGHConfig) ([]map[string]any, error) {
 		if len(out) < 100 {
 			return all, nil
 		}
+	}
+}
+
+// listPRComments must read past the first page: the freshness check deletes
+// baseline comments and then looks for a new one, and a single page could hide
+// either. The server holds 250 comments, served 100 per page.
+func TestListPRCommentsReadsEveryPage(t *testing.T) {
+	const total = 250
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		if page < 1 {
+			page = 1
+		}
+		perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+		if perPage < 1 {
+			perPage = 30
+		}
+		out := []map[string]any{}
+		for id := (page-1)*perPage + 1; id <= page*perPage && id <= total; id++ {
+			out = append(out, map[string]any{"id": id})
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	}))
+	defer srv.Close()
+
+	got, err := listPRComments(realGHConfig{token: "t", repo: "o/r", prNumber: 1, apiURL: srv.URL})
+	if err != nil {
+		t.Fatalf("listPRComments: %v", err)
+	}
+	if len(got) != total {
+		t.Fatalf("listPRComments returned %d comments, want all %d", len(got), total)
 	}
 }
 
