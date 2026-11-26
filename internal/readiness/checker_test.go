@@ -424,7 +424,50 @@ status:
 	}
 }
 
-// Mirrors PR 15963: a single-replica Deployment stuck rolling out a crashing
+// kstatus reads Ready=True as Current without looking at the condition's own
+// observedGeneration. Right after a spec change, a CRD that tracks generation
+// per condition still carries the previous generation's Ready=True until its
+// controller re-evaluates it: that must not read Current. A condition that
+// doesn't set the field (or sets the unset value 0) still defers to kstatus.
+func TestCheckAll_ReadyConditionFromOlderGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		observed   string
+		wantStatus string
+	}{
+		{name: "older generation", observed: "\n      observedGeneration: 3", wantStatus: "InProgress"},
+		{name: "current generation", observed: "\n      observedGeneration: 4", wantStatus: "Current"},
+		{name: "unset", observed: "", wantStatus: "Current"},
+		{name: "zero", observed: "\n      observedGeneration: 0", wantStatus: "Current"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			certYAML := `
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: app-tls
+  namespace: apps
+  generation: 4
+status:
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: Ready` + tc.observed + "\n"
+			fake := &fakeFetcher{resources: map[string]string{
+				"cert-manager.io/v1|Certificate|app-tls|apps": certYAML,
+			}}
+			results, err := NewChecker(fake).CheckAll(context.Background(), []string{"apps_app-tls_cert-manager.io_Certificate"})
+			if err != nil {
+				t.Fatalf("CheckAll: %v", err)
+			}
+			if r := results[0]; r.Status != tc.wantStatus {
+				t.Errorf("status = %q (message %q), want %q", r.Status, r.Message, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// Covers a single-replica Deployment stuck rolling out a crashing
 // pod. Available stays True (maxUnavailable=1 → minAvailable=0) while zero pods
 // are ready. The bridge must surface the hard counts so the LLM reports "0/1
 // ready" instead of guessing that "older replicas remain ready".
@@ -875,24 +918,61 @@ func TestWaitUntilSettledFunc_RefsGrowMidPoll(t *testing.T) {
 	}
 }
 
+// A cancelled caller never gets settled=true, even when the snapshot (read
+// by a fetcher that ignores ctx) is all Current, or when there are no refs.
 func TestWaitUntilSettled_ContextCancelled(t *testing.T) {
 	fake := &fakeFetcher{resources: map[string]string{
-		"apps/v1|Deployment|api|default": inProgressDeploymentYAML,
+		"apps/v1|Deployment|api|default": readyDeploymentYAML,
 	}}
 	checker := NewChecker(fake)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel before the first check completes the loop
-	_, _, err := checker.WaitUntilSettled(
-		ctx,
-		[]string{"default_api_apps_Deployment"},
-		50*time.Millisecond, 5*time.Second,
-	)
-	// The first CheckAll completes (it's synchronous, no ctx check inside),
-	// but the select-on-ctx.Done arm fires on the second iteration. Either
-	// outcome is acceptable: error == nil + settled=false (timed out on
-	// first iter with cancelled ctx) OR error == context.Canceled.
-	if err != nil && err != context.Canceled {
-		t.Errorf("unexpected error: %v", err)
+	cancel()
+	for _, refs := range [][]string{{"default_api_apps_Deployment"}, nil} {
+		_, settled, err := checker.WaitUntilSettled(ctx, refs, 50*time.Millisecond, 5*time.Second)
+		if settled || !errors.Is(err, context.Canceled) {
+			t.Errorf("refs %v: settled=%v err=%v, want settled=false and context.Canceled", refs, settled, err)
+		}
+	}
+}
+
+// The last sleep stops at the deadline: an interval longer than the timeout
+// must not hold the poll a whole interval past it.
+func TestWaitUntilSettled_SleepStopsAtDeadline(t *testing.T) {
+	fake := &fakeFetcher{resources: map[string]string{
+		"apps/v1|Deployment|api|default": inProgressDeploymentYAML,
+	}}
+	start := time.Now()
+	_, settled, err := NewChecker(fake).WaitUntilSettled(context.Background(),
+		[]string{"default_api_apps_Deployment"}, 10*time.Second, 50*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want an unsettled timeout", settled, err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("poll returned after %s, want shortly after the 50ms timeout", elapsed)
+	}
+}
+
+// The refs and the rows are separate reads. When the refs change between
+// them (a HelmRelease finished its install and now lists a child the refs
+// read missed), an all-Current snapshot of the old refs is not settled.
+func TestWaitUntilSettledFunc_RefsChangedAfterCheck(t *testing.T) {
+	fake := &fakeFetcher{resources: map[string]string{
+		"apps/v1|Deployment|a|default": readyDeploymentYAML,
+		"apps/v1|Deployment|b|default": readyDeploymentYAML,
+	}}
+	var calls atomic.Int32
+	refsFunc := func() []string {
+		if calls.Add(1) == 1 {
+			return []string{"default_a_apps_Deployment"}
+		}
+		return []string{"default_a_apps_Deployment", "default_b_apps_Deployment"}
+	}
+	results, settled, err := NewChecker(fake).WaitUntilSettledFunc(context.Background(), refsFunc, 10*time.Millisecond, 2*time.Second)
+	if err != nil || !settled {
+		t.Fatalf("settled=%v err=%v, want settled", settled, err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d rows, want 2: the settled snapshot must cover the refs read after it: %v", len(results), results)
 	}
 }
 

@@ -450,8 +450,10 @@ func TestPersistence_QuorumTopology(t *testing.T) {
 		pod := fmt.Sprintf("valkey-node-%d", i)
 		cmd := exec.Command("kubectl", "--context", context, "-n", "valkey",
 			"exec", pod, "-c", "sentinel", "--",
-			"valkey-cli", "-p", "26379", "-a", adminPw, "--no-auth-warning",
+			"valkey-cli", "-e", "-p", "26379", "-a", adminPw, "--no-auth-warning",
 			"SENTINEL", "get-primary-addr-by-name", masterName)
+		// -e: an error reply (NOAUTH, unknown command) fails the exec instead
+		// of printing identical text on every sentinel that would compare equal.
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("sentinel query on %s: %v\n%s", pod, err, out)
@@ -459,6 +461,14 @@ func TestPersistence_QuorumTopology(t *testing.T) {
 		got := strings.TrimSpace(string(out))
 		if got == "" {
 			t.Fatalf("sentinel on %s did not know master %q (output empty)", pod, masterName)
+		}
+		// The reply is the primary's host and port, one per line.
+		f := strings.Fields(got)
+		if len(f) != 2 {
+			t.Fatalf("sentinel on %s returned %q for master %q, want a host and a port", pod, got, masterName)
+		}
+		if port, err := strconv.Atoi(f[1]); err != nil || port < 1 || port > 65535 {
+			t.Fatalf("sentinel on %s returned %q for master %q, want a host and a port", pod, got, masterName)
 		}
 		if i == 0 {
 			first = got

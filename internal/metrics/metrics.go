@@ -34,13 +34,19 @@ var (
 	//
 	//   admission outcomes (no pipeline ran):
 	//     unauthorized     — HMAC validation failed
+	//     invalid          — the body couldn't be read (e.g. over 1 MiB) or
+	//                        decoded as an event; client gets 400/413
 	//     skipped          — event ignored before processing (wrong kind/severity, kustomization filter, etc.)
 	//     busy             — event queue full (4× WEBHOOK_MAX_CONCURRENT running
-	//                        + waiting); client gets 503. Also a queued event
-	//                        abandoned at shutdown
+	//                        + waiting); client gets 503. Also an event that
+	//                        arrives after shutdown began (503), and a queued
+	//                        event abandoned at shutdown
 	//
 	//   pipeline outcomes (classifyOutcome on the wrapped error):
-	//     success          — pipeline completed, comment posted
+	//     success          — the pipeline returned no error. Includes no-op
+	//                        runs that post nothing: every PR skipped (see
+	//                        PRsSkipped), a deferred revision, or an
+	//                        unchanged comment
 	//     mcp_error        — flux-operator-mcp call, or parsing its answer, failed
 	//     readiness_error  — the readiness poll failed (MCP error or cancellation).
 	//                        A poll that merely times out is not an error: it
@@ -259,18 +265,20 @@ var (
 		[]string{"kind"},
 	)
 
-	// LLMFallbacks counts events that posted a kstatus-only comment because
-	// the LLM call failed (rate limit, transient network error, auth
-	// failure, etc.). The bridge prefers a partial comment (deterministic
-	// kstatus tables, no narrative) over no comment at all so reviewers
-	// still see the readiness state during an LLM outage. The outcome of
-	// the event in EventsProcessed is still `success` — this counter is
-	// the only place an operator can see how often the LLM is silently
-	// failing while comments keep landing.
+	// LLMFallbacks counts events whose LLM call failed (rate limit, transient
+	// network error, auth failure, etc.) so the bridge fell back to a
+	// kstatus-only comment. The bridge prefers a partial comment
+	// (deterministic kstatus tables, no narrative) over no comment at all so
+	// reviewers still see the readiness state during an LLM outage. It counts
+	// the fallback decision, before delivery: a fallback comment GitHub then
+	// rejects is counted here too, and its event ends as github_error (or
+	// rate_limited) in EventsProcessed. Otherwise the event's outcome is still `success` —
+	// this counter is the only place an operator can see how often the LLM
+	// is silently failing while comments keep landing.
 	LLMFallbacks = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "flux_ai_bridge_llm_fallbacks_total",
-			Help: "Total events where the LLM call failed and the bridge posted a kstatus-only comment as fallback.",
+			Help: "Total events where the LLM call failed and the bridge fell back to a kstatus-only comment (counted before delivery).",
 		},
 		[]string{"provider"},
 	)

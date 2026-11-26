@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -452,6 +453,10 @@ func requireRealGitHubEnv(t *testing.T) realGHConfig {
 	if cfg.apiURL == "" {
 		cfg.apiURL = "https://api.github.com"
 	}
+	// The helpers send GITHUB_TOKEN on every request: never in cleartext.
+	if u, err := url.Parse(cfg.apiURL); err != nil || u.Scheme != "https" || u.Host == "" {
+		t.Fatalf("GITHUB_API_URL must be an https:// URL (the token is sent with every request), got %q", cfg.apiURL)
+	}
 	if cfg.token == "" {
 		t.Fatal("GITHUB_TOKEN is required when E2E_REAL_GITHUB=1")
 	}
@@ -821,8 +826,12 @@ func TestPipelineDefersUnappliedRevision(t *testing.T) {
 	for time.Now().Before(deadline) {
 		out, _ := exec.Command("kubectl", "--context", context, "-n", namespace,
 			"logs", "deploy/flux-ai-bridge", "--since=40s", "--tail=500").CombinedOutput()
-		if strings.Contains(string(out), sha) && strings.Contains(string(out), "deferring until") {
-			return // gate fired
+		// One JSON log entry per line: the deferral entry itself must carry
+		// this SHA, not just any entry next to some other deferral.
+		for line := range strings.SplitSeq(string(out), "\n") {
+			if strings.Contains(line, "deferring until") && strings.Contains(line, sha) {
+				return // gate fired
+			}
 		}
 		time.Sleep(time.Second)
 	}

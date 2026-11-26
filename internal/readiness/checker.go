@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -179,7 +180,13 @@ func (c *Checker) WaitUntilSettled(ctx context.Context, refs []string, interval,
 // Settled semantics match WaitUntilSettled: every row in the LATEST
 // snapshot must reach a terminal kstatus. If refsFunc grows the list
 // mid-poll, the new rows need to settle too before the loop returns
-// settled=true.
+// settled=true. The refs and the rows are separate reads, so a settled
+// snapshot only counts when a fresh refsFunc() still returns the same refs:
+// a HelmRelease that finishes its install between the two reads can read
+// Current while its new children are still missing from the refs.
+//
+// A cancelled ctx never yields settled=true, and the last sleep stops at the
+// deadline instead of running up to a whole interval past it.
 func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []string, interval, timeout time.Duration) (results []ResourceStatus, settled bool, err error) {
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -189,20 +196,26 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []st
 	}
 	deadline := time.Now().Add(timeout)
 	for {
-		results, err = c.CheckAll(ctx, refsFunc())
+		refs := refsFunc()
+		results, err = c.CheckAll(ctx, refs)
 		if err != nil {
 			return results, false, err
 		}
-		if allSettled(results) {
+		// Reads made with a dead context prove nothing (and no refs at all
+		// would read as settled).
+		if err := ctx.Err(); err != nil {
+			return results, false, err
+		}
+		if allSettled(results) && slices.Equal(refsFunc(), refs) {
 			return results, true, nil
 		}
-		if time.Now().After(deadline) {
+		if !time.Now().Before(deadline) {
 			return results, false, nil
 		}
 		select {
 		case <-ctx.Done():
 			return results, false, ctx.Err()
-		case <-time.After(interval):
+		case <-time.After(min(interval, time.Until(deadline))):
 		}
 	}
 }
@@ -373,6 +386,19 @@ func (c *Checker) fetchResource(ctx context.Context, parsed InventoryRef, apiVer
 			rs.Message = msg
 		}
 	}
+	// kstatus reads Ready=True as Current without looking at the condition's
+	// own observedGeneration. A resource that tracks generation only per
+	// condition (the metav1.Condition convention, e.g. cert-manager's
+	// Certificate) therefore reads Current right after a spec change, off the
+	// previous generation's verdict, until its controller re-evaluates it.
+	// Only an explicitly stale value demotes the row, so a CRD that never
+	// sets the field still defers to kstatus.
+	if rs.Status == string(status.CurrentStatus) {
+		if msg, stale := staleReadyCondition(obj); stale {
+			rs.Status = string(status.InProgressStatus)
+			rs.Message = msg
+		}
+	}
 	// Extract controller-level conditions only for non-Current rows — they're
 	// the only ones where the LLM benefits from the extra context. Skipping
 	// the read for Current rows keeps the prompt lean.
@@ -430,6 +456,34 @@ func staleObservedGeneration(obj *unstructured.Unstructured) (message string, st
 	}
 	if observed != generation {
 		return fmt.Sprintf("status.observedGeneration (%d) has not caught up to metadata.generation (%d) yet", observed, generation), true
+	}
+	return "", false
+}
+
+// staleReadyCondition reports whether the object's Ready condition carries an
+// observedGeneration behind metadata.generation. A missing or zero value (the
+// unset value of metav1.Condition.ObservedGeneration) is not stale: a
+// controller that doesn't track generation per condition would otherwise read
+// as stuck forever.
+func staleReadyCondition(obj *unstructured.Unstructured) (message string, stale bool) {
+	generation := obj.GetGeneration()
+	if generation == 0 {
+		return "", false
+	}
+	raw, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil || !found {
+		return "", false
+	}
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok || m["type"] != "Ready" {
+			continue
+		}
+		observed, found, err := unstructured.NestedInt64(m, "observedGeneration")
+		if err != nil || !found || observed == 0 || observed >= generation {
+			return "", false
+		}
+		return fmt.Sprintf("Ready condition observedGeneration (%d) has not caught up to metadata.generation (%d) yet", observed, generation), true
 	}
 	return "", false
 }

@@ -65,6 +65,10 @@ type Handler struct {
 	sem               chan struct{} // running pipelines
 	queue             chan struct{} // accepted events: running + waiting for a sem slot
 	wg                sync.WaitGroup
+	// mu guards closed and orders every wg.Add before Shutdown's Wait:
+	// once Shutdown sets closed, no new event is admitted.
+	mu     sync.Mutex
+	closed bool
 	// baseCtx parents every worker goroutine's context so Shutdown can
 	// cancel in-flight pipelines that outlive the graceful-wait budget.
 	// Without it, killing the process mid-Process would skip the
@@ -133,6 +137,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = r.Body.Close() }()
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		metrics.EventsProcessed.WithLabelValues("invalid").Inc()
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
@@ -156,6 +161,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var event eventv1.Event
 	if err := json.Unmarshal(body, &event); err != nil {
+		metrics.EventsProcessed.WithLabelValues("invalid").Inc()
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
@@ -213,9 +219,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admission and wg.Add happen under mu, so Shutdown's Wait never races a
+	// late Add, and an event arriving after shutdown began gets a 503 (Flux
+	// retries it) instead of a 202 for work that would never run.
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		h.logger.Warn("shutting down, dropping event", "name", event.InvolvedObject.Name, "namespace", event.InvolvedObject.Namespace)
+		metrics.EventsProcessed.WithLabelValues("busy").Inc()
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	select {
 	case h.queue <- struct{}{}:
 	default:
+		h.mu.Unlock()
 		h.logger.Warn("event queue full, dropping event", "name", event.InvolvedObject.Name, "namespace", event.InvolvedObject.Namespace)
 		metrics.EventsProcessed.WithLabelValues("busy").Inc()
 		// Dedup marks are only written inside the processor, after the PR
@@ -224,8 +242,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "busy", http.StatusServiceUnavailable)
 		return
 	}
-
 	h.wg.Add(1)
+	h.mu.Unlock()
+
 	go func(evt eventv1.Event, revisionSHA string) {
 		defer h.wg.Done()
 		defer func() { <-h.queue }()
@@ -238,6 +257,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer func() { <-h.sem }()
+		// When a slot frees up as Shutdown cancels, select may pick either
+		// ready case: don't start a pipeline on a cancelled context.
+		if h.baseCtx.Err() != nil {
+			metrics.EventsProcessed.WithLabelValues("busy").Inc()
+			return
+		}
 		// Panic recovery: the LLM client, YAML parser, and go-github can all
 		// surface panics under pathological inputs. Without a recover here a
 		// single bad event would take down the whole bridge process. Any
@@ -328,8 +353,9 @@ func (h *Handler) Wait(ctx context.Context) error {
 	}
 }
 
-// Shutdown waits for in-flight pipelines like Wait, but when ctx expires
-// first it CANCELS them (a pipeline can hold a multi-minute readiness-poll
+// Shutdown stops admitting events (later ones get 503) and waits for
+// in-flight pipelines like Wait, but when ctx expires first it CANCELS
+// them (a pipeline can hold a multi-minute readiness-poll
 // budget, far past any sane termination grace period) and waits up to
 // unwind for the cancellation to unwind. The unwind matters: the
 // processor's deferred cleanup rolls back per-PR dedupe admission marks,
@@ -337,6 +363,11 @@ func (h *Handler) Wait(ctx context.Context) error {
 // PR-head's analysis until it expires. ctx's budget plus unwind must fit in
 // the pod's termination grace period.
 func (h *Handler) Shutdown(ctx context.Context, unwind time.Duration) error {
+	// Close admission first: a request still reading its body when the HTTP
+	// server's own shutdown gave up must not Add to wg once Wait runs.
+	h.mu.Lock()
+	h.closed = true
+	h.mu.Unlock()
 	// Cancel the shutdown signal however the drain ends: detached work it
 	// stops (see lifecycle) — e.g. an artifact download whose caller already
 	// gave up — isn't tracked by Wait.

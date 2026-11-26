@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -395,6 +396,11 @@ func (b *blockingProcessor) Process(context.Context, eventv1.Event, string) erro
 // retries a 503 only briefly); only a full queue answers 503.
 func TestHandler_QueuesEventsBeyondConcurrency(t *testing.T) {
 	proc := &blockingProcessor{release: make(chan struct{}), started: make(chan struct{}, 8)}
+	// Release the workers however the test ends, so a failed assertion
+	// doesn't leave them blocked.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(proc.release) }) }
+	t.Cleanup(release)
 	h := NewHandler(proc, discardLogger(), Options{MaxConcurrent: 1})
 	codes := make([]int, 0, 5)
 	for range 5 {
@@ -406,13 +412,17 @@ func TestHandler_QueuesEventsBeyondConcurrency(t *testing.T) {
 			t.Fatalf("responses = %v, want %v (1 running + 3 queued, then 503)", codes, want)
 		}
 	}
-	<-proc.started
+	select {
+	case <-proc.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no accepted event started processing")
+	}
 	select {
 	case <-proc.started:
 		t.Fatal("a queued event started while the only slot was busy")
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(proc.release)
+	release()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := h.Wait(ctx); err != nil {
@@ -420,6 +430,95 @@ func TestHandler_QueuesEventsBeyondConcurrency(t *testing.T) {
 	}
 	if got := proc.done.Load(); got != 4 {
 		t.Fatalf("processed %d events, want all 4 accepted ones", got)
+	}
+}
+
+// countingProcessor counts Process calls.
+type countingProcessor struct{ calls atomic.Int32 }
+
+func (c *countingProcessor) Process(context.Context, eventv1.Event, string) error {
+	c.calls.Add(1)
+	return nil
+}
+
+// An event that arrives after Shutdown began gets a 503 (Flux retries it),
+// never a 202 for work that won't run, and doesn't Add to the WaitGroup
+// Shutdown is waiting on.
+func TestShutdown_RejectsEventsAfterShutdown(t *testing.T) {
+	proc := &countingProcessor{}
+	h := NewHandler(proc, discardLogger(), Options{})
+	if err := h.Shutdown(context.Background(), time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	before := testutil.ToFloat64(metrics.EventsProcessed.WithLabelValues("busy"))
+	rr := postWebhook(h, newKustomizationEvent("apps", "default", "main@sha1:"+testSHA))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 after shutdown", rr.Code)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := h.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := proc.calls.Load(); got != 0 {
+		t.Fatalf("processor ran %d times after shutdown, want 0", got)
+	}
+	if got := testutil.ToFloat64(metrics.EventsProcessed.WithLabelValues("busy")) - before; got != 1 {
+		t.Errorf("EventsProcessed{outcome=busy} delta = %v, want 1", got)
+	}
+}
+
+// A queued event whose slot frees up as Shutdown cancels sees both select
+// cases ready; it must not start a pipeline on the cancelled context. The
+// loop makes a random select pick show up: without the check, about half
+// the runs call Process.
+func TestHandler_QueuedEventDoesNotStartAfterCancel(t *testing.T) {
+	for range 64 {
+		proc := &countingProcessor{}
+		h := newTestHandler(proc)
+		h.cancelBase() // shutdown signal fired; a running slot is free
+		if rr := postWebhook(h, newKustomizationEvent("apps", "default", "main@sha1:"+testSHA)); rr.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202 (admission is still open)", rr.Code)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := h.Wait(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+		if got := proc.calls.Load(); got != 0 {
+			t.Fatalf("processor ran %d times on a cancelled context, want 0", got)
+		}
+	}
+}
+
+// Requests that can't be read or decoded as an event still end in exactly
+// one EventsProcessed sample, so sum(EventsProcessed) counts them.
+func TestHandler_InvalidRequestsCounted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+		want int
+	}{
+		{name: "invalid json", body: []byte("{not json"), want: http.StatusBadRequest},
+		{name: "too large", body: bytes.Repeat([]byte("a"), maxBodyBytes+1), want: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proc := &countingProcessor{}
+			h := newTestHandler(proc)
+			before := testutil.ToFloat64(metrics.EventsProcessed.WithLabelValues("invalid"))
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(tc.body)))
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rr.Code, tc.want)
+			}
+			if got := testutil.ToFloat64(metrics.EventsProcessed.WithLabelValues("invalid")) - before; got != 1 {
+				t.Errorf("EventsProcessed{outcome=invalid} delta = %v, want 1", got)
+			}
+			if got := proc.calls.Load(); got != 0 {
+				t.Errorf("processor ran %d times, want 0", got)
+			}
+		})
 	}
 }
 
