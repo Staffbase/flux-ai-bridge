@@ -5,8 +5,8 @@ description: >
   queries flux-operator-mcp for namespace resource status, and posts AI-generated
   deployment status comments to the originating GitHub PR using Claude or any OpenAI-compatible LLM.
 type: application
-version: 0.9.13
-appVersion: "v0.9.10"
+version: 0.10.0
+appVersion: "v0.10.0"
 keywords:
   - flux
   - fluxcd
