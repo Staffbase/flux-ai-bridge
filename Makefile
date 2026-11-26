@@ -871,7 +871,7 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	    -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' >&2 || true; \
 	  exit 1; }; \
 	sha=$$(kubectl --context $(CONTEXT) -n git-server exec deployment/git-server -c git-http -- \
-	  git -C /serve/flux-ai-bridge.git rev-parse 'e2e-test^{commit}'); \
+	  cat /serve/flux-ai-bridge.git/info/refs | awk '$$2 == "refs/tags/e2e-test" { print $$1 }'); \
 	[ -n "$$sha" ] || { echo "ERROR: the git-server serves no e2e-test commit" >&2; exit 1; }; \
 	short=$$(printf '%.12s' "$$sha"); \
 	echo "    git-server snapshot: $$sha"; \
