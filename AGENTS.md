@@ -101,7 +101,8 @@ default, and how it interacts with other values. Templates carry no documentatio
 comment (a non-obvious guard or derivation), keep it to one or two lines and leave the explanation to `values.yaml`.
 
 Keys in `values.yaml` and `ci/*.yaml` are sorted alphabetically at every level; list items keep their order, and a
-key's comment moves with it. `Chart.yaml` keeps Helm's field order.
+key's comment moves with it. The sections of the sub-charts (`flux-operator-mcp`, `ollama`, `valkey`) stay at the
+bottom, after the chart's own keys, sorted among themselves. `Chart.yaml` keeps Helm's field order.
 
 ## Chart releases
 

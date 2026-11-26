@@ -724,21 +724,6 @@ flux:
     # Defaults to the Helm release namespace.
     namespace: ""
 
-flux-operator-mcp:
-  enabled: true
-  # Pin the Service name to "flux-operator-mcp" regardless of release name.
-  # The bridge derives its default MCP URL (and the mcpRbac subject) from
-  # this name. Mirrors the ollama sub-chart pattern below.
-  fullnameOverride: flux-operator-mcp
-  networkPolicy:
-    create: true
-    ingress:
-      namespaces: []
-  rbac:
-    create: false
-  readonly: true
-  transport: http
-
 fullnameOverride: ""
 
 image:
@@ -756,25 +741,6 @@ livenessProbe:
   initialDelaySeconds: 5
   periodSeconds: 10
   timeoutSeconds: 3
-
-# ─── Optional bundled flux-operator-mcp sub-chart ────────────────────────────
-#
-# The bridge needs an MCP server to query for cluster state. The sub-chart
-# provisions one alongside the bridge so a fresh `helm install` works
-# self-contained. The defaults match what the bridge expects:
-#
-#   - transport: http     — matches the URL scheme in config.mcp.url
-#   - readonly: true      — the bridge only reads; never grant write tools
-#   - networkPolicy.create: true — MCP speaks unauthenticated HTTP, so only
-#     the release namespace (where the bridge runs) may connect; add more
-#     via networkPolicy.ingress.namespaces
-#   - rbac.create: false  — the sub-chart would bind cluster-admin; the
-#     bridge chart binds a read-only ClusterRole instead (mcpRbac below)
-#
-# Enabled by default so a fresh install works out of the box (also used by
-# e2e). Set `enabled: false` if you already run flux-operator-mcp yourself
-# and want to avoid a duplicate Deployment — then point `config.mcp.url`
-# at your existing Service.
 
 # Read-only ClusterRole (get/list/watch on all resources) bound to the bundled
 # flux-operator-mcp ServiceAccount. Wildcard because the bridge polls every
@@ -885,88 +851,6 @@ networkPolicy:
   monitoringNamespace: monitoring
 
 nodeSelector: {}
-
-# ─── Optional bundled local LLM (otwld/ollama-helm) ─────────────────────────
-#
-# ┌─────────────────────────────────────────────────────────────────────────┐
-# │ ⚠  THE BUNDLED OLLAMA CONFIG IS A "RUNS AT ALL" DEFAULT, NOT A         │
-# │    PRODUCTION RECOMMENDATION.                                           │
-# │                                                                         │
-# │ The default model (qwen2.5-coder:1.5b) is chosen so `helm install`     │
-# │ produces a working bridge on any host — zero credentials, ~1.5 GB RAM   │
-# │ footprint, runs on CPU. Output quality is substantially worse than     │
-# │ Anthropic Claude or Azure OpenAI Service: the model frequently breaks   │
-# │ the deterministic comment structure SKILL.md prescribes, hallucinates   │
-# │ resource names, and skips the failure-context citations PR reviewers    │
-# │ rely on. Comments are still readable but visibly lower-quality.         │
-# │                                                                         │
-# │ Use the bundled Ollama for:                                             │
-# │   - Local development / smoke-testing the install path                  │
-# │   - CI / e2e tests that want zero external dependencies                 │
-# │   - Air-gapped deployments where external LLM APIs aren't reachable     │
-# │                                                                         │
-# │ For production PR-comment quality, prefer one of:                       │
-# │   - Anthropic Claude:    config.llm.provider=claude (Sonnet/Opus)       │
-# │   - Azure OpenAI Service: config.llm.provider=openai-compatible         │
-# │   - OpenAI direct:        config.llm.provider=openai-compatible         │
-# │                                                                         │
-# │ If you must use local Ollama in production, step up to qwen2.5-coder:7b │
-# │ (8 GB RAM) at a minimum; 14B (16 GB) approaches Claude Haiku quality;   │
-# │ 32B (32 GB) approaches Claude Sonnet. See docs/local-llm.md.           │
-# └─────────────────────────────────────────────────────────────────────────┘
-#
-# When ollama.enabled=true, the upstream otwld/ollama-helm sub-chart is
-# rendered alongside the bridge and, with config.llm.openaiBaseUrl empty, the
-# bridge's OPENAI_BASE_URL points at it. The provider is NOT switched for you:
-# set config.llm.provider=openai-compatible (and config.llm.model, matching
-# ollama.ollama.models.pull/run) — with the default "none" Ollama runs unused.
-ollama:
-  # Whether to install the bundled Ollama sub-chart. Disabled by default
-  # so chart install + chart-testing run on minimally-sized CI runners
-  # (the qwen2.5-coder image alone exceeds typical GitHub-runner memory).
-  # Enable for local-only smoke-testing and air-gapped installs — for
-  # production switch config.llm.provider to "claude" (with
-  # credentials.anthropicApiKey) or "openai-compatible" with a real
-  # endpoint URL + key. See the warning above.
-  enabled: false
-  # Bump Ollama's default context window so the SKILL.md system prompt
-  # (~5k tokens) plus the per-event user payload (Kustomization YAML +
-  # readiness rows + failure context can reach 10-15k tokens) actually fit.
-  # Ollama's hard-coded default is 4k on CPU hosts — too small; SKILL.md
-  # gets evicted and the model effectively never sees the format spec,
-  # which is the #1 cause of malformed PR comments on small local models.
-  # 16k strikes a balance; bump to 32k if your model card supports it and
-  # you're running 7B+ where the extra context actually helps.
-  extraEnv:
-    - name: OLLAMA_CONTEXT_LENGTH
-      value: "16384"
-  # Make the Service name predictable so the bridge can auto-derive the URL.
-  fullnameOverride: ollama
-  # Deploy Ollama into a different namespace than the bridge release.
-  # Leave empty to share the bridge's namespace (default helm sub-chart
-  # behavior). When set, you must pre-create the namespace yourself — helm
-  # won't create namespaces for sub-chart resources. The bridge's
-  # OPENAI_BASE_URL auto-derive picks up this value, so callers don't need
-  # to override the URL separately.
-  namespaceOverride: ""
-  # Default model — small, code-tuned, CPU-friendly (~1 GB on disk, ~1.5 GB RAM loaded).
-  # Override by setting ollama.ollama.models.pull and ollama.ollama.models.run.
-  # See docs/local-llm.md for the model-size vs output-quality trade-off; the
-  # 1.5B default produces compact but often format-breaking comments because
-  # small models struggle with the structured SKILL.md template. 7B is the
-  # practical floor for reliable formatting; 14B/32B match Anthropic Haiku /
-  # Sonnet quality on this workload at the cost of RAM.
-  ollama:
-    models:
-      pull:
-        - qwen2.5-coder:1.5b
-      run:
-        - qwen2.5-coder:1.5b
-  # Persistence is OFF by default — model gets re-pulled on every pod restart.
-  # For production, set persistentVolume.enabled=true and configure storageClass
-  # appropriately (see docs/local-llm.md).
-  persistentVolume:
-    enabled: false
 
 podAnnotations: {}
 
@@ -1082,6 +966,125 @@ terminationGracePeriodSeconds: 45
 
 tolerations: []
 
+volumeMounts: []
+
+volumes: []
+
+# ─── Optional bundled flux-operator-mcp sub-chart ────────────────────────────
+#
+# The bridge needs an MCP server to query for cluster state. The sub-chart
+# provisions one alongside the bridge so a fresh `helm install` works
+# self-contained. The defaults match what the bridge expects:
+#
+#   - transport: http     — matches the URL scheme in config.mcp.url
+#   - readonly: true      — the bridge only reads; never grant write tools
+#   - networkPolicy.create: true — MCP speaks unauthenticated HTTP, so only
+#     the release namespace (where the bridge runs) may connect; add more
+#     via networkPolicy.ingress.namespaces
+#   - rbac.create: false  — the sub-chart would bind cluster-admin; the
+#     bridge chart binds a read-only ClusterRole instead (see mcpRbac)
+#
+# Enabled by default so a fresh install works out of the box (also used by
+# e2e). Set `enabled: false` if you already run flux-operator-mcp yourself
+# and want to avoid a duplicate Deployment — then point `config.mcp.url`
+# at your existing Service.
+flux-operator-mcp:
+  enabled: true
+  # Pin the Service name to "flux-operator-mcp" regardless of release name.
+  # The bridge derives its default MCP URL (and the mcpRbac subject) from
+  # this name. Mirrors the ollama sub-chart pattern below.
+  fullnameOverride: flux-operator-mcp
+  networkPolicy:
+    create: true
+    ingress:
+      namespaces: []
+  rbac:
+    create: false
+  readonly: true
+  transport: http
+
+# ─── Optional bundled local LLM (otwld/ollama-helm) ─────────────────────────
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ ⚠  THE BUNDLED OLLAMA CONFIG IS A "RUNS AT ALL" DEFAULT, NOT A         │
+# │    PRODUCTION RECOMMENDATION.                                           │
+# │                                                                         │
+# │ The default model (qwen2.5-coder:1.5b) is chosen so `helm install`     │
+# │ produces a working bridge on any host — zero credentials, ~1.5 GB RAM   │
+# │ footprint, runs on CPU. Output quality is substantially worse than     │
+# │ Anthropic Claude or Azure OpenAI Service: the model frequently breaks   │
+# │ the deterministic comment structure SKILL.md prescribes, hallucinates   │
+# │ resource names, and skips the failure-context citations PR reviewers    │
+# │ rely on. Comments are still readable but visibly lower-quality.         │
+# │                                                                         │
+# │ Use the bundled Ollama for:                                             │
+# │   - Local development / smoke-testing the install path                  │
+# │   - CI / e2e tests that want zero external dependencies                 │
+# │   - Air-gapped deployments where external LLM APIs aren't reachable     │
+# │                                                                         │
+# │ For production PR-comment quality, prefer one of:                       │
+# │   - Anthropic Claude:    config.llm.provider=claude (Sonnet/Opus)       │
+# │   - Azure OpenAI Service: config.llm.provider=openai-compatible         │
+# │   - OpenAI direct:        config.llm.provider=openai-compatible         │
+# │                                                                         │
+# │ If you must use local Ollama in production, step up to qwen2.5-coder:7b │
+# │ (8 GB RAM) at a minimum; 14B (16 GB) approaches Claude Haiku quality;   │
+# │ 32B (32 GB) approaches Claude Sonnet. See docs/local-llm.md.           │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# When ollama.enabled=true, the upstream otwld/ollama-helm sub-chart is
+# rendered alongside the bridge and, with config.llm.openaiBaseUrl empty, the
+# bridge's OPENAI_BASE_URL points at it. The provider is NOT switched for you:
+# set config.llm.provider=openai-compatible (and config.llm.model, matching
+# ollama.ollama.models.pull/run) — with the default "none" Ollama runs unused.
+ollama:
+  # Whether to install the bundled Ollama sub-chart. Disabled by default
+  # so chart install + chart-testing run on minimally-sized CI runners
+  # (the qwen2.5-coder image alone exceeds typical GitHub-runner memory).
+  # Enable for local-only smoke-testing and air-gapped installs — for
+  # production switch config.llm.provider to "claude" (with
+  # credentials.anthropicApiKey) or "openai-compatible" with a real
+  # endpoint URL + key. See the warning above.
+  enabled: false
+  # Bump Ollama's default context window so the SKILL.md system prompt
+  # (~5k tokens) plus the per-event user payload (Kustomization YAML +
+  # readiness rows + failure context can reach 10-15k tokens) actually fit.
+  # Ollama's hard-coded default is 4k on CPU hosts — too small; SKILL.md
+  # gets evicted and the model effectively never sees the format spec,
+  # which is the #1 cause of malformed PR comments on small local models.
+  # 16k strikes a balance; bump to 32k if your model card supports it and
+  # you're running 7B+ where the extra context actually helps.
+  extraEnv:
+    - name: OLLAMA_CONTEXT_LENGTH
+      value: "16384"
+  # Make the Service name predictable so the bridge can auto-derive the URL.
+  fullnameOverride: ollama
+  # Deploy Ollama into a different namespace than the bridge release.
+  # Leave empty to share the bridge's namespace (default helm sub-chart
+  # behavior). When set, you must pre-create the namespace yourself — helm
+  # won't create namespaces for sub-chart resources. The bridge's
+  # OPENAI_BASE_URL auto-derive picks up this value, so callers don't need
+  # to override the URL separately.
+  namespaceOverride: ""
+  # Default model — small, code-tuned, CPU-friendly (~1 GB on disk, ~1.5 GB RAM loaded).
+  # Override by setting ollama.ollama.models.pull and ollama.ollama.models.run.
+  # See docs/local-llm.md for the model-size vs output-quality trade-off; the
+  # 1.5B default produces compact but often format-breaking comments because
+  # small models struggle with the structured SKILL.md template. 7B is the
+  # practical floor for reliable formatting; 14B/32B match Anthropic Haiku /
+  # Sonnet quality on this workload at the cost of RAM.
+  ollama:
+    models:
+      pull:
+        - qwen2.5-coder:1.5b
+      run:
+        - qwen2.5-coder:1.5b
+  # Persistence is OFF by default — model gets re-pulled on every pod restart.
+  # For production, set persistentVolume.enabled=true and configure storageClass
+  # appropriately (see docs/local-llm.md).
+  persistentVolume:
+    enabled: false
+
 # ─── Optional bundled Valkey sub-chart (dedupe persistence) ──────────────────
 #
 # Optional bundled Valkey for persistent dedupe state. Valkey speaks the
@@ -1143,6 +1146,3 @@ valkey:
   # comfortably holds it. If you lower the memory limit, set `maxmemory` in
   # extraConfig to ~75% of it (see above).
   resources:
-volumeMounts: []
-
-volumes: []
