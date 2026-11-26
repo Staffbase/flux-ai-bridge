@@ -1,0 +1,17 @@
+# LLM_PROVIDER=none — the bridge posts a deterministic comment built from
+# kstatus output alone. No API key required. Verifies the chart renders
+# cleanly without anthropicApiKey / openaiApiKey set.
+flux:
+  notification:
+    enabled: false
+config:
+  llm:
+    provider: none
+credentials:
+  githubApp:
+    appId: "1"
+    installationId: "1"
+    privateKey: |
+      -----BEGIN PRIVATE KEY-----
+      placeholder
+      -----END PRIVATE KEY-----

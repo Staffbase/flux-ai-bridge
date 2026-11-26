@@ -1,0 +1,69 @@
+name: Release Helm Charts
+
+permissions: read-all
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'charts/**/**'
+
+env:
+  helm-version: "v4.3.0"
+
+jobs:
+  release:
+    permissions:
+      contents: write # to create the chart's GitHub release (helm/chart-releaser-action)
+      packages: write # to push the chart to GHCR
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
+        with:
+          version: "${{ env.helm-version }}"
+
+      # chart-releaser builds the chart dependencies while packaging; the
+      # non-OCI sub-chart repositories must be known to Helm for that.
+      - name: Add Helm dependency repositories
+        run: |
+          helm repo add ollama https://helm.otwld.com/
+          helm repo update
+
+      - name: Run chart-releaser
+        id: chart-releaser
+        uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
+        env:
+          CR_GENERATE_RELEASE_NOTES: true
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          # Registry credentials for `cr push`, read from the environment so
+          # the token isn't passed on the command line.
+          CR_USERNAME: "${{ github.actor }}"
+          CR_PASSWORD: "${{ secrets.GITHUB_TOKEN }}"
+        with:
+          # Publish to the OCI registry only. This skips the gh-pages index
+          # update; the GitHub release per chart version is still created.
+          skip_upload: true
+          # Lets a rerun recover from a failed OCI push: the existing GitHub
+          # release is skipped and only missing chart versions are pushed.
+          skip_existing: true
+          # Package this chart on every run (the workflow only runs on chart
+          # changes) instead of diffing against the last tag: a fresh
+          # single-commit history has nothing to diff against. skip_existing
+          # makes an unchanged chart version a no-op.
+          charts: charts/flux-ai-bridge
+          # Chart releases share the repository with the app's v* releases;
+          # keep the app release marked as latest.
+          mark_as_latest: false
+          oci_registry_url: "oci://ghcr.io/staffbase/charts"

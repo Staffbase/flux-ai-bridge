@@ -1,0 +1,14 @@
+bin/*
+# Sub-charts are fetched from the versions pinned in Chart.yaml via
+# `make chart-deps` (helm dependency update).
+charts/flux-ai-bridge/charts/*
+charts/flux-ai-bridge/Chart.lock
+
+# Generated at `make e2e-up` time when running in mock-github mode. A
+# throwaway RSA private key the bridge needs to construct its
+# ghinstallation transport (the lib parses the PEM eagerly even though
+# mock-github never verifies the resulting JWTs). Regenerated on every
+# `make e2e-up`; never committed.
+e2e/fixtures/mock-app-key.pem
+.omo/*
+mise.toml

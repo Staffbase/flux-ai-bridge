@@ -1,0 +1,36 @@
+{{- /*
+Read-only RBAC for the bundled flux-operator-mcp sub-chart, replacing its
+default cluster-admin binding (flux-operator-mcp.rbac.create=false in
+values.yaml). The bridge only calls read tools, but it polls every object in
+a Kustomization's inventory — which can be any kind, CRDs included — so the
+role grants get/list/watch on everything (subresources such as pods/log
+included). The MCP server masks Secret values in its responses by default.
+*/ -}}
+{{- $mcp := index .Values "flux-operator-mcp" | default dict }}
+{{- if and $mcp.enabled .Values.mcpRbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}-mcp-read
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}-mcp-read
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "flux-ai-bridge.fullname" . }}-mcp-read
+subjects:
+  - kind: ServiceAccount
+    name: {{ (($mcp.serviceAccount | default dict).name) | default ($mcp.fullnameOverride | default "flux-operator-mcp") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

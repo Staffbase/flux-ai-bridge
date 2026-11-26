@@ -1,0 +1,13 @@
+# The LLM API key comes from its own Secret via extraEnv; the rest from
+# existingSecret.
+existingSecret: flux-ai-bridge
+config:
+  llm:
+    provider: openai-compatible
+    openaiBaseUrl: "http://llm-gateway.example.com:8787"
+extraEnv:
+  - name: OPENAI_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: flux-ai-bridge-llm
+        key: api-key

@@ -1,0 +1,145 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "flux-ai-bridge.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- with .Values.networkPolicy.ingress.from }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.service.port }}
+    {{- else }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.fluxNamespace | default "flux-system" }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+    {{- end }}
+    # `helm test` pod (templates/tests/test-connection.yaml).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: chart-test
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+    {{- if .Values.serviceMonitor.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace | default "monitoring" }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+    {{- end }}
+    {{- with .Values.networkPolicy.ingress.extra }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  egress:
+    # DNS — required for resolving the MCP, GitHub, and LLM endpoints.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Flux controllers in the flux namespace — the flux-operator-mcp endpoint
+    # AND source-controller's artifact server (the bridge fetches the source
+    # tarball to resolve exact PR attribution). Any port, narrowed by namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.fluxNamespace | default "flux-system" }}
+    # Pods in the release namespace — the bundled flux-operator-mcp and Valkey
+    # sub-charts deploy here. Any port, narrowed by namespace.
+    - to:
+        - podSelector: {}
+    {{- if and .Values.ollama.enabled .Values.ollama.namespaceOverride (ne .Values.ollama.namespaceOverride .Release.Namespace) }}
+    # Bundled Ollama sub-chart moved out of the release namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.ollama.namespaceOverride }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ollama
+      ports:
+        - protocol: TCP
+          port: 11434
+    {{- end }}
+    {{- /* LLM and GitHub endpoints configured by URL (see the urlEgressRule helper). */}}
+    {{- $llm := .Values.config.llm | default dict }}
+    {{- $github := .Values.config.github | default dict }}
+    {{- range $label, $url := dict "OpenAI-compatible endpoint" $llm.openaiBaseUrl "Anthropic endpoint" $llm.anthropicBaseUrl "GitHub API" $github.apiUrl }}
+    {{- with $url }}
+    {{- with include "flux-ai-bridge.urlEgressRule" (dict "url" . "label" $label "root" $) | trim }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- /*
+    External dedupe backend (the bundled Valkey is covered by the
+    release-namespace rule): the configured data ports, plus the Sentinel
+    ports in Sentinel mode (networkPolicy.egress.redis), plus any port
+    written in the URL or the Sentinel addresses — the bridge dials exactly
+    those. The master's data port is whatever Sentinel hands out, so it can
+    only come from the configured list.
+    */}}
+    {{- $persistence := .Values.config.dedupe.persistence | default dict }}
+    {{- $sentinel := $persistence.sentinel | default dict }}
+    {{- $redis := .Values.networkPolicy.egress.redis | default dict }}
+    {{- if and $persistence.enabled (not .Values.valkey.enabled) }}
+    {{- $ports := list }}
+    {{- range $redis.ports }}{{ $ports = append $ports (toString .) }}{{ end }}
+    {{- if $sentinel.enabled }}
+    {{- range $redis.sentinelPorts }}{{ $ports = append $ports (toString .) }}{{ end }}
+    {{- $addrs := $sentinel.addrs }}
+    {{- if kindIs "slice" $addrs }}{{ $addrs = join "," $addrs }}{{ end }}
+    {{- /* Only a trailing ":<digits>" is a port: an IPv6 host like [2001:db8::1] has colons of its own. */}}
+    {{- range splitList "," (toString $addrs) }}
+    {{- with regexFind ":[0-9]+$" (trim .) }}{{ $ports = append $ports (trimPrefix ":" .) }}{{ end }}
+    {{- end }}
+    {{- else if $persistence.url }}
+    {{- with regexFind ":[0-9]+$" (urlParse $persistence.url).host }}{{ $ports = append $ports (trimPrefix ":" .) }}{{ end }}
+    {{- end }}
+    {{- with ($ports | uniq) }}
+    # External Redis/Valkey dedupe backend.
+    - ports:
+        {{- range . }}
+        - protocol: TCP
+          port: {{ int . }}
+        {{- end }}
+    {{- end }}
+    {{- end }}
+    # HTTPS to anywhere — Kubernetes API server + external GitHub/LLM endpoints.
+    # NetworkPolicy can't express FQDN-based allow-lists; a CNI with FQDN
+    # policies (e.g., Cilium) or an egress proxy is required for stricter
+    # controls. Port 6443 is included for clusters that expose kube-apiserver
+    # there instead of 443.
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    {{- with .Values.networkPolicy.egress.extra }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

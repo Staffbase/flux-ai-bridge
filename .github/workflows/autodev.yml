@@ -1,0 +1,60 @@
+name: Autodev
+
+on:
+  push:
+    branches-ignore: [ dev ]
+  pull_request:
+    types: [ labeled, unlabeled, closed ]
+
+permissions: {}
+
+jobs:
+  autodev:
+    name: Build Dev Branch
+    # Dependabot runs get a read-only token; label events only for the dev label.
+    if: github.actor != 'dependabot[bot]' && (github.event_name == 'push' || github.event.label.name == 'dev' || github.event.action == 'closed')
+    runs-on: ubuntu-24.04
+    # One run at a time, each on the current dev tip and labels. Job level, so
+    # a skipped run (other label) can't replace a waiting rebuild; a newer
+    # waiting rebuild replaces an older one, as every run rebuilds dev.
+    concurrency:
+      group: autodev
+      cancel-in-progress: false
+    permissions:
+      contents: write # force-push the dev branch
+      pull-requests: write # list the labeled PRs
+      issues: write # set the successful/failed labels
+      actions: write # dispatch the ci workflow on dev
+    steps:
+      # autodev pushes with the checkout's credentials (the GITHUB_TOKEN).
+      - name: Checkout # zizmor: ignore[artipacked]
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: false
+
+      - name: Record the dev branch tip
+        id: before
+        run: echo "sha=$(git ls-remote origin refs/heads/dev | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Autodev
+        uses: Staffbase/autodev-action@4d7207fa767390412b2febe6de0e9f4bc0e9c776 # v2.12.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          labels: true
+          user: github-actions[bot]
+          email: 41898282+github-actions[bot]@users.noreply.github.com
+
+      # A push made with the GITHUB_TOKEN doesn't trigger workflows, so start
+      # the ci workflow (dev image build) explicitly when dev moved. A manual
+      # rerun always dispatches, to recover from a failed dispatch.
+      - name: Build the dev image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ steps.before.outputs.sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          after=$(git ls-remote origin refs/heads/dev | cut -f1)
+          if [ -n "$after" ] && { [ "$after" != "$BEFORE" ] || [ "$RUN_ATTEMPT" -gt 1 ]; }; then
+            gh workflow run ci-cd.yaml --ref dev
+          fi

@@ -1,0 +1,30 @@
+{{- if .Values.flux.notification.enabled }}
+apiVersion: {{ include "flux-ai-bridge.notificationAPIVersion" (dict "ctx" . "kind" "Alert") }}
+kind: Alert
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}
+  namespace: {{ include "flux-ai-bridge.notificationNamespace" . }}
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+spec:
+  providerRef:
+    name: {{ include "flux-ai-bridge.fullname" . }}
+  eventSeverity: info
+  # Subscribe to ALL Kustomizations. Per-name selection (allowlist or
+  # blocklist) is handled bridge-side via config.kustomizations.{include,exclude}
+  # in values.yaml — the Alert CRD only supports allowlisting and can't
+  # express exclude semantics, so we centralize the decision in one place.
+  #
+  # An event source without a namespace only matches the Alert's own
+  # namespace; list more under flux.notification.eventSourceNamespaces.
+  eventSources:
+    - kind: Kustomization
+      name: "*"
+    {{- range .Values.flux.notification.eventSourceNamespaces }}
+    {{- if ne . (include "flux-ai-bridge.notificationNamespace" $) }}
+    - kind: Kustomization
+      name: "*"
+      namespace: {{ . }}
+    {{- end }}
+    {{- end }}
+{{- end }}

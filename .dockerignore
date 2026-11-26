@@ -1,0 +1,13 @@
+# Only Go sources, go.mod and go.sum are needed to build the binary. Keeping
+# the rest out shrinks the build context and stops unrelated edits (docs,
+# chart, e2e) from invalidating the `COPY . .` layer.
+.git
+.github
+bin
+charts
+docs
+e2e
+*.md
+mise.toml
+prompts.md
+.omo

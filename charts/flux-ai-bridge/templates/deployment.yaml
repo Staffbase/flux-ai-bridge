@@ -1,0 +1,537 @@
+{{- /*
+Multi-replica invariant. Two replicas without persistent dedupe means both
+pods run the LLM + GitHub-comment pipeline for every event: wasted tokens,
+duplicate comments, comment-update races. Persistent dedupe (Redis/Valkey
+SETNX) is the only supported cross-replica coordination. Catch this at
+template time rather than letting the user discover it in production.
+
+The fix is one of:
+  - replicaCount: 1                          (single-replica is fine without dedupe persistence)
+  - valkey.enabled=true + config.dedupe.persistence.enabled=true   (bundled Valkey)
+  - config.dedupe.persistence.{url,enabled}=...                     (external Redis-protocol service)
+*/}}
+{{- $multiReplica := or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled }}
+{{- $dedupePersisted := .Values.config.dedupe.persistence.enabled }}
+{{- if and $multiReplica (not $dedupePersisted) }}
+{{- fail "replicaCount > 1 (or autoscaling.enabled) requires persistent dedupe so the replicas coordinate via Redis/Valkey SETNX. Set config.dedupe.persistence.enabled=true plus either valkey.enabled=true (bundled) or config.dedupe.persistence.url=redis://... (external). See chart/values.yaml ─── HA ─── section." }}
+{{- end }}
+{{- /*
+Misconfig guards for dedupe persistence:
+  - valkey.enabled (bundled single-node Valkey) + sentinel.enabled is a
+    confused configuration: sentinel mode points at a user-managed
+    Redis+Sentinel cluster, so the bundled Valkey would deploy AND be
+    ignored. Fail fast — the operator likely meant one or the other.
+  - sentinel.{addrs/user/password/passwordKey/masterName} set while
+    sentinel.enabled=false silently drops those values. Most often happens
+    when copy-pasting a sentinel block then forgetting the toggle. Fail with
+    a pointer so the operator notices.
+*/}}
+{{- $persistence := .Values.config.dedupe.persistence | default dict }}
+{{- $sentinelBlk := $persistence.sentinel | default dict }}
+{{- if and .Values.valkey.enabled $sentinelBlk.enabled }}
+{{- fail "Both valkey.enabled=true (bundled single-node Valkey) AND config.dedupe.persistence.sentinel.enabled=true are set. Sentinel mode points at a user-managed Redis+Sentinel cluster; the bundled Valkey would be deployed but ignored. Pick one." }}
+{{- end }}
+{{- if and (not $sentinelBlk.enabled) (or $sentinelBlk.addrs $sentinelBlk.masterName $sentinelBlk.user $sentinelBlk.password $sentinelBlk.passwordKey) }}
+{{- fail "config.dedupe.persistence.sentinel.* fields are set but sentinel.enabled=false — those values would be silently ignored. Either set sentinel.enabled=true or remove the sentinel sub-block from your values." }}
+{{- end }}
+{{- /*
+Persistence needs a backend. Without one the URL would be auto-derived to a
+bundled `valkey` Service that doesn't exist, and the bridge — whose dedupe
+fails closed when Redis is unreachable — would skip every PR.
+*/}}
+{{- if and $persistence.enabled (not .Values.valkey.enabled) (not $persistence.url) (not $sentinelBlk.enabled) }}
+{{- fail "config.dedupe.persistence.enabled=true needs a backend: set valkey.enabled=true (bundled), config.dedupe.persistence.url=redis://... (external), or config.dedupe.persistence.sentinel.enabled=true." }}
+{{- end }}
+{{- if not (include "flux-ai-bridge.mcpURL" .) }}
+{{- fail "config.mcp.url is required when flux-operator-mcp.enabled=false — point it at your flux-operator-mcp install." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flux-ai-bridge.fullname" . }}
+  labels:
+    {{- include "flux-ai-bridge.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "flux-ai-bridge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Trigger a rollout when skill ConfigMaps change. Skills are loaded at
+        # startup; without this annotation, editing chart/skills/* + `helm
+        # upgrade` would leave the running pod with stale content.
+        checksum/skill: {{ include (print $.Template.BasePath "/configmap-skill.yaml") . | sha256sum }}
+        # Secrets reach the container as env vars, which are only read at
+        # start — roll the pod whenever a chart-managed Secret changes.
+        # Secrets you manage yourself (existingSecret) need a reloader.
+        {{- if not .Values.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        checksum/dedupe-secret: {{ include (print $.Template.BasePath "/secret-dedupe.yaml") . | sha256sum }}
+        {{- /*
+        Hash the token the HMAC Secret carries (one value per render, see the
+        hmacToken helper), so the bridge restarts whenever Flux would start
+        signing with a different token. An existingSecret is yours to rotate
+        and needs a reloader, like the other existing Secrets.
+        */}}
+        checksum/webhook-hmac: {{ printf "%s/%s/%s" (include "flux-ai-bridge.hmacMode" .) .Values.flux.notification.hmac.existingSecret (include "flux-ai-bridge.hmacToken" .) | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "flux-ai-bridge.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "flux-ai-bridge.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- with .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          env:
+            - name: WEBHOOK_PORT
+              value: {{ .Values.service.port | quote }}
+            {{- if .Values.config.webhook.maxConcurrent }}
+            - name: WEBHOOK_MAX_CONCURRENT
+              value: {{ .Values.config.webhook.maxConcurrent | quote }}
+            {{- end }}
+            {{- if .Values.config.mcp.poolSize }}
+            - name: MCP_POOL_SIZE
+              value: {{ .Values.config.mcp.poolSize | quote }}
+            {{- end }}
+            {{- if .Values.config.dedupe.ttl }}
+            - name: DEDUPE_TTL
+              value: {{ .Values.config.dedupe.ttl | quote }}
+            {{- end }}
+            {{- if .Values.config.dedupe.reEval.ttl }}
+            - name: DEDUPE_PR_REEVAL_TTL
+              value: {{ .Values.config.dedupe.reEval.ttl | quote }}
+            {{- end }}
+            {{- if eq (.Values.config.dedupe.reEval.failedOnly | toString) "false" }}
+            - name: DEDUPE_REEVAL_FAILED_ONLY
+              value: "false"
+            {{- end }}
+            {{- if .Values.config.dedupe.reEval.maxRetries }}
+            - name: DEDUPE_PR_REEVAL_MAX
+              value: {{ .Values.config.dedupe.reEval.maxRetries | quote }}
+            {{- end }}
+            {{- /*
+            Dedupe persistence URL. Three sources, picked in order:
+              1. Explicit user override:  .Values.config.dedupe.persistence.url
+              2. Auto-derive from the bundled Valkey sub-chart when enabled
+                 (the fullnameOverride pins the Service name to "valkey").
+              3. Unset → bridge falls back to in-memory dedupe.
+            DEDUPE_PERSISTENCE_PASSWORD is sourced from a Secret entry so the
+            chart doesn't have to inline it into a Pod env — same pattern as
+            credentials.openaiApiKey etc.
+            */}}
+            {{- if .Values.config.dedupe.persistence.enabled }}
+            {{- /*
+            Two topology modes:
+              - sentinel.enabled=true → emit SENTINEL_ADDRS + MASTER_NAME +
+                                        DB + TLS + SENTINEL_USER. The
+                                        single-node URL is omitted entirely
+                                        — the bridge selector treats
+                                        SENTINEL_ADDRS as "you are in
+                                        sentinel mode".
+              - else (single-node)    → emit URL (auto-derived from the
+                                        bundled valkey sub-chart when not
+                                        set explicitly).
+            Backend creds (USER/PASSWORD) are shared across both modes.
+            Sentinel-daemon creds (SENTINEL_USER, SENTINEL_PASSWORD) are
+            only emitted in sentinel mode.
+            */}}
+            {{- $sentinel := .Values.config.dedupe.persistence.sentinel | default dict }}
+            {{- if $sentinel.enabled }}
+            {{- /*
+            `addrs` is the Sentinel quorum, passed straight through to
+            go-redis's FailoverClient. Point it at the Redis chart's headless
+            Service DNS (returns every sentinel pod — the idiomatic single
+            entry) or list the per-pod names comma-separated for maximum
+            robustness. The port lives in each addr, so it's configurable
+            without a dedicated field; a plain Service VIP would only ever
+            return one IP and defeat the quorum, so use the headless name.
+            */}}
+            {{- if not (and $sentinel.addrs $sentinel.masterName) }}
+              {{- fail "config.dedupe.persistence.sentinel.enabled=true requires `addrs` AND `masterName`. addrs is the sentinel quorum (e.g. \"redis-headless.<ns>.svc.cluster.local:26379\", or a comma-separated list of pod DNS names); masterName matches the sentinel `monitor <name> …` config line (often \"mymaster\"). See chart values.yaml `sentinel:` block." }}
+            {{- end }}
+            - name: DEDUPE_PERSISTENCE_SENTINEL_ADDRS
+              value: {{ $sentinel.addrs | quote }}
+            - name: DEDUPE_PERSISTENCE_MASTER_NAME
+              value: {{ $sentinel.masterName | quote }}
+            {{- if $sentinel.db }}
+            - name: DEDUPE_PERSISTENCE_DB
+              value: {{ $sentinel.db | quote }}
+            {{- end }}
+            {{- if $sentinel.tls }}
+            - name: DEDUPE_PERSISTENCE_TLS
+              value: "true"
+            {{- end }}
+            {{- with $sentinel.user }}
+            - name: DEDUPE_PERSISTENCE_SENTINEL_USER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- else }}
+            - name: DEDUPE_PERSISTENCE_URL
+              value: {{ default (printf "redis://valkey.%s.svc.cluster.local:6379/0" .Release.Namespace) .Values.config.dedupe.persistence.url | quote }}
+            {{- end }}
+            {{- /*
+            Backend username is plaintext (Redis ACL usernames aren't secret)
+            and is injected as a plain pod env var regardless of which Secret
+            holds the password.
+            Backend password is sourced from a Secret. Two paths:
+              - existingSecret set   → look up `passwordKey` in the BYO Secret.
+                                        Empty passwordKey ("") skips password
+                                        injection — username-only ACL flows.
+              - existingSecret unset → chart-managed Secret with the fixed
+                                        DEDUPE_PERSISTENCE_PASSWORD key, only
+                                        rendered when an inline password is
+                                        set (see secret-dedupe.yaml).
+            Sentinel password (sentinel mode only) follows the same pattern
+            but with sentinel.passwordKey / inline sentinel.password.
+            */}}
+            {{- with .Values.config.dedupe.persistence.user }}
+            - name: DEDUPE_PERSISTENCE_USER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- $dpSecret := .Values.config.dedupe.persistence.existingSecret }}
+            {{- $dpManagedName := printf "%s-dedupe" (include "flux-ai-bridge.fullname" .) }}
+            {{- if $dpSecret }}
+              {{- with .Values.config.dedupe.persistence.passwordKey }}
+            - name: DEDUPE_PERSISTENCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $dpSecret }}
+                  key: {{ . | quote }}
+              {{- end }}
+              {{- if $sentinel.enabled }}
+                {{- with $sentinel.passwordKey }}
+            - name: DEDUPE_PERSISTENCE_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $dpSecret }}
+                  key: {{ . | quote }}
+                {{- end }}
+              {{- end }}
+            {{- else }}
+              {{- if .Values.config.dedupe.persistence.password }}
+            - name: DEDUPE_PERSISTENCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $dpManagedName }}
+                  key: DEDUPE_PERSISTENCE_PASSWORD
+              {{- end }}
+              {{- if and $sentinel.enabled $sentinel.password }}
+            - name: DEDUPE_PERSISTENCE_SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $dpManagedName }}
+                  key: DEDUPE_PERSISTENCE_SENTINEL_PASSWORD
+              {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.config.llm.maxTokens }}
+            - name: LLM_MAX_TOKENS
+              value: {{ .Values.config.llm.maxTokens | quote }}
+            {{- end }}
+            {{- if .Values.config.readiness.pollInterval }}
+            - name: READINESS_POLL_INTERVAL
+              value: {{ .Values.config.readiness.pollInterval | quote }}
+            {{- end }}
+            {{- if .Values.config.readiness.pollTimeout }}
+            - name: READINESS_POLL_TIMEOUT
+              value: {{ .Values.config.readiness.pollTimeout | quote }}
+            {{- end }}
+            {{- /* toString, so an unquoted 0 (disable) still renders */}}
+            {{- if and (hasKey .Values.config.readiness "podQuietPeriod") (ne (toString .Values.config.readiness.podQuietPeriod) "") }}
+            - name: READINESS_POD_QUIET_PERIOD
+              value: {{ .Values.config.readiness.podQuietPeriod | quote }}
+            {{- end }}
+            {{- /*
+            Render INCLUDE_PODS / EXPAND_HELMRELEASES only when explicitly
+            set to false. The bridge defaults to true for both, so omitting
+            the env vars matches chart-value `true` and keeps the rendered
+            Deployment minimal.
+            */}}
+            {{- if hasKey .Values.config.readiness "includePods" }}
+            {{- if not .Values.config.readiness.includePods }}
+            - name: READINESS_INCLUDE_PODS
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- if hasKey .Values.config.readiness "expandHelmReleases" }}
+            {{- if not .Values.config.readiness.expandHelmReleases }}
+            - name: READINESS_EXPAND_HELMRELEASES
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- /*
+            Render LLM_SKIP_ON_HEALTHY only when explicitly set to false.
+            The bridge default is true, so omitting matches chart-value
+            `true` and keeps the rendered Deployment minimal.
+            */}}
+            {{- if hasKey .Values.config.llm "skipOnHealthy" }}
+            {{- if not .Values.config.llm.skipOnHealthy }}
+            - name: LLM_SKIP_ON_HEALTHY
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.config.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            {{- end }}
+            {{- with .Values.config.instanceId }}
+            - name: INSTANCE_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.config.shutdownTimeout }}
+            - name: SHUTDOWN_TIMEOUT
+              value: {{ .Values.config.shutdownTimeout | quote }}
+            {{- end }}
+            {{- /* `0` (disable) is a real value here — don't let `with` drop it. */}}
+            {{- $maxTTL := (.Values.config.dedupe.persistence | default dict).maxTTL }}
+            {{- if and (not (kindIs "invalid" $maxTTL)) (ne (toString $maxTTL) "") }}
+            - name: DEDUPE_PERSISTENCE_MAX_TTL
+              value: {{ toString $maxTTL | quote }}
+            {{- end }}
+            - name: MCP_URL
+              value: {{ include "flux-ai-bridge.mcpURL" . | quote }}
+            - name: LLM_PROVIDER
+              value: {{ .Values.config.llm.provider | quote }}
+            {{- if .Values.config.llm.model }}
+            - name: LLM_MODEL
+              value: {{ .Values.config.llm.model | quote }}
+            {{- end }}
+            {{- if .Values.config.github.repo }}
+            - name: GITHUB_REPO
+              value: {{ .Values.config.github.repo | quote }}
+            {{- end }}
+            {{- $comments := .Values.config.github.comments | default dict }}
+            {{- if $comments.keepHistory }}
+            - name: GITHUB_KEEP_COMMENT_HISTORY
+              value: "true"
+            {{- end }}
+            {{- /*
+            comments.includeSummary / includeFooter default to true in the
+            bridge. Only render the env var when explicitly set to false,
+            keeping the rendered Deployment minimal.
+            */}}
+            {{- if hasKey $comments "includeSummary" }}
+            {{- if not $comments.includeSummary }}
+            - name: COMMENT_INCLUDE_SUMMARY
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- if hasKey $comments "includeFooter" }}
+            {{- if not $comments.includeFooter }}
+            - name: COMMENT_INCLUDE_FOOTER
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- if $comments.failedResourcesOnly }}
+            - name: COMMENT_FAILED_RESOURCES_ONLY
+              value: "true"
+            {{- end }}
+            {{- /*
+            comments.onSuccess defaults true in the bridge. Only render the env
+            var (as "false") when explicitly disabled, so a healthy outcome
+            posts no comment. Labels still reconcile independently (labels.enabled).
+            NB: can't use `| default true` here — sprig's `default` treats the
+            bool `false` as empty and would flip it back to true; compare the
+            stringified value instead so an explicit `false` is honored.
+            */}}
+            {{- if eq ($comments.onSuccess | toString) "false" }}
+            - name: COMMENT_ON_SUCCESS
+              value: "false"
+            {{- end }}
+            {{- /*
+            GitHub fetch-cache + walk tuning. Rendered only when set; empty =
+            bridge defaults. These are the operator's rate-limit levers — see
+            docs/caching.md.
+            */}}
+            {{- with .Values.config.github.parentWalkDepth }}
+            - name: PARENT_WALK_DEPTH
+              value: {{ . | quote }}
+            {{- end }}
+            {{- $ghCache := .Values.config.github.cache | default dict }}
+            {{- with $ghCache.capacity }}
+            - name: FETCH_CACHE_CAPACITY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $ghCache.prsForCommitTTL }}
+            - name: PRS_FOR_COMMIT_TTL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $ghCache.commitTTL }}
+            - name: COMMIT_TTL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- /*
+            PR_LABEL_ENABLED defaults false in the bridge. Only render the env
+            var (and the optional custom label names) when explicitly enabled.
+            Empty names fall back to the bridge defaults (flux-success/flux-failed).
+            */}}
+            {{- $labels := .Values.config.github.labels | default dict }}
+            {{- if $labels.enabled }}
+            - name: PR_LABEL_ENABLED
+              value: "true"
+            {{- $labelNames := $labels.names | default dict }}
+            {{- with $labelNames.success }}
+            - name: PR_LABEL_SUCCESS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $labelNames.failed }}
+            - name: PR_LABEL_FAILED
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $labelNames.warning }}
+            - name: PR_LABEL_WARNING
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.config.llm.anthropicBaseUrl }}
+            - name: ANTHROPIC_BASE_URL
+              value: {{ .Values.config.llm.anthropicBaseUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.llm.openaiBaseUrl }}
+            - name: OPENAI_BASE_URL
+              value: {{ .Values.config.llm.openaiBaseUrl | quote }}
+            {{- else if .Values.ollama.enabled }}
+            # Auto-wire to the bundled Ollama sub-chart. fullnameOverride=ollama
+            # (in values.yaml) makes the Service name predictable. The Service
+            # lives in ollama.namespaceOverride if set, otherwise in the
+            # release namespace (helm sub-chart default).
+            - name: OPENAI_BASE_URL
+              value: "http://ollama.{{ .Values.ollama.namespaceOverride | default .Release.Namespace }}.svc.cluster.local:11434/v1"
+            {{- end }}
+            {{- if .Values.config.github.apiUrl }}
+            - name: GITHUB_API_URL
+              value: {{ .Values.config.github.apiUrl | quote }}
+            {{- end }}
+            {{- with .Values.config.kustomizations }}
+            {{- /* An empty pattern renders as nothing in the joined env var, so
+            `include: [""]` would silently admit everything; reject it here. */}}
+            {{- range concat (.include | default list) (.exclude | default list) }}
+            {{- if not (trim (toString .)) }}
+            {{- fail "config.kustomizations.include/exclude must not contain empty patterns" }}
+            {{- end }}
+            {{- end }}
+            {{- if .include }}
+            - name: KUSTOMIZATIONS_INCLUDE
+              value: {{ join "," .include | quote }}
+            {{- end }}
+            {{- if .exclude }}
+            - name: KUSTOMIZATIONS_EXCLUDE
+              value: {{ join "," .exclude | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with (default dict .Values.config.prFilter).requiredLabels }}
+            - name: PR_REQUIRED_LABELS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- /*
+            Render PR_ATTRIBUTE_PRUNES only when explicitly set to false — the
+            bridge defaults to true, so omitting keeps the Deployment minimal.
+            */}}
+            {{- if hasKey (default dict .Values.config.prFilter) "attributePrunes" }}
+            {{- if not .Values.config.prFilter.attributePrunes }}
+            - name: PR_ATTRIBUTE_PRUNES
+              value: "false"
+            {{- end }}
+            {{- end }}
+            {{- with .Values.config.failureAnalysis }}
+            - name: FAILURE_FETCH_LOGS
+              value: {{ .fetchLogs | quote }}
+            - name: FAILURE_FETCH_EVENTS
+              value: {{ .fetchEvents | quote }}
+            - name: FAILURE_FETCH_METRICS
+              value: {{ .fetchMetrics | quote }}
+            - name: FAILURE_FETCH_FLUX_INSTANCE
+              value: {{ .fetchFluxInstance | quote }}
+            {{- end }}
+            {{- $hmacName := include "flux-ai-bridge.hmacSecretName" . }}
+            {{- if $hmacName }}
+            - name: WEBHOOK_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $hmacName }}
+                  key: token
+            {{- end }}
+            {{- /*
+            Last, so these read like overrides. Kubernetes gives env priority
+            over envFrom, so an entry here replaces the same key from the
+            credentials Secret (e.g. an API key kept in its own Secret).
+            */}}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "flux-ai-bridge.secretName" . }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # ConfigMap-backed mount for the SKILL.md the bridge inlines into
+          # every LLM call. Always mounted — the ConfigMap is always
+          # rendered; the loader handles an empty file when both
+          # skill.default.enabled and skill.custom are unset.
+          volumeMounts:
+            - name: skill
+              mountPath: /skills
+              readOnly: true
+            {{- with .Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: skill
+          configMap:
+            name: {{ include "flux-ai-bridge.fullname" . }}-skill
+        {{- with .Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

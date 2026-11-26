@@ -1,0 +1,145 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: git-server
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: git-server-nginx
+  namespace: git-server
+data:
+  default.conf: |
+    server {
+      listen 8080 default_server;
+      access_log /dev/stdout;
+      error_log  /dev/stderr;
+
+      # Forward every request under /<repo>.git/ to git-http-backend via fcgiwrap.
+      location ~ ^/.*\.git(/.*)?$ {
+        client_max_body_size 0;
+        fastcgi_pass unix:/run/fcgiwrap.sock;
+        include /etc/nginx/fastcgi_params;
+        # Debian path. (Alpine ships only the dumb-protocol bits, not the backend.)
+        fastcgi_param SCRIPT_FILENAME    /usr/lib/git-core/git-http-backend;
+        fastcgi_param GIT_HTTP_EXPORT_ALL "1";
+        fastcgi_param GIT_PROJECT_ROOT   /serve;
+        fastcgi_param PATH_INFO          $uri;
+        fastcgi_param REMOTE_USER        $remote_user;
+        fastcgi_param REMOTE_ADDR        $remote_addr;
+        fastcgi_param CONTENT_LENGTH     $content_length;
+        fastcgi_param CONTENT_TYPE       $content_type;
+        fastcgi_param REQUEST_METHOD     $request_method;
+        fastcgi_param QUERY_STRING       $query_string;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git-server
+  namespace: git-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: git-server
+  template:
+    metadata:
+      labels:
+        app: git-server
+    spec:
+      initContainers:
+        - name: init-repo
+          image: debian:bookworm-slim
+          command:
+            - bash
+            - -exc
+            - |
+              apt-get update -qq
+              apt-get install -qq -y --no-install-recommends git ca-certificates >/dev/null
+              # Host repo is mounted read-only with the host UID; this container
+              # runs as root. We snapshot the *working tree* (not just HEAD) so
+              # uncommitted changes are picked up by the e2e suite without
+              # requiring a commit before each run. A fresh single-commit repo
+              # is built and cloned into the bare-served path.
+              git config --global user.email "e2e@local"
+              git config --global user.name  "e2e"
+              git config --global init.defaultBranch main
+              git config --global --add safe.directory '*'
+              mkdir -p /tmp/work
+              # tar avoids rsync's UID-preservation quirks and is always present.
+              # Exclude .git (we'll create our own) and bin/ (large untracked binary).
+              tar -C /source --exclude=./.git --exclude=./bin -cf - . \
+                | tar -C /tmp/work -xf -
+              cd /tmp/work
+              git init -q
+              git add -A
+              git commit -q -m "e2e snapshot"
+              git tag e2e-test
+              git clone --bare /tmp/work /serve/flux-ai-bridge.git
+              git -C /serve/flux-ai-bridge.git update-server-info
+              touch /serve/flux-ai-bridge.git/git-daemon-export-ok
+              chmod -R a+rX /serve
+          volumeMounts:
+            - name: source
+              mountPath: /source
+              readOnly: true
+            - name: serve
+              mountPath: /serve
+      containers:
+        - name: git-http
+          # Debian's `git` package ships /usr/lib/git-core/git-http-backend,
+          # which Alpine's does not. nginx → fcgiwrap → git-http-backend speaks
+          # the smart-HTTP protocol Flux source-controller (go-git) requires.
+          image: debian:bookworm-slim
+          command:
+            - bash
+            - -ec
+            - |
+              apt-get update -qq
+              apt-get install -qq -y --no-install-recommends \
+                git nginx fcgiwrap spawn-fcgi ca-certificates >/dev/null
+              cp /config/default.conf /etc/nginx/sites-enabled/default
+              mkdir -p /run/nginx /run/fcgiwrap
+              spawn-fcgi -s /run/fcgiwrap.sock -M 0666 -- /usr/sbin/fcgiwrap
+              exec nginx -g 'daemon off;'
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: serve
+              mountPath: /serve
+              readOnly: true
+            - name: nginx-config
+              mountPath: /config
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 192Mi
+      volumes:
+        - name: source
+          hostPath:
+            path: /flux-ai-bridge-src
+            type: Directory
+        - name: serve
+          emptyDir: {}
+        - name: nginx-config
+          configMap:
+            name: git-server-nginx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-server
+  namespace: git-server
+spec:
+  selector:
+    app: git-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

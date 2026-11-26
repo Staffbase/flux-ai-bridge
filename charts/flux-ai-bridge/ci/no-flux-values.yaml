@@ -1,0 +1,3 @@
+flux:
+  notification:
+    enabled: false

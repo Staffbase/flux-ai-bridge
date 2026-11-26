@@ -1,0 +1,36 @@
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: podinfo
+  namespace: podinfo
+spec:
+  interval: 5m
+  # Cap each Helm install/upgrade attempt at 2m. helm-controller only
+  # writes status.inventory.entries (the child Deployment/Service refs
+  # the bridge expands into its Resource Status table) AFTER the attempt
+  # finishes — success or failure. The default 5m means a broken install
+  # (`make e2e-broken` → --foo=bar postRenderer → pods never become
+  # ready) blocks the inventory write for 5 minutes; the bridge's
+  # readiness poll (3m) times out first and the Resource Status table
+  # only shows the kustomize-level inventory (Namespace + HelmRelease +
+  # HelmRepository), missing the chart's children. Shortening to 2m
+  # keeps helm-controller well inside the poll window so the inventory
+  # writes and expansion picks up Deployment/podinfo + Service/podinfo
+  # before the bridge gives up.
+  timeout: 2m
+  chart:
+    spec:
+      chart: podinfo
+      version: '6.x'
+      sourceRef:
+        kind: HelmRepository
+        name: podinfo
+  values:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi

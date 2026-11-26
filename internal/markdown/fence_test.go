@@ -1,0 +1,83 @@
+// Copyright 2026, Staffbase SE and contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package markdown
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestCloseOpenFence(t *testing.T) {
+	for name, tc := range map[string]struct{ in, want string }{
+		"balanced":            {"a\n```\nx\n```\nb", "a\n```\nx\n```\nb"},
+		"open backticks":      {"a\n```yaml\nx", "a\n```yaml\nx\n```"},
+		"open four backticks": {"````\nx\n```\ny", "````\nx\n```\ny\n````"},
+		"open tildes":         {"~~~\nx", "~~~\nx\n~~~"},
+		"tilde inside ticks":  {"```\n~~~\nx", "```\n~~~\nx\n```"},
+		"longer close":        {"```\nx\n`````\nafter", "```\nx\n`````\nafter"},
+		"indented 3":          {"   ~~~~\nx", "   ~~~~\nx\n~~~~"},
+		"indented 4 is code":  {"    ```\nx", "    ```\nx"},
+		"inline backticks":    {"use ```x``` inline", "use ```x``` inline"},
+		"backtick info":       {"``` a`b\nx", "``` a`b\nx"},
+		"closer with text":    {"```\nx\n``` not a close", "```\nx\n``` not a close\n```"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := CloseOpenFence(tc.in); got != tc.want {
+				t.Fatalf("CloseOpenFence(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTrackerListItemFences covers fences opened inside a list item: the
+// marker must not hide the opener, or the indented closer is taken for a new
+// opener and every following line counts as code (leaving its @mentions
+// live in a comment).
+func TestTrackerListItemFences(t *testing.T) {
+	for name, tc := range map[string]struct {
+		in   string
+		want []bool
+	}{
+		"bullet":         {"- ~~~\n  quoted code\n  ~~~\nprose @someone", []bool{true, true, true, false}},
+		"star backticks": {"* ```yaml\n  x: 1\n  ```\nprose", []bool{true, true, true, false}},
+		"ordered wide":   {"10. ~~~\n    code\n    ~~~\nprose", []bool{true, true, true, false}},
+		"list no fence":  {"- item\n  ~~~\n  code\n  ~~~\nprose", []bool{false, true, true, true, false}},
+		"thematic break": {"---\nprose", []bool{false, false}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var tr Tracker
+			lines := strings.Split(tc.in, "\n")
+			for i, line := range lines {
+				if got := tr.Line(line); got != tc.want[i] {
+					t.Fatalf("line %d %q inside = %v, want %v", i, line, got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestTrackerMarksDelimitersAndContent(t *testing.T) {
+	var tr Tracker
+	var inside []bool
+	for _, line := range strings.Split("text\n````\n```\ncode\n````\nafter", "\n") {
+		inside = append(inside, tr.Line(line))
+	}
+	want := []bool{false, true, true, true, true, false}
+	for i := range want {
+		if inside[i] != want[i] {
+			t.Fatalf("line %d inside = %v, want %v (all: %v)", i, inside[i], want[i], inside)
+		}
+	}
+}
