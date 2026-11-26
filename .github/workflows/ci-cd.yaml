@@ -97,13 +97,22 @@ jobs:
     needs:
       - ci
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      pull-requests: write
+    permissions: {}
     steps:
+      # The branch ruleset requires a code owner review. A GITHUB_TOKEN
+      # approval doesn't count as one, but this GitHub App is exempt from it.
+      - name: Get App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.STAFFBASE_ACTIONS_CLIENT_ID }}
+          private-key: ${{ secrets.STAFFBASE_ACTIONS_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Approve and enable auto-merge
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           gh pr review "$PR_URL" --approve
