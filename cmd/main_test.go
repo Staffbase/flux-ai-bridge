@@ -110,20 +110,32 @@ func TestNewDedupe_ConfiguredPersistenceFailsClosed(t *testing.T) {
 }
 
 // The Redis URL parse error quotes the raw URL, userinfo included; the
-// startup error must not carry it into the log.
+// startup error must not carry it into the log. Its inner error quotes part
+// of the input too: without the '@', the password is parsed as the port (or
+// carries an invalid escape), so only the kind of problem may be reported.
 func TestNewDedupe_MalformedURLErrorOmitsCredentials(t *testing.T) {
-	t.Setenv("DEDUPE_PERSISTENCE_SENTINEL_ADDRS", "")
-	t.Setenv("DEDUPE_PERSISTENCE_URL", "redis://user:s3cr3t-pw@redis.example.com:bad")
-	_, err := newDedupe(slog.New(slog.NewTextHandler(io.Discard, nil)), "test:")
-	if err == nil {
-		t.Fatal("newDedupe() returned no error for a malformed URL")
+	tests := []struct{ name, url, cause string }{
+		{"bad port", "redis://user:s3cr3t-pw@redis.example.com:bad", "port"},
+		{"missing @", "redis://user:s3cr3t-pw/redis.example.com:6379", "port"},
+		{"bad escape in password", "redis://user:s3cr3t-pw%zz@redis.example.com:6379", "escape"},
+		{"space in password without @", "redis://user:s3cr3t pw/redis.example.com", "port"},
 	}
-	for _, leak := range []string{"s3cr3t-pw", "user:", "redis://"} {
-		if strings.Contains(err.Error(), leak) {
-			t.Errorf("error contains %q: %v", leak, err)
-		}
-	}
-	if !strings.Contains(err.Error(), "port") {
-		t.Errorf("error lost the cause (invalid port): %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DEDUPE_PERSISTENCE_SENTINEL_ADDRS", "")
+			t.Setenv("DEDUPE_PERSISTENCE_URL", tc.url)
+			_, err := newDedupe(slog.New(slog.NewTextHandler(io.Discard, nil)), "test:")
+			if err == nil {
+				t.Fatal("newDedupe() returned no error for a malformed URL")
+			}
+			for _, leak := range []string{"s3cr3t", "%zz", "user:", "redis://"} {
+				if strings.Contains(err.Error(), leak) {
+					t.Errorf("error contains %q: %v", leak, err)
+				}
+			}
+			if !strings.Contains(err.Error(), tc.cause) {
+				t.Errorf("error lost the cause (%s): %v", tc.cause, err)
+			}
+		})
 	}
 }

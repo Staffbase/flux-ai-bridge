@@ -10,10 +10,11 @@ Health check:
 
 {{- if contains "ClusterIP" .Values.service.type }}
 
-To verify the health endpoint locally:
+To verify the health endpoint locally (replace <your-context> with the kube
+context you installed into):
 
-  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "flux-ai-bridge.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
-  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:{{ .Values.service.port }}
+  export POD_NAME=$(kubectl --context <your-context> get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "flux-ai-bridge.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  kubectl --context <your-context> --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:{{ .Values.service.port }}
   curl http://127.0.0.1:8080/healthz
 
 {{- end }}
@@ -72,6 +73,7 @@ You're running with provider=none — the bridge posts deterministic kstatus
 comments without contacting any LLM. To add an LLM-written analysis on top:
 
   helm upgrade {{ .Release.Name }} oci://ghcr.io/staffbase/charts/flux-ai-bridge \
+    --kube-context <your-context> \
     --version {{ .Chart.Version }} --namespace {{ .Release.Namespace }} \
     --reset-then-reuse-values \
     --set config.llm.provider=claude   # or openai-compatible

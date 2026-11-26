@@ -107,7 +107,9 @@ func TestDisabled_AlwaysMisses(t *testing.T) {
 	if v, ok := c.Get(ctx, "k"); ok || v != nil {
 		t.Fatalf("Disabled.Get = (%v, %v), want (nil, false)", v, ok)
 	}
-	c.Delete(ctx, "k") // must not panic
+	if err := c.Delete(ctx, "k"); err != nil { // must not panic
+		t.Fatalf("Delete: %v", err)
+	}
 }
 
 // TestLRU_Delete pins Delete's contract: after Delete, Get returns
@@ -118,11 +120,15 @@ func TestLRU_Delete(t *testing.T) {
 	c := fetchcache.NewLRU(16)
 	ctx := context.Background()
 	c.Put(ctx, "k", []byte("v"), 0)
-	c.Delete(ctx, "k")
+	if err := c.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
 	if v, ok := c.Get(ctx, "k"); ok || v != nil {
 		t.Fatalf("Get after Delete = (%q, %v), want (nil, false)", v, ok)
 	}
-	c.Delete(ctx, "missing") // must not panic on absent key
+	if err := c.Delete(ctx, "missing"); err != nil { // must not panic on absent key
+		t.Fatalf("Delete: %v", err)
+	}
 }
 
 // TestRedis_Delete pins the same contract on the Redis backend so
@@ -134,11 +140,34 @@ func TestRedis_Delete(t *testing.T) {
 	c := fetchcache.NewRedis(client, "test:", 500*time.Millisecond, 0)
 	ctx := context.Background()
 	c.Put(ctx, "k", []byte("v"), 0)
-	c.Delete(ctx, "k")
+	if err := c.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
 	if v, ok := c.Get(ctx, "k"); ok || v != nil {
 		t.Fatalf("Get after Delete = (%q, %v), want (nil, false)", v, ok)
 	}
-	c.Delete(ctx, "missing") // must not panic on absent key
+	if err := c.Delete(ctx, "missing"); err != nil { // must not panic on absent key
+		t.Fatalf("Delete: %v", err)
+	}
+}
+
+// A Delete the backend refused must say so: the commenter drops its comment
+// and label records with it before a GitHub write, and a record that silently
+// survived could later vouch for a state the PR no longer has.
+func TestRedis_DeleteReportsBackendError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	c := fetchcache.NewRedis(client, "test:", 500*time.Millisecond, 0)
+	ctx := context.Background()
+	c.Put(ctx, "k", []byte("v"), 0)
+	if err := c.Delete(ctx, "missing"); err != nil {
+		t.Fatalf("Delete of an absent key = %v, want nil", err)
+	}
+	mr.SetError("ERR boom")
+	if err := c.Delete(ctx, "k"); err == nil {
+		t.Fatal("Delete with a failing backend returned nil; the entry is still there")
+	}
 }
 
 // TestRedis_RoundTrip verifies the Redis backend against miniredis (in-
@@ -270,7 +299,9 @@ func TestRedis_WritesSurviveCancelledContext(t *testing.T) {
 	if !mr.Exists("test:k") {
 		t.Fatal("Put with a cancelled context did not write")
 	}
-	c.Delete(ctx, "k")
+	if err := c.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
 	if mr.Exists("test:k") {
 		t.Fatal("Delete with a cancelled context did not delete")
 	}

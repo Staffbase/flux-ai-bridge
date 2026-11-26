@@ -243,7 +243,9 @@ config:
     #                       restart. Matches the bridge's event-driven
     #                       contract: a PR head is analysed once.
     #   - "0"            → dedupe disabled entirely. Every event runs the
-    #                       pipeline.
+    #                       pipeline. Not allowed with github.labels.enabled
+    #                       unless persistence is on: label aggregation
+    #                       needs the dedupe record.
     #   - positive dur.  → TTL-bounded. Useful for "give me a refresh post
     #                       once a day" — e.g. "24h" or "1h". Go duration
     #                       syntax.

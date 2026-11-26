@@ -383,6 +383,38 @@ func TestBuildFileSetWithComponents(t *testing.T) {
 	}
 }
 
+// A spec.path that exists but holds no manifests still builds in Flux: it
+// generates an empty kustomization there and adds spec.components. The build
+// set is then the components' files. A missing spec.path, or one with no
+// build inputs and no components, stays an error.
+func TestBuildFileSetWithComponents_ComponentsOnly(t *testing.T) {
+	files := map[string]string{
+		"apps/empty/README.md":              "docs",
+		"components/tls/kustomization.yaml": "kind: Component\npatches:\n  - path: tls.yaml\n",
+		"components/tls/tls.yaml":           "kind: Deployment\n",
+	}
+	tree, err := ReadTarGz(bytes.NewReader(makeTarGz(t, files)))
+	if err != nil {
+		t.Fatalf("ReadTarGz: %v", err)
+	}
+	comps := Components{Paths: []string{"../../components/tls"}}
+	set, err := tree.BuildFileSetWithComponents("apps/empty", comps)
+	if err != nil {
+		t.Fatalf("BuildFileSetWithComponents: %v", err)
+	}
+	for _, p := range []string{"components/tls/kustomization.yaml", "components/tls/tls.yaml"} {
+		if _, ok := set[p]; !ok {
+			t.Errorf("component file %s missing; set = %v", p, keys(set))
+		}
+	}
+	if _, err := tree.BuildFileSetWithComponents("apps/gone", comps); err == nil {
+		t.Error("a missing spec.path must fail the build set, components or not")
+	}
+	if _, err := tree.BuildFileSetWithComponents("apps/empty", Components{}); err == nil {
+		t.Error("a spec.path with no build inputs and no components must fail the build set")
+	}
+}
+
 func keys(m map[string]struct{}) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

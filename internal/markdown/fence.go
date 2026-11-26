@@ -35,37 +35,56 @@ func (f Fence) String() string {
 // opens with at least three backticks or tildes (indented at most three
 // spaces) and closes with a run of the same character at least as long and
 // nothing after it. A backtick or tilde line that doesn't close the open
-// block is part of its content. A fence may also open right after a list
-// marker (`- ~~~`); its closer is then indented to the item's content, and
-// the block also ends with the item: at the first non-blank line indented
-// less than the item's content (an outdented paragraph or a sibling item).
+// block is part of its content. A fence may also open inside a list item,
+// right after its marker (`- ~~~`) or on a continuation line indented to the
+// item's content; its closer is then indented to the item's content, and the
+// block also ends with the item: at the first non-blank line indented less
+// than the item's content (an outdented paragraph or a sibling item). Only
+// the innermost item is tracked; once a line leaves it, later fences count
+// as top-level ones.
 type Tracker struct {
 	open   Fence
 	inside bool
 	indent int // content indent of the list item that opened the block
+	item   int // content indent of the list item outside a block, or 0
 }
 
 // Line feeds the next line and reports whether it belongs to a fenced block,
 // counting the opening and closing delimiter lines as part of it.
 func (t *Tracker) Line(line string) bool {
-	if t.inside && t.indent > 0 && strings.TrimSpace(line) != "" &&
-		len(line)-len(strings.TrimLeft(line, " ")) < t.indent {
+	lead := len(line) - len(strings.TrimLeft(line, " "))
+	if t.inside && t.indent > 0 && !blank(line) && lead < t.indent {
 		t.inside = false // the list item, and with it the block, ended
 	}
 	if t.inside {
 		f, rest, ok := delimiter(dedent(line, t.indent))
-		if ok && f.Char == t.open.Char && f.Len >= t.open.Len && strings.TrimSpace(rest) == "" {
+		if ok && f.Char == t.open.Char && f.Len >= t.open.Len && blank(rest) {
 			t.inside = false
 		}
 		return true
 	}
-	w := listMarkerWidth(line)
-	f, rest, ok := delimiter(line[w:])
+	w, body := listMarkerWidth(line), line
+	switch {
+	case w > 0:
+		t.item, body = w, line[w:] // a new item; the fence may follow its marker
+	case t.item > 0 && lead >= t.item:
+		w, body = t.item, dedent(line, t.item) // a continuation line of the item
+	case !blank(line):
+		t.item = 0 // the line left the item
+	}
+	f, rest, ok := delimiter(body)
 	if ok && (f.Char != '`' || !strings.Contains(rest, "`")) {
 		t.open, t.inside, t.indent = f, true, w
 		return true
 	}
 	return false
+}
+
+// blank reports whether line holds only spaces and tabs (and the \r of a
+// CRLF line ending): CommonMark's blank line, and all it allows after a
+// closing fence. Other Unicode spaces, such as U+00A0, are content.
+func blank(line string) bool {
+	return strings.Trim(strings.TrimSuffix(line, "\r"), " \t") == ""
 }
 
 // listMarkerWidth returns the width of a list item marker that starts line

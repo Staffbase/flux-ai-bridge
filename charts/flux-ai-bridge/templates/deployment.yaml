@@ -42,6 +42,21 @@ fails closed when Redis is unreachable — would skip every PR.
 {{- if and $persistence.enabled (not .Values.valkey.enabled) (not $persistence.url) (not $sentinelBlk.enabled) }}
 {{- fail "config.dedupe.persistence.enabled=true needs a backend: set valkey.enabled=true (bundled), config.dedupe.persistence.url=redis://... (external), or config.dedupe.persistence.sentinel.enabled=true." }}
 {{- end }}
+{{- /*
+A zero or negative config.dedupe.ttl disables the in-memory dedupe cache, and
+with it the per-PR record of each Kustomization's outcome that PR labels
+aggregate. Labels would then follow the last event: a healthy Kustomization
+would replace another one's flux-failed with flux-success. Persistence
+ignores the TTL and keeps the record.
+*/}}
+{{- $dedupeTTL := "" }}
+{{- if hasKey .Values.config.dedupe "ttl" }}
+{{- $dedupeTTL = toString .Values.config.dedupe.ttl | trim }}
+{{- end }}
+{{- $dedupeOff := regexMatch "^-[0-9.]+[a-zµμ]|^[-+]?[0.]+([a-zµμ]+[0.]*)*$" $dedupeTTL }}
+{{- if and $dedupeOff ((.Values.config.github.labels | default dict).enabled) (not $persistence.enabled) }}
+{{- fail (printf "config.dedupe.ttl=%q disables dedupe, which PR label aggregation (config.github.labels.enabled=true) needs: a healthy Kustomization would replace another one's flux-failed with flux-success. Use a positive ttl or leave it empty, or enable config.dedupe.persistence." $dedupeTTL) }}
+{{- end }}
 {{- if not (include "flux-ai-bridge.mcpURL" .) }}
 {{- fail "config.mcp.url is required when flux-operator-mcp.enabled=false — point it at your flux-operator-mcp install." }}
 {{- end }}

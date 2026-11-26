@@ -751,10 +751,17 @@ func (c *Commenter) findPRsForCommitShared(ctx context.Context, owner, repo, sha
 		// work, not the waiters that coalesce onto it.
 		metrics.FetchCacheMisses.WithLabelValues("prs_walk").Inc()
 		var obs observedAt
-		result, err := c.resolvePRsForCommit(ctx, owner, repo, sha, &obs)
+		result, complete, err := c.resolvePRsForCommit(ctx, owner, repo, sha, &obs)
 		if err != nil {
 			c.prsForCommitSF.Forget(cacheKey)
 			return nil, err
+		}
+		if !complete {
+			// The walk failed after the direct lookup found PRs: serve those,
+			// but don't cache the incomplete set, so the next event walks
+			// again.
+			c.prsForCommitSF.Forget(cacheKey)
+			return result, nil
 		}
 		// The result is as old as the oldest per-commit lookup it reused, so
 		// it expires with that one: re-caching it for a full TTL would serve
@@ -804,17 +811,29 @@ func (c *Commenter) cachedPRsForCommit(ctx context.Context, cacheKey string) ([]
 // itself be the head of an open PR (a promotion PR from the dev branch), and
 // stopping at that PR would hide the PRs merged into the branch. For a
 // non-merge commit the walk ends after one (cached) commit lookup.
-func (c *Commenter) resolvePRsForCommit(ctx context.Context, owner, repo, sha string, obs *observedAt) ([]PRInfo, error) {
+//
+// The walk only adds PRs. When it fails after the direct lookup found some,
+// those (plus any the walk found before failing) are returned with complete
+// false instead of the error: they are this commit's own PRs, and failing the
+// lookup would leave them without a comment until the walk recovers. Without
+// direct matches the walk's error is returned.
+func (c *Commenter) resolvePRsForCommit(ctx context.Context, owner, repo, sha string, obs *observedAt) (prs []PRInfo, complete bool, err error) {
 	direct, err := c.listPRsForCommit(ctx, owner, repo, sha, obs)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	complete = true
 	walked, err := c.walkMergeParents(ctx, owner, repo, sha, obs)
 	if err != nil {
-		return nil, err
+		if len(direct) == 0 {
+			return nil, false, err
+		}
+		slog.Default().Warn("parent walk failed; using the commit's direct PR matches",
+			"owner", owner, "repo", repo, "sha", sha, "prs", len(direct), "error", err.Error())
+		complete = false
 	}
 	if len(direct) == 0 {
-		return walked, nil
+		return walked, complete, nil
 	}
 	seen := make(map[int]struct{}, len(direct))
 	for _, pr := range direct {
@@ -827,7 +846,7 @@ func (c *Commenter) resolvePRsForCommit(ctx context.Context, owner, repo, sha st
 			out = append(out, pr)
 		}
 	}
-	return out, nil
+	return out, complete, nil
 }
 
 // observedAt tracks when the oldest PR lookup a resolution used was fetched
@@ -1159,6 +1178,16 @@ func (c *Commenter) PostOrUpdateCommentKeyed(ctx context.Context, owner, repo, k
 	}
 
 	cacheKey := lastCommentCacheKey(owner, repo, prNumber, kustomizationNamespace, kustomizationName)
+	// The mutex above serializes this replica only. Another replica posting a
+	// different head of the same PR for the same scope would read the same
+	// record, and both swaps would delete the same predecessor, so one new
+	// comment would never be swept. The cross-replica lock makes the second
+	// replica wait and then swap the first one's comment.
+	ctx, unlock, err := c.lockCommentRecord(ctx, cacheKey)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	// Fast path: skip-if-unchanged. We remember the comment we last delivered
 	// for this (PR, scope) AND the hash of its body. If the new body hashes
@@ -1356,6 +1385,20 @@ func (c *Commenter) RemoveComment(ctx context.Context, owner, repo, kustomizatio
 	lock.Lock()
 	defer lock.Unlock()
 	cacheKey := lastCommentCacheKey(owner, repo, prNumber, kustomizationNamespace, kustomizationName)
+	// A recorded "no comment" needs no write, so the healthy steady state
+	// doesn't pay for the cross-replica lock that guards the deletes below.
+	if cached, hit := c.cache.Get(ctx, cacheKey); hit {
+		var none lastComment
+		if json.Unmarshal(cached, &none) == nil && none.None {
+			metrics.FetchCacheHits.WithLabelValues("last_comment").Inc()
+			return nil
+		}
+	}
+	ctx, unlock, err := c.lockCommentRecord(ctx, cacheKey)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	var ids []int64
 	var lc lastComment
 	if cached, hit := c.cache.Get(ctx, cacheKey); hit && json.Unmarshal(cached, &lc) == nil && (lc.ID != 0 || lc.None) {
@@ -1372,6 +1415,14 @@ func (c *Commenter) RemoveComment(ctx context.Context, owner, repo, kustomizatio
 		}
 		for _, cm := range mine {
 			ids = append(ids, cm.GetID())
+		}
+	}
+	// Drop the record before deleting: if the "no comment" record below
+	// doesn't land, a record still naming the deleted comment would make a
+	// later post of the same state skip, leaving the PR with no comment.
+	if len(ids) > 0 {
+		if err := c.cache.Delete(ctx, cacheKey); err != nil {
+			return fmt.Errorf("drop comment record before removing: %w", err)
 		}
 	}
 	for _, id := range ids {
@@ -1479,13 +1530,56 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return lifecycle.Detach(ctx, cleanupTimeout)
 }
 
+// Cross-replica comment lock. commentWorkTimeout bounds the list and create
+// calls made under it; the deletes after a create get cleanupTimeout of their
+// own, so the TTL covers both plus a margin for the record write. A crashed
+// holder blocks the scope for at most commentLockTTL.
+const (
+	commentWorkTimeout = 60 * time.Second
+	commentLockTTL     = commentWorkTimeout + cleanupTimeout + 10*time.Second
+	commentLockPoll    = 200 * time.Millisecond
+)
+
+// lockCommentRecord takes the cross-replica lock for one (PR, scope) comment
+// record (`<record key>:lock`, see fetchcache TryLock), waiting while another
+// replica holds it, until ctx ends. The returned context bounds the caller's
+// GitHub calls so they finish before the lock can lapse. A lock that can't be
+// asked for (a backend error) is logged and the work runs serialized within
+// this replica only, as SetPRLabels does; the in-memory backend grants it at
+// once.
+func (c *Commenter) lockCommentRecord(ctx context.Context, cacheKey string) (context.Context, func(), error) {
+	for {
+		start := time.Now() // taken before the lock, so the work ends no later
+		release, ok, err := c.cache.TryLock(ctx, cacheKey+":lock", commentLockTTL)
+		if err != nil {
+			slog.Default().Warn("PR comment lock unavailable; proceeding without cross-replica serialization",
+				"key", cacheKey, "error", err.Error())
+			return ctx, func() {}, nil
+		}
+		if ok {
+			wctx, cancel := context.WithDeadline(ctx, start.Add(commentWorkTimeout))
+			return wctx, func() { cancel(); release() }, nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx, nil, fmt.Errorf("wait for PR comment lock: %w", ctx.Err())
+		case <-time.After(commentLockPoll):
+		}
+	}
+}
+
 // createComment posts a fresh comment and returns its ID. It drops the
 // scope's cached record first: until the caller records the new comment (see
 // recordComment), the record must not claim a state the PR doesn't have — a
 // stale ID, or "no comment" (which would make RemoveComment skip the new
 // one). A cold cache sends the next post or removal to the list-based path.
+// If the record can't be dropped, nothing is posted: the record would then
+// outlive the swap, and a later post of the old state would trust it and skip
+// the sweep, leaving both comments up.
 func (c *Commenter) createComment(ctx context.Context, owner, repo string, prNumber int, commentBody, cacheKey string) (int64, error) {
-	c.cache.Delete(ctx, cacheKey)
+	if err := c.cache.Delete(ctx, cacheKey); err != nil {
+		return 0, fmt.Errorf("drop comment record before posting: %w", err)
+	}
 	newComment, resp, err := c.client.Issues.CreateComment(ctx, owner, repo, prNumber, &gh.IssueComment{Body: gh.String(commentBody)})
 	recordRateLimit(resp, err)
 	if err != nil {
@@ -1622,8 +1716,9 @@ const (
 // nothing — not even the outcome record — and returns ErrPRLabelsLocked, so
 // the caller retries on a later event. If the lock can't be asked for (a
 // backend error), the reconcile runs anyway, as it does when the outcome
-// record can't be read. The in-memory backend serves one replica and grants
-// the lock at once.
+// record can't be read. It does not run when the record can't be dropped
+// before the first label write: that error is returned and nothing changes.
+// The in-memory backend serves one replica and grants the lock at once.
 //
 // Any other API error is returned to the caller. The caller (processor)
 // treats label failures as non-fatal — the comment has already been
@@ -1707,9 +1802,11 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 	// The record describes the labels this reconcile is about to change. Drop
 	// it before the first mutation: if a later step fails, a call with the old
 	// outcome must reconcile again rather than trust a record the PR no
-	// longer matches (e.g. both the old and the new label on it).
-	if hit {
-		c.cache.Delete(ctx, cacheKey)
+	// longer matches (e.g. both the old and the new label on it). The drop
+	// must be confirmed, so no label changes when it fails; it runs on a miss
+	// too, since a failed read can hide a record that is still there.
+	if err := c.cache.Delete(ctx, cacheKey); err != nil {
+		return fmt.Errorf("drop label outcome record before reconciling: %w", err)
 	}
 	if len(add) > 0 {
 		_, resp, err := c.client.Issues.AddLabelsToIssue(ctx, owner, repo, prNumber, add)

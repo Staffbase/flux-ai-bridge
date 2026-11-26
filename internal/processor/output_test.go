@@ -80,7 +80,11 @@ func TestNeutralizeMentions(t *testing.T) {
 		// A list-item fence never closed ends with its item: prose after the
 		// item is neutralized again.
 		"- ~~~\n  @heidi\n\nOutside: ping @ops": "- ~~~\n  @heidi\n\nOutside: ping @" + zw + "ops",
-		"no mentions here":                      "no mentions here",
+		// The same for a fence opened on a continuation line of the item,
+		// ended by outdented prose or by a sibling item.
+		"- item\n  ~~~\n  @heidi\n\nOutside: ping @ops": "- item\n  ~~~\n  @heidi\n\nOutside: ping @" + zw + "ops",
+		"- item\n  ~~~\n  @heidi\n- ping @ops":          "- item\n  ~~~\n  @heidi\n- ping @" + zw + "ops",
+		"no mentions here":                              "no mentions here",
 	} {
 		if got := neutralizeMentions(in); got != want {
 			t.Errorf("neutralizeMentions(%q) = %q, want %q", in, got, want)

@@ -55,10 +55,11 @@ func (c *mapCache) Put(_ context.Context, key string, value []byte, _ time.Durat
 	c.m[key] = value
 }
 
-func (c *mapCache) Delete(_ context.Context, key string) {
+func (c *mapCache) Delete(_ context.Context, key string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.m, key)
+	return nil
 }
 
 // TryLock always grants the lock, like the in-memory backend.

@@ -104,15 +104,17 @@ func (c *redisCache) Put(ctx context.Context, key string, value []byte, ttl time
 	}
 }
 
-// Delete removes the entry for key. No-op on cache miss; logs and
-// returns on backend error (fail-open).
-func (c *redisCache) Delete(ctx context.Context, key string) {
+// Delete removes the entry for key. No-op on cache miss; logs and returns
+// a backend error, so a caller can tell that the entry may still be there.
+func (c *redisCache) Delete(ctx context.Context, key string) error {
 	ctx, cancel := lifecycle.Detach(ctx, c.opTimeout)
 	defer cancel()
 	if err := c.client.Del(ctx, c.keyPrefix+key).Err(); err != nil {
 		slog.Default().Warn("fetchcache: redis DEL failed",
 			"key", key, "error", err.Error())
+		return fmt.Errorf("fetchcache: delete %q: %w", key, err)
 	}
+	return nil
 }
 
 // TryLock takes the lock with `SET <key> <token> NX PX <ttl>` (go-redis sends

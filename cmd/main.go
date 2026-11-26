@@ -472,16 +472,28 @@ func newDedupe(logger *slog.Logger, keyPrefix string) (*dedupe.Cache, error) {
 	return dedupe.New(d, capacity), nil
 }
 
-// withoutURL drops the raw URL from a URL parse error. url.Error quotes the
-// whole input, userinfo included, so a malformed DEDUPE_PERSISTENCE_URL
-// would put the Redis password into the startup log. The inner error still
-// names what is wrong (e.g. an invalid port).
+// withoutURL replaces a URL parse error with the kind of problem alone.
+// url.Error quotes the whole input, userinfo included, and its inner error
+// quotes part of it: without the '@', the password is read as the port
+// (`invalid port ":<password>"`), and an escape or host error quotes the
+// offending text. Either would put the Redis password into the startup log.
 func withoutURL(err error) error {
 	var ue *url.Error
-	if errors.As(err, &ue) {
-		return ue.Err
+	if !errors.As(err, &ue) {
+		return err
 	}
-	return err
+	var escErr url.EscapeError
+	var hostErr url.InvalidHostError
+	switch {
+	case errors.As(ue.Err, &escErr):
+		return errors.New("malformed URL: invalid percent-escape")
+	case errors.As(ue.Err, &hostErr):
+		return errors.New("malformed URL: invalid character in host")
+	case strings.HasPrefix(ue.Err.Error(), "invalid port"):
+		return errors.New("malformed URL: invalid port")
+	default:
+		return errors.New("malformed URL")
+	}
 }
 
 // buildResolver populates the readiness Resolver from MCP discovery. Returns

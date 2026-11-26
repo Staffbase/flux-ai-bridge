@@ -827,7 +827,8 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	@#   4. Annotate GitRepository, HelmChart and HelmRelease with a reconcile
 	@#      timestamp, one after the other, and wait until each has handled
 	@#      it, so the release runs the new chart before step 5 restarts it
-	@#      (instead of waiting for their poll intervals, 30s / 1m).
+	@#      (instead of waiting for their poll intervals, 30s / 1m). Fail
+	@#      when the HelmRelease isn't Ready afterwards (failed upgrade).
 	@#   5. Force a deployment rollout. The image tag is unchanged and the
 	@#      chart sets pullPolicy=Never, so the kubelet has no signal that
 	@#      anything changed unless we tell it to recreate the pods.
@@ -853,6 +854,9 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	@# Reconcile source → chart → release in order and wait for each to
 	@# handle the request, so the restart below runs against the Deployment
 	@# from the new chart and values, not the one before Flux applied them.
+	@# A release that handled the request but failed the upgrade isn't Ready
+	@# (kubectl wait also checks the condition's observedGeneration): stop
+	@# there instead of restarting the old Deployment.
 	@echo "==> Reconciling the chart source, the HelmChart and the bridge HelmRelease"
 	@set -e; ts=$$(date +%s); \
 	kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
@@ -869,7 +873,14 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
 	  helmrelease/flux-ai-bridge reconcile.fluxcd.io/requestedAt=$$ts; \
 	kubectl --context $(CONTEXT) -n flux-system wait helmrelease/flux-ai-bridge \
-	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=10m
+	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=10m; \
+	kubectl --context $(CONTEXT) -n flux-system wait helmrelease/flux-ai-bridge \
+	  --for=condition=Ready --timeout=1m || { \
+	  echo "ERROR: HelmRelease flux-ai-bridge is not Ready after the reconcile, so the chart change wasn't applied:" >&2; \
+	  kubectl --context $(CONTEXT) -n flux-system get helmrelease/flux-ai-bridge \
+	    -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' >&2; \
+	  exit 1; \
+	}
 	@# Also re-reconcile the test workload Kustomization so edits under
 	@# e2e/podinfo-kustomize/ land immediately (and a fresh Flux event
 	@# fires at the bridge for downstream test flows that watch for one).

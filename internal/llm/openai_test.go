@@ -23,7 +23,9 @@ import (
 
 	openai "github.com/openai/openai-go/v3"
 	openaiOption "github.com/openai/openai-go/v3/option"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/staffbase/flux-ai-bridge/internal/config"
+	"github.com/staffbase/flux-ai-bridge/internal/metrics"
 )
 
 // The output cap must reach the backend in the field it honours: Ollama reads
@@ -61,5 +63,27 @@ func TestOpenAIAnalyzer_TokenCapField(t *testing.T) {
 				t.Errorf("%s = %v sent too, want it absent", tc.otherField, got)
 			}
 		})
+	}
+}
+
+// LLMInputTokens counts uncached input, as the Claude analyzer does
+// (Anthropic's input_tokens excludes cache reads). OpenAI's prompt_tokens
+// includes the cached part, so only the remainder may be added.
+func TestOpenAIAnalyzer_InputTokensExcludeCached(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":3000,"completion_tokens":5,"total_tokens":3005,"prompt_tokens_details":{"cached_tokens":2000}}}`))
+	}))
+	defer srv.Close()
+
+	a := NewOpenAIAnalyzer(&config.Config{LLMModel: "m"})
+	a.client = openai.NewClient(openaiOption.WithBaseURL(srv.URL), openaiOption.WithMaxRetries(0))
+
+	before := testutil.ToFloat64(metrics.LLMInputTokens)
+	if _, err := a.Analyze(context.Background(), "", "hello"); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.LLMInputTokens) - before; got != 1000 {
+		t.Errorf("LLMInputTokens grew by %v, want 1000 (prompt 3000 minus 2000 cached)", got)
 	}
 }

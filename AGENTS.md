@@ -92,8 +92,6 @@ and issue, is public.
 - **Commits, branches and PRs:** conventional-commit scopes without ticket keys (`fix(processor): ...`), descriptive
   branch names, and no links to internal tools. PR descriptions follow
   [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md).
-- **New dependencies** (Go modules, sub-charts, base images) use Apache-2.0, MIT, BSD or ISC. Any other license needs a
-  maintainer's approval before merge; GPL, AGPL and SSPL are not added.
 - Exception: "autodev" stays. Link it to <https://github.com/Staffbase/autodev-action> where it is introduced.
 
 ## Chart releases

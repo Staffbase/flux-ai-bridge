@@ -149,7 +149,9 @@ type Components struct {
 // A startDir without a kustomization file is built the way Flux's
 // kustomize-controller generates one for it: every .yaml/.yml file below it,
 // except that a subdirectory with its own kustomization file is included as a
-// kustomize directory (its build inputs, not every file in it).
+// kustomize directory (its build inputs, not every file in it). A startDir
+// that exists but holds no manifests builds from its components alone; a
+// missing startDir, or one with no build inputs at all, is an error.
 //
 // Remote references (URLs, git::/oci:: bases) are skipped: they live in another
 // repo and can never be one of THIS repo's changed files. Any LOCAL reference
@@ -219,10 +221,14 @@ func (t *Tree) BuildFileSetWithComponents(startDir string, comps Components) (ma
 			return nil, err
 		}
 	} else {
-		files, kustDirs := t.generatedInputs(start)
-		if len(files) == 0 && len(kustDirs) == 0 {
+		// Flux fails a missing spec.path. A path without manifests still
+		// builds: Flux generates an empty kustomization there and adds
+		// spec.components to it, so an empty input set is only rejected once
+		// the components are resolved (below).
+		if !t.exists(start) {
 			return nil, fmt.Errorf("no kustomization or manifests at %q", start)
 		}
+		files, kustDirs := t.generatedInputs(start)
 		for _, f := range files {
 			out[f] = struct{}{}
 		}
@@ -247,6 +253,9 @@ func (t *Tree) BuildFileSetWithComponents(startDir string, comps Components) (ma
 		if err := walk(target); err != nil {
 			return nil, fmt.Errorf("component %q: %w", c, err)
 		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no kustomization or manifests at %q", start)
 	}
 	return out, nil
 }

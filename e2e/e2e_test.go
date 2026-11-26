@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -404,19 +405,36 @@ func TestPipelineProducesRealGitHubComment(t *testing.T) {
 	// No synthetic webhook, no comment deletion, no mock-llm reset. The
 	// real Flux pipeline drives the bridge naturally — we just poll
 	// GitHub for the bridge marker on the configured PR.
+	//
+	// The comment carries no head SHA, so tie it to the selected head
+	// another way: it must be written after that head commit was made, and,
+	// when GITHUB_APP_ID is set, by that App. A leftover comment for an
+	// earlier head (or from another bridge) doesn't count.
+	headDate, err := lookupCommitDate(cfg, cfg.sha)
+	if err != nil {
+		t.Fatalf("look up commit %s in %s: %v", cfg.sha, cfg.repo, err)
+	}
+	appID := os.Getenv("GITHUB_APP_ID")
 	deadline := time.Now().Add(pipelineDeadline())
 	var found map[string]any
+	var stale int
 	for time.Now().Before(deadline) {
 		comments, err := listPRComments(cfg)
 		if err != nil {
 			t.Logf("listPRComments: %v (will retry)", err)
 		} else {
+			stale = 0
 			for _, c := range comments {
 				body, _ := c["body"].(string)
-				if strings.Contains(body, "<!-- flux-ai-bridge") {
-					found = c
-					break
+				if !strings.Contains(body, "<!-- flux-ai-bridge") {
+					continue
 				}
+				if !commentByApp(c, appID) || !commentWrittenSince(c, headDate) {
+					stale++
+					continue
+				}
+				found = c
+				break
 			}
 		}
 		if found != nil {
@@ -425,10 +443,11 @@ func TestPipelineProducesRealGitHubComment(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}
 	if found == nil {
-		t.Fatalf("no bridge comment with marker on PR #%d in repo %s within %s — "+
+		t.Fatalf("no bridge comment with marker for head %s on PR #%d in repo %s within %s "+
+			"(%d marker comment(s) ignored: written before the head commit, or not by App %q) — "+
 			"if the cluster is long-running and the PR head SHA was already analyzed, "+
 			"rollout-restart the bridge (`make e2e-update`) to clear in-memory dedupe, and delete its PR comment (an unchanged state isn't re-posted)",
-			cfg.prNumber, cfg.repo, pipelineDeadline())
+			cfg.sha, cfg.prNumber, cfg.repo, pipelineDeadline(), stale, appID)
 	}
 
 	body, _ := found["body"].(string)
@@ -504,6 +523,72 @@ func requireRealGitHubEnv(t *testing.T) realGHConfig {
 	return cfg
 }
 
+// githubClient sends the requests that carry GITHUB_TOKEN. It follows a
+// redirect only within the https origin it started on: net/http keeps the
+// Authorization header on a redirect to the same host, even from https to
+// http.
+var githubClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if req.URL.Scheme != "https" || req.URL.Host != via[0].URL.Host {
+			return fmt.Errorf("refusing redirect to %s: the request carries GITHUB_TOKEN", req.URL.Redacted())
+		}
+		return nil
+	},
+}
+
+// lookupCommitDate returns the committer date of commit sha via
+// GET /commits/{sha}.
+func lookupCommitDate(cfg realGHConfig, sha string) (time.Time, error) {
+	url := fmt.Sprintf("%s/repos/%s/commits/%s", cfg.apiURL, cfg.repo, sha)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := githubClient.Do(req)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("get commit: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, fmt.Errorf("GitHub returned %s", resp.Status)
+	}
+	var commit struct {
+		Commit struct {
+			Committer struct {
+				Date time.Time `json:"date"`
+			} `json:"committer"`
+		} `json:"commit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&commit); err != nil {
+		return time.Time{}, fmt.Errorf("decode commit response: %w", err)
+	}
+	if commit.Commit.Committer.Date.IsZero() {
+		return time.Time{}, errors.New("commit response has no committer date")
+	}
+	return commit.Commit.Committer.Date, nil
+}
+
+// commentWrittenSince reports whether an issue comment was created or last
+// updated at or after t.
+func commentWrittenSince(c map[string]any, t time.Time) bool {
+	raw, _ := c["updated_at"].(string)
+	updated, err := time.Parse(time.RFC3339, raw)
+	return err == nil && !updated.Before(t)
+}
+
+// commentByApp reports whether an issue comment was posted by the GitHub App
+// appID. An empty appID accepts any author.
+func commentByApp(c map[string]any, appID string) bool {
+	if appID == "" {
+		return true
+	}
+	app, _ := c["performed_via_github_app"].(map[string]any)
+	id, ok := app["id"].(float64)
+	return ok && strconv.FormatInt(int64(id), 10) == strings.TrimSpace(appID)
+}
+
 // lookupPRHeadSHA fetches a specific PR's head SHA via GET /pulls/{number}.
 // Used when GITHUB_PR_NUMBER is pinned but GITHUB_PR_SHA is not.
 func lookupPRHeadSHA(cfg realGHConfig, prNumber int) (string, error) {
@@ -511,7 +596,7 @@ func lookupPRHeadSHA(cfg realGHConfig, prNumber int) (string, error) {
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.token)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := githubClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("get PR: %w", err)
 	}
@@ -542,7 +627,7 @@ func discoverOpenPR(cfg realGHConfig) (realGHConfig, error) {
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.token)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := githubClient.Do(req)
 	if err != nil {
 		return realGHConfig{}, fmt.Errorf("list open PRs: %w", err)
 	}
@@ -581,7 +666,7 @@ func listPRComments(cfg realGHConfig) ([]map[string]any, error) {
 	req.Header.Set("Authorization", "Bearer "+cfg.token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := githubClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -236,6 +236,60 @@ func TestFindPRsForCommit_DirectHitStillWalksMergeParents(t *testing.T) {
 	}
 }
 
+// The parent walk only adds PRs to the direct lookup's. A walk that fails
+// (a 5xx, a rate limit on one ancestor) must not throw away the PRs the
+// direct lookup already found for this very commit, and the incomplete
+// result must not be cached, so the next event walks again.
+func TestFindPRsForCommit_WalkFailureKeepsDirectMatches(t *testing.T) {
+	const mergeSHA, featureHead = "merge0001", "feature1"
+	var walkBroken atomic.Bool
+	walkBroken.Store(true)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/"+mergeSHA+"/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 1, "state": "open"}})
+	})
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/"+mergeSHA, func(w http.ResponseWriter, _ *http.Request) {
+		if walkBroken.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"sha": mergeSHA, "parents": []map[string]any{{"sha": "dev0000"}, {"sha": featureHead}}})
+	})
+	mux.HandleFunc("/api/v3/repos/owner/repo/commits/"+featureHead+"/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"number": 7, "state": "open"}})
+	})
+	serveNonMergeCommit(mux, "dev0000")
+	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: fetchcache.NewLRU(64)})
+	ctx := context.Background()
+
+	numbers := func(prs []bridgegithub.PRInfo) []int {
+		var out []int
+		for _, pr := range prs {
+			out = append(out, pr.Number)
+		}
+		return out
+	}
+	prs, err := c.FindPRsForCommit(ctx, "owner", "repo", mergeSHA)
+	if err != nil {
+		t.Fatalf("FindPRsForCommit with a failing walk: %v; want the direct match", err)
+	}
+	if got := numbers(prs); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("PR numbers = %v, want [1] (the direct match)", got)
+	}
+
+	walkBroken.Store(false)
+	prs, err = c.FindPRsForCommit(ctx, "owner", "repo", mergeSHA)
+	if err != nil {
+		t.Fatalf("FindPRsForCommit after the walk recovered: %v", err)
+	}
+	if got := numbers(prs); len(got) != 2 || got[0] != 1 || got[1] != 7 {
+		t.Fatalf("PR numbers = %v, want [1 7]: the incomplete result was cached", got)
+	}
+}
+
 // TestFindPRsForCommit_CachesWholeResult pins the whole-resolution cache: a
 // second FindPRsForCommit for the same source SHA must make ZERO GitHub calls
 // — the direct lookup AND the entire merge-parent walk are skipped via the
@@ -342,6 +396,10 @@ func TestFindPRsForCommit_CoalescesConcurrent(t *testing.T) {
 	gets := &walkGets{Cache: fetchcache.NewLRU(64)}
 	c := newCommenterWithOptions(t, mux, bridgegithub.Options{Cache: gets})
 	ctx := context.Background()
+	// Registered after the server's cleanup, so it runs first: a failed
+	// assertion must not leave the handler parked and Close waiting on it.
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 
 	type result struct {
 		prs []bridgegithub.PRInfo
@@ -354,12 +412,7 @@ func TestFindPRsForCommit_CoalescesConcurrent(t *testing.T) {
 		prs, err := c.FindPRsForCommit(ctx, "owner", "repo", mergeSHA)
 		results <- result{prs, err}
 	}()
-	select {
-	case <-leaderEntered:
-	case <-time.After(5 * time.Second):
-		close(release)
-		t.Fatal("leader never entered the walk")
-	}
+	waitClosed(t, leaderEntered, "leader never entered the walk")
 
 	// Now the rest, while the leader is still parked — they must coalesce.
 	for i := 0; i < callers-1; i++ {
@@ -373,10 +426,15 @@ func TestFindPRsForCommit_CoalescesConcurrent(t *testing.T) {
 	waitFor(t, func() bool { return gets.n.Load() >= callers+1 })
 	// Give the waiters a beat to join the single flight before releasing.
 	time.Sleep(50 * time.Millisecond)
-	close(release)
+	releaseOnce.Do(func() { close(release) })
 
 	for i := 0; i < callers; i++ {
-		r := <-results
+		var r result
+		select {
+		case r = <-results:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("caller %d never returned", i)
+		}
 		if r.err != nil {
 			t.Fatalf("caller %d: %v", i, r.err)
 		}
@@ -412,6 +470,29 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("condition not met within 5s")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitClosed fails the test, instead of blocking it until the go test
+// timeout, when ch is not closed within 5s.
+func waitClosed(t *testing.T, ch <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
+// recvErr receives from ch, failing the test after 5s instead of blocking.
+func recvErr(t *testing.T, ch <-chan error, who string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s never returned", who)
+		return nil
 	}
 }
 
@@ -462,7 +543,7 @@ func TestFindPRsForCommit_WaiterCancelStopsWaiting(t *testing.T) {
 		_, err := c.FindPRsForCommit(context.Background(), "owner", "repo", "merge0001")
 		leaderDone <- err
 	}()
-	<-entered
+	waitClosed(t, entered, "leader never entered the walk")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	waiterDone := make(chan error, 1)
@@ -483,7 +564,7 @@ func TestFindPRsForCommit_WaiterCancelStopsWaiting(t *testing.T) {
 		t.Fatal("cancelled waiter still blocked on the leader's walk")
 	}
 	releaseOnce.Do(func() { close(release) })
-	if err := <-leaderDone; err != nil {
+	if err := recvErr(t, leaderDone, "leader"); err != nil {
 		t.Errorf("leader: %v", err)
 	}
 }
@@ -502,7 +583,7 @@ func TestFindPRsForCommit_WaiterSurvivesLeaderCancel(t *testing.T) {
 		_, err := c.FindPRsForCommit(leaderCtx, "owner", "repo", "merge0001")
 		leaderDone <- err
 	}()
-	<-entered
+	waitClosed(t, entered, "leader never entered the walk")
 
 	type result struct {
 		prs []bridgegithub.PRInfo
@@ -517,7 +598,7 @@ func TestFindPRsForCommit_WaiterSurvivesLeaderCancel(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	cancelLeader()
 
-	if err := <-leaderDone; err == nil {
+	if err := recvErr(t, leaderDone, "cancelled leader"); err == nil {
 		t.Error("cancelled leader returned no error")
 	}
 	select {
@@ -564,7 +645,9 @@ func TestFindPRsForCommit_WalkEntryExpiresWithItsOldestLookup(t *testing.T) {
 	}
 	time.Sleep(wait)
 	// A new resolution that reuses the per-commit entries cached above.
-	cache.Delete(ctx, "prs-walk:owner/repo/merge0001")
+	if err := cache.Delete(ctx, "prs-walk:owner/repo/merge0001"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
 	prs, err := c.FindPRsForCommit(ctx, "owner", "repo", "merge0001")
 	if err != nil {
 		t.Fatalf("second: %v", err)
@@ -610,7 +693,9 @@ func TestListPRsForCommit_NegativeCaches(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		// Evict the whole-resolution entry so each call reaches the direct
 		// lookup and only its own (negative) cache can save the API call.
-		cache.Delete(ctx, "prs-walk:owner/repo/"+sha)
+		if err := cache.Delete(ctx, "prs-walk:owner/repo/"+sha); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
 		prs, err := c.FindPRsForCommit(ctx, "owner", "repo", sha)
 		if err != nil {
 			t.Fatalf("call %d: %v", i, err)
@@ -1696,7 +1781,9 @@ func TestFindPRsForCommit_CachesMergeWalk(t *testing.T) {
 	// cache (PRsForCommitTTL > 0 by default when Options.Cache is set).
 	// The whole-resolution entry is evicted first, so the walk really runs
 	// and only the per-commit caches can save the calls.
-	cache.Delete(ctx, "prs-walk:owner/repo/head")
+	if err := cache.Delete(ctx, "prs-walk:owner/repo/head"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
 	prs2, err := c.FindPRsForCommit(ctx, "owner", "repo", "head")
 	if err != nil {
 		t.Fatalf("second walk: %v", err)

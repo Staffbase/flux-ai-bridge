@@ -185,10 +185,14 @@ log line announcing it); the proof is that GitHub API calls succeed.
 
 Increment-driven verification:
 
-- `kubectl -n flux-system port-forward svc/flux-ai-bridge 8080:8080` then
-  `curl http://localhost:8080/metrics | grep github_rate_limit`. A real
-  installation token gets at least 5,000 requests/hour (more for installations with many repositories or users, up to 12,500; 15,000 on GitHub Enterprise Cloud). The remaining-budget gauge
-  is the quickest tell that auth is wired up correctly.
+- `kubectl --context <your-context> -n flux-system port-forward svc/flux-ai-bridge 8080:8080`
+  then `curl http://localhost:8080/metrics | grep flux_ai_bridge_github_`.
+  After a Flux event, `flux_ai_bridge_github_api_requests_total` shows 2xx
+  statuses and `flux_ai_bridge_github_auth_failures_total` stays at 0. Don't
+  rely on `flux_ai_bridge_github_rate_limit_remaining` alone: a 401 or 403
+  carries rate-limit headers too, so the gauge also moves when the App lacks a
+  permission.
+- The surest proof is the bridge's comment on the PR.
 
 ---
 
@@ -225,10 +229,21 @@ bridge intentionally posts nothing in this case.
 GitHub lets you generate a new key without invalidating the old one. Plan:
 
 1. Generate new private key in the App settings.
-2. Update the bridge's Secret (`kubectl edit secret ...` or via your
-   external secret manager).
-3. Restart the bridge pod (kill + let K8s reschedule, or `kubectl rollout
-   restart deployment/flux-ai-bridge`).
+2. Put the new key where the chart reads it:
+   - **Option A (chart-managed Secret):** run `helm upgrade` with the new key,
+     for example `helm upgrade flux-ai-bridge ./charts/flux-ai-bridge
+     --kube-context <your-context> --namespace flux-system
+     --reset-then-reuse-values --set-file credentials.githubApp.privateKey=<new-key.pem>`.
+     Don't edit the Secret by hand: the next `helm upgrade` would restore the
+     old key from the Helm values. The chart rolls the pods when the Secret
+     changes.
+   - **Option B (external Secret):** update the Secret in your secret manager
+     (or `kubectl --context <your-context> edit secret ...`), then restart the
+     bridge: `kubectl --context <your-context> -n flux-system rollout restart
+     deployment/flux-ai-bridge`.
+3. Wait until every replica runs with the new key:
+   `kubectl --context <your-context> -n flux-system rollout status
+   deployment/flux-ai-bridge`. Go on only when it reports success.
 4. Delete the old key in the App settings.
 
 The bridge reads the private key only at startup, and uses it to mint and

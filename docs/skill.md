@@ -58,6 +58,7 @@ skill:
 
 ```bash
 helm upgrade --install flux-ai-bridge ./charts/flux-ai-bridge \
+  --kube-context <your-context> \
   --namespace flux-system \
   --set-file skill.custom=./platform-skill.md \
   ...

@@ -169,8 +169,8 @@ What happens:
 2. `make e2e` runs the suite. `TestPipelineProducesGitHubComment` is **skipped** (it would target the mock); `TestPipelineProducesRealGitHubComment` becomes active.
 3. The test relies on the **real Flux reconcile pipeline** — source-controller fetches the configured branch, kustomize-controller reconciles, Notification Controller forwards the event to the bridge, which posts the comment. The test simply:
    - auto-discovers the open PR (or uses `GITHUB_PR_NUMBER` / `GITHUB_PR_SHA` when pinned)
-   - polls `GET /repos/${GITHUB_USER}/${GH_REPO}/issues/${PR}/comments` for up to 90 s
-   - asserts a comment with the `<!-- flux-ai-bridge` marker exists and has the expected structure
+   - polls `GET /repos/${GITHUB_USER}/${GH_REPO}/issues/${PR}/comments` until the pipeline deadline (60 s; 3 min with a real LLM, 4 min for the broken workload)
+   - asserts a comment with the `<!-- flux-ai-bridge` marker exists and has the expected structure. The comment counts only when it was written at or after the PR head commit's committer date and, when `GITHUB_APP_ID` is set, posted by that App, so a leftover comment for an earlier head doesn't pass the test
 
    No prior-comment deletion, no mock-llm reset — those were mock-mode artifacts. Mock-mode coverage of the synthetic-webhook path is retained in `TestPipelineProducesGitHubComment`.
 

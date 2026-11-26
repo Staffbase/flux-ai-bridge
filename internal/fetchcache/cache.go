@@ -77,9 +77,13 @@ type Cache interface {
 	// Delete removes the entry for key. Used by callers that need a true
 	// invalidation primitive (Put with empty bytes leaves a tombstone-
 	// shaped row that costs a slot in the LRU and a permanent key in
-	// Redis). No-op when the key is absent; errors are logged but not
-	// surfaced — same fail-open contract as Put.
-	Delete(ctx context.Context, key string)
+	// Redis). No-op when the key is absent.
+	//
+	// Unlike Get and Put, a backend error is returned (and logged): a caller
+	// that drops a record before a GitHub write must know whether it is
+	// really gone, or a stale record could later vouch for a state the PR
+	// no longer has. Callers that only tidy up may ignore it.
+	Delete(ctx context.Context, key string) error
 	// TryLock takes a short-lived exclusive lock named key, for work that
 	// must not interleave across replicas (e.g. a PR's label reconcile).
 	// ok=false with a nil error means another holder has it: the caller
@@ -89,7 +93,7 @@ type Cache interface {
 	// on its own after ttl (which must be positive), so a crashed holder
 	// blocks the others for at most ttl.
 	//
-	// Unlike Get/Put/Delete this is not fail-open: an error is returned, not
+	// Unlike Get and Put this is not fail-open: an error is returned, not
 	// hidden, because "couldn't ask" and "someone else holds it" call for
 	// different handling. Backends that serve a single process (in-memory,
 	// disabled) always grant the lock: the process's own mutex already
@@ -107,7 +111,7 @@ type disabled struct{}
 
 func (disabled) Get(context.Context, string) ([]byte, bool)         { return nil, false }
 func (disabled) Put(context.Context, string, []byte, time.Duration) {}
-func (disabled) Delete(context.Context, string)                     {}
+func (disabled) Delete(context.Context, string) error               { return nil }
 
 func (disabled) TryLock(context.Context, string, time.Duration) (func(), bool, error) {
 	return noopRelease, true, nil

@@ -163,9 +163,11 @@ func (a *OpenAIAnalyzer) Analyze(ctx context.Context, systemPrefix, userPayload 
 	}
 	metrics.LLMRequests.WithLabelValues("openai-compatible", "success").Inc()
 
-	// Token metrics. OpenAI-compatible APIs don't expose Anthropic-style cache
-	// counters, so cache_read/cache_write stay at zero — that's fine.
-	metrics.LLMInputTokens.Add(float64(completion.Usage.PromptTokens))
+	// Token metrics. LLMInputTokens counts uncached input, like Anthropic's
+	// input_tokens; prompt_tokens includes the cached part, so subtract it.
+	// Backends without a prompt cache report zero cached tokens.
+	uncached := completion.Usage.PromptTokens - completion.Usage.PromptTokensDetails.CachedTokens
+	metrics.LLMInputTokens.Add(float64(max(uncached, 0)))
 	metrics.LLMOutputTokens.Add(float64(completion.Usage.CompletionTokens))
 
 	if len(completion.Choices) == 0 {

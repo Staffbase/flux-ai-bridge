@@ -952,6 +952,39 @@ func TestWaitUntilSettled_SleepStopsAtDeadline(t *testing.T) {
 	}
 }
 
+// slowFetcher returns readyDeploymentYAML after delay, or the ctx error if
+// ctx ends first, like an MCP call bound to its context.
+type slowFetcher struct{ delay time.Duration }
+
+func (s slowFetcher) GetKubernetesResource(ctx context.Context, _, _, _, _ string) ([]byte, error) {
+	select {
+	case <-time.After(s.delay):
+		return []byte(readyDeploymentYAML), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// The poll's reads are bounded by its timeout (with a short floor), not just
+// its sleeps: a read slower than the timeout is cut short, reads Unknown, and
+// the poll returns unsettled without an error instead of running past the
+// timeout and reporting what the slow read eventually returned.
+func TestWaitUntilSettled_ReadsBoundedByTimeout(t *testing.T) {
+	start := time.Now()
+	results, settled, err := NewChecker(slowFetcher{delay: 5 * time.Second}).WaitUntilSettled(
+		context.Background(), []string{"default_api_apps_Deployment"}, 10*time.Millisecond, 50*time.Millisecond)
+	elapsed := time.Since(start)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("poll returned after %s, want the read cut at the 1s floor", elapsed)
+	}
+	if len(results) != 1 || results[0].Status != "Unknown" {
+		t.Errorf("results = %+v, want one Unknown row for the cut read", results)
+	}
+}
+
 // The refs and the rows are separate reads. When the refs change between
 // them (a HelmRelease finished its install and now lists a child the refs
 // read missed), an all-Current snapshot of the old refs is not settled.

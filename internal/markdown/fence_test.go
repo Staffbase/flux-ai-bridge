@@ -34,6 +34,12 @@ func TestCloseOpenFence(t *testing.T) {
 		"closer with text":    {"```\nx\n``` not a close", "```\nx\n``` not a close\n```"},
 		"open in list item":   {"- ~~~\n  code", "- ~~~\n  code\n  ~~~"},
 		"open in ordered":     {"10. ```\n    code", "10. ```\n    code\n    ```"},
+		// CommonMark: only spaces and tabs may follow a closing fence, so a
+		// no-break space leaves the block open.
+		"closer with nbsp":   {"~~~\ncode\n~~~ ", "~~~\ncode\n~~~ \n~~~"},
+		"closer with tab":    {"~~~\ncode\n~~~ \t", "~~~\ncode\n~~~ \t"},
+		"closer with crlf":   {"~~~\r\ncode\r\n~~~\r", "~~~\r\ncode\r\n~~~\r"},
+		"open in item cont.": {"- item\n  ~~~\n  code", "- item\n  ~~~\n  code\n  ~~~"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := CloseOpenFence(tc.in); got != tc.want {
@@ -63,6 +69,15 @@ func TestTrackerListItemFences(t *testing.T) {
 		"sibling item":    {"- ~~~\n  code\n- ping @ops", []bool{true, true, false}},
 		"sibling fence":   {"- ~~~\n  code\n- ```\n  more\n  ```\nprose", []bool{true, true, true, true, true, false}},
 		"top level stays": {"~~~\ncode\n\nstill code", []bool{true, true, true, true}},
+		// A fence opened on a continuation line of a list item belongs to
+		// the item too, and ends with it.
+		"cont. item ends":  {"- item\n  ~~~\n  code\n\nOutside: ping @ops", []bool{false, true, true, true, false}},
+		"cont. sibling":    {"- item\n  ~~~\n  code\n- ping @ops", []bool{false, true, true, false}},
+		"cont. nested":     {"- a\n  - b\n    ~~~\n    code\n  back in a @ops", []bool{false, false, true, true, false}},
+		"cont. after gap":  {"- item\n\n  ~~~\n  code\nOutside @ops", []bool{false, false, true, true, false}},
+		"item left first":  {"- item\n\nprose\n  ~~~\ncode\n\nstill code", []bool{false, false, false, true, true, true, true}},
+		"outdented opener": {"- item\n~~~\ncode\n\nstill code", []bool{false, true, true, true, true}},
+		"nbsp line ends":   {"- ~~~\n  code\n \nprose", []bool{true, true, false, false}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var tr Tracker

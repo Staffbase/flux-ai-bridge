@@ -154,18 +154,39 @@ func TestSetPRLabels_UnchangedOutcomeIgnoresTheLock(t *testing.T) {
 	}
 }
 
+// lockErrCache fails every TryLock and serves the rest from memory.
+type lockErrCache struct{ fetchcache.Cache }
+
+func (lockErrCache) TryLock(context.Context, string, time.Duration) (func(), bool, error) {
+	return nil, false, errors.New("lock backend unavailable")
+}
+
 // A lock that can't be taken because the backend fails is handled like the
-// outcome cache's own errors in SetPRLabels: the reconcile is not skipped on
+// outcome cache's read errors in SetPRLabels: the reconcile is not skipped on
 // state it couldn't read, so the labels still match the verdict.
 func TestSetPRLabels_LockBackendErrorStillReconciles(t *testing.T) {
-	mr, replicaA, _ := labelReplicas(t)
-	mr.SetError("ERR boom")
 	var calls atomic.Int32
-	c := newCommenterWithOptions(t, labelCallMux(&calls, nil), bridgegithub.Options{Cache: replicaA})
+	c := newCommenterWithOptions(t, labelCallMux(&calls, nil), bridgegithub.Options{Cache: lockErrCache{fetchcache.NewLRU(64)}})
 	if err := c.SetPRLabels(context.Background(), "owner", "repo", 42, "h1", bridgegithub.OutcomeFailure); err != nil {
 		t.Fatalf("SetPRLabels with a failing lock backend: %v", err)
 	}
 	if calls.Load() == 0 {
 		t.Error("labels not written when the lock backend failed")
+	}
+}
+
+// With the whole backend down, the outcome record can't be dropped, so no
+// label changes: the record would otherwise outlive the reconcile and later
+// vouch for labels the PR no longer has. The error makes the event retry.
+func TestSetPRLabels_BackendDownWritesNoLabels(t *testing.T) {
+	mr, replicaA, _ := labelReplicas(t)
+	mr.SetError("ERR boom")
+	var calls atomic.Int32
+	c := newCommenterWithOptions(t, labelCallMux(&calls, nil), bridgegithub.Options{Cache: replicaA})
+	if err := c.SetPRLabels(context.Background(), "owner", "repo", 42, "h1", bridgegithub.OutcomeFailure); err == nil {
+		t.Fatal("SetPRLabels with the backend down returned nil; want an error so the event retries")
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("label writes with the backend down = %d, want 0", n)
 	}
 }

@@ -194,7 +194,10 @@ func (c *Checker) WaitUntilSettled(ctx context.Context, refs []string, interval,
 // Current while its new children are still missing from the refs.
 //
 // A cancelled ctx never yields settled=true, and the last sleep stops at the
-// deadline instead of running up to a whole interval past it.
+// deadline instead of running up to a whole interval past it. Each poll's
+// reads are bounded by the deadline (at least minPollRead per poll): a read
+// the timeout cuts short reads Unknown, so the result is settled=false with a
+// nil error.
 func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []string, interval, timeout time.Duration) (results []ResourceStatus, settled bool, err error) {
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -205,7 +208,17 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []st
 	deadline := time.Now().Add(timeout)
 	for {
 		refs := refsFunc()
-		results, err = c.CheckAll(ctx, refs)
+		// The poll's MCP reads are bounded by the timeout too (but get at
+		// least minPollRead), so a slow read can't run the poll past it. A
+		// read cut short reads Unknown, which keeps the snapshot unsettled.
+		readStart := time.Now()
+		readDeadline := deadline
+		if floor := readStart.Add(minPollRead); floor.After(readDeadline) {
+			readDeadline = floor
+		}
+		readCtx, cancelRead := context.WithDeadline(ctx, readDeadline)
+		results, err = c.CheckAll(readCtx, refs)
+		cancelRead()
 		if err != nil {
 			return results, false, err
 		}
@@ -227,6 +240,10 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []st
 		}
 	}
 }
+
+// minPollRead is the least time one poll's reads get, even when the timeout
+// is already spent, so the poll still takes its one snapshot.
+const minPollRead = time.Second
 
 // allSettled returns true iff every row is in a terminal kstatus. InProgress
 // and Unknown count as still-changing so the poll keeps running.

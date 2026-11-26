@@ -89,11 +89,12 @@ func (c *memCache) Put(ctx context.Context, key string, value []byte, ttl time.D
 	c.mu.Unlock()
 }
 
-// Delete removes the entry for key. No-op when key is absent.
-func (c *memCache) Delete(ctx context.Context, key string) {
+// Delete removes the entry for key. No-op when key is absent. Never fails.
+func (c *memCache) Delete(ctx context.Context, key string) error {
 	c.mu.Lock()
 	c.lru.Remove(key)
 	c.mu.Unlock()
+	return nil
 }
 
 // TryLock always grants the lock: an in-memory cache serves one process, and
