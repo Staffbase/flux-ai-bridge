@@ -188,6 +188,11 @@ data:
         '  namespace: podinfo\n'
     )
 
+    # GET /app answers with this slug, and the comments mock-github returns are
+    # authored by `<slug>[bot]`, like real GitHub does for an App's comments.
+    APP_SLUG = 'flux-ai-bridge-e2e'
+    APP_USER = {'login': APP_SLUG + '[bot]', 'type': 'Bot'}
+
     # The GitHub endpoints the bridge hits map to specific pipeline phases.
     # Tag each so you can grep for a phase across calls.
     def _phase(method, path):
@@ -205,6 +210,8 @@ data:
             return 'comment-update'
         if '/app/installations/' in path:
             return 'app-token'
+        if path.split('?')[0].endswith('/app'):
+            return 'app-identity'
         return method.lower()
 
     def _log(label, payload):
@@ -273,6 +280,11 @@ data:
                 }, tag=tag)
             elif re.search(r'/issues/\d+/comments', self.path):
                 self._json([], tag=tag)
+            elif self.path.split('?')[0].endswith('/app'):
+                # The App the bridge authenticates as. The bridge reads its
+                # slug at startup and then only treats comments by
+                # `<slug>[bot]` as its own.
+                self._json({'id': 1, 'slug': APP_SLUG, 'name': APP_SLUG}, tag=tag)
             else:
                 self._json({}, tag=tag)
 
@@ -291,14 +303,14 @@ data:
             call_seq += 1
             tag = f'#{call_seq:03d} {_phase("POST", self.path)}'
             self._capture('POST', tag)
-            self._json({'id': 1, 'body': 'ok'}, 201, tag=tag)
+            self._json({'id': 1, 'body': 'ok', 'user': APP_USER}, 201, tag=tag)
 
         def do_PATCH(self):
             global call_seq
             call_seq += 1
             tag = f'#{call_seq:03d} {_phase("PATCH", self.path)}'
             self._capture('PATCH', tag)
-            self._json({'id': 1, 'body': 'ok'}, tag=tag)
+            self._json({'id': 1, 'body': 'ok', 'user': APP_USER}, tag=tag)
 
         def _capture(self, method, tag):
             length = int(self.headers.get('Content-Length', 0))

@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -109,6 +110,13 @@ func commentKeyOf(body string) string {
 
 type Commenter struct {
 	client *gh.Client
+	// appClient authenticates with the App JWT instead of the installation
+	// token. It serves the App-level endpoints (GET /app) only.
+	appClient *gh.Client
+	// botLogin is the login the bridge's comments are authored by
+	// (`<app-slug>[bot]`), set by ResolveAppIdentity. Empty until then, or
+	// when the lookup failed; see isBridgeComment.
+	botLogin atomic.Pointer[string]
 	// keepHistory, when true, makes PostOrUpdateComment skip the delete-prior
 	// step and just create a fresh comment. Useful for testing (you want to
 	// see the sequence of analyses as a commit toggles between healthy and
@@ -173,10 +181,10 @@ type Commenter struct {
 	// B adds failure, A removes failure, B removes success — leaving the
 	// PR with NO outcome label, while both then cache their outcome so the
 	// transition-only short-circuit never re-asserts it. Serializing makes
-	// each reconcile atomic per PR within this replica. Replicas are NOT
-	// serialized against each other: the same interleaving across two
-	// replicas can leave the PR without an outcome label, and the shared
-	// record then skips the repair until the outcome or the head changes.
+	// each reconcile atomic per PR within this replica. Replicas are
+	// serialized against each other by the PR's label lock in the shared
+	// fetchcache (see SetPRLabels); this mutex keeps a replica's own
+	// goroutines from contending for that lock.
 	//
 	// STRIPED, not per-key: unlike postLocks (bounded by the cluster's
 	// Kustomization count), PR numbers grow without bound over a deployment's
@@ -295,17 +303,22 @@ func NewCommenter(cfg AuthConfig, opts Options) (*Commenter, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	tr, err := newAppTransport(cfg)
+	tr, appTr, err := newAppTransport(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("github app transport: %w", err)
 	}
 	httpClient := &http.Client{Transport: tr, Timeout: requestTimeout, CheckRedirect: sameOriginRedirect}
 	ghClient := gh.NewClient(httpClient)
+	appClient := gh.NewClient(&http.Client{Transport: appTr, Timeout: requestTimeout, CheckRedirect: sameOriginRedirect})
 	if cfg.BaseURL != "" {
 		var err error
 		ghClient, err = ghClient.WithEnterpriseURLs(cfg.BaseURL, cfg.BaseURL)
 		if err != nil {
 			return nil, fmt.Errorf("github client with enterprise urls: %w", err)
+		}
+		appClient, err = appClient.WithEnterpriseURLs(cfg.BaseURL, cfg.BaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("github app client with enterprise urls: %w", err)
 		}
 		// ghinstallation's installation-token refresh goes to api.github.com
 		// by default. Point it at the SAME normalized REST root go-github
@@ -353,6 +366,7 @@ func NewCommenter(cfg AuthConfig, opts Options) (*Commenter, error) {
 	}
 	return &Commenter{
 		client:          ghClient,
+		appClient:       appClient,
 		keepHistory:     opts.KeepCommentHistory,
 		instanceID:      opts.InstanceID,
 		cache:           cache,
@@ -431,21 +445,57 @@ func (t *countingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	return resp, err
 }
 
-func newAppTransport(cfg AuthConfig) (*ghinstallation.Transport, error) {
+// newAppTransport returns the installation-token transport the commenter's
+// API calls use, and the App JWT transport it is built on (for the App-level
+// endpoints, such as GET /app).
+func newAppTransport(cfg AuthConfig) (*ghinstallation.Transport, *ghinstallation.AppsTransport, error) {
 	var (
-		tr  *ghinstallation.Transport
-		err error
+		appTr *ghinstallation.AppsTransport
+		err   error
 	)
 	base := &countingTransport{base: http.DefaultTransport}
 	if cfg.AppPrivateKeyFile != "" {
-		tr, err = ghinstallation.NewKeyFromFile(base, cfg.AppID, cfg.InstallationID, cfg.AppPrivateKeyFile)
+		appTr, err = ghinstallation.NewAppsTransportKeyFromFile(base, cfg.AppID, cfg.AppPrivateKeyFile)
 	} else {
-		tr, err = ghinstallation.New(base, cfg.AppID, cfg.InstallationID, []byte(cfg.AppPrivateKeyPEM))
+		appTr, err = ghinstallation.NewAppsTransport(base, cfg.AppID, []byte(cfg.AppPrivateKeyPEM))
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return tr, nil
+	return ghinstallation.NewFromAppsTransport(appTr, cfg.InstallationID), appTr, nil
+}
+
+// ResolveAppIdentity looks up the App the bridge authenticates as (GET /app,
+// with the App JWT — no extra permission needed) and remembers the login its
+// comments are authored by, `<slug>[bot]`. From then on only comments by that
+// login count as the bridge's own (see isBridgeComment), so another App's
+// comment that copies the marker is never edited, kept or deleted as ours.
+//
+// Call it once at startup. On error the identity stays unknown and comments
+// are recognised as before (marker plus a non-human author); the caller logs
+// and carries on rather than blocking startup on it.
+func (c *Commenter) ResolveAppIdentity(ctx context.Context) error {
+	app, resp, err := c.appClient.Apps.Get(ctx, "")
+	recordRateLimit(resp, err)
+	if err != nil {
+		return fmt.Errorf("get app: %w", err)
+	}
+	slug := app.GetSlug()
+	if slug == "" {
+		return errors.New("get app: response has no slug")
+	}
+	login := slug + "[bot]"
+	c.botLogin.Store(&login)
+	return nil
+}
+
+// BotLogin returns the login the bridge's comments are authored by, or ""
+// while ResolveAppIdentity hasn't succeeded.
+func (c *Commenter) BotLogin() string {
+	if p := c.botLogin.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 func parseInt64(s string) (int64, error) {
@@ -1340,6 +1390,7 @@ func (c *Commenter) RemoveComment(ctx context.Context, owner, repo, kustomizatio
 // PR, across all pages.
 func (c *Commenter) listScopedComments(ctx context.Context, owner, repo string, prNumber int, marker string) ([]*gh.IssueComment, error) {
 	var mine []*gh.IssueComment
+	botLogin := c.BotLogin()
 	opt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	for {
 		comments, resp, err := c.client.Issues.ListComments(ctx, owner, repo, prNumber, opt)
@@ -1348,7 +1399,7 @@ func (c *Commenter) listScopedComments(ctx context.Context, owner, repo string, 
 			return nil, fmt.Errorf("list comments: %w", err)
 		}
 		for _, comment := range comments {
-			if isBridgeComment(comment, marker) {
+			if isBridgeComment(comment, marker, botLogin) {
 				mine = append(mine, comment)
 			}
 		}
@@ -1394,11 +1445,20 @@ func truncateComment(body string) string {
 
 // isBridgeComment reports whether comment is one the bridge wrote for this
 // marker's scope: the marker is the body's first line (the bridge always puts
-// it there) and the author isn't a human account. A plain substring match
-// would also claim — and delete — a user's comment that quotes the marker, or
-// one whose text echoes it further down.
-func isBridgeComment(comment *gh.IssueComment, marker string) bool {
+// it there) and the author is the bridge's App. A plain substring match would
+// also claim — and delete — a user's comment that quotes the marker, or one
+// whose text echoes it further down.
+//
+// botLogin is the App's bot login (`<slug>[bot]`, see ResolveAppIdentity).
+// When known, the author must be that login (GitHub logins are
+// case-insensitive), so another bot or App posting a copied marker isn't
+// mistaken for the bridge. When unknown (the startup lookup failed), any
+// author that isn't a human account is accepted, as before the lookup existed.
+func isBridgeComment(comment *gh.IssueComment, marker, botLogin string) bool {
 	if comment.GetUser().GetType() == "User" {
+		return false
+	}
+	if botLogin != "" && !strings.EqualFold(comment.GetUser().GetLogin(), botLogin) {
 		return false
 	}
 	return strings.HasPrefix(comment.GetBody(), marker+"\n")
@@ -1491,6 +1551,12 @@ const (
 	DefaultPRLabelWarning = "flux-warning"
 )
 
+// ErrPRLabelsLocked reports that SetPRLabels skipped its reconcile because
+// another replica holds the PR's label lock. Nothing was written, not even the
+// outcome record, so the caller treats it like any label failure: a later
+// event reconciles the labels again.
+var ErrPRLabelsLocked = errors.New("PR labels are being reconciled by another replica")
+
 // Outcome is the bridge's classification of a Kustomization analysis.
 // Mirrors the marker emoji vocabulary in processor.buildKstatusBody
 // (✅ / ❌ / ⚠️) but as an enum the GitHub layer can switch on without
@@ -1549,6 +1615,16 @@ const (
 // was never restored because the cache was PR-scoped and the new head's
 // identical aggregate hit it.
 //
+// Across replicas: with the Redis/Valkey fetchcache, the read-reconcile-write
+// runs under a per-PR lock (`pr-outcome:<owner>/<repo>/<pr>:lock`, TTL
+// prLabelLockTTL) so two replicas can't interleave their add/remove calls and
+// leave conflicting labels. While another replica holds it, the call writes
+// nothing — not even the outcome record — and returns ErrPRLabelsLocked, so
+// the caller retries on a later event. If the lock can't be asked for (a
+// backend error), the reconcile runs anyway, as it does when the outcome
+// record can't be read. The in-memory backend serves one replica and grants
+// the lock at once.
+//
 // Any other API error is returned to the caller. The caller (processor)
 // treats label failures as non-fatal — the comment has already been
 // posted at that point, so a label hiccup shouldn't tank the pipeline.
@@ -1568,6 +1644,37 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 		metrics.FetchCacheHits.WithLabelValues("pr_outcome").Inc()
 		return nil
 	}
+
+	// The mutex above serializes this replica only. The label lock serializes
+	// the replicas sharing the Redis/Valkey cache (the in-memory backend grants
+	// it at once). A held lock skips this reconcile: no write, no record, and an
+	// error so the caller retries on a later event. A lock that can't be asked
+	// for is handled like the outcome cache's errors here: the reconcile runs
+	// rather than being skipped on state it couldn't read.
+	lockDeadline := time.Now().Add(prLabelLockTTL) // set before the lock, so it ends no later
+	release, locked, err := c.cache.TryLock(ctx, prLabelLockKey(owner, repo, prNumber), prLabelLockTTL)
+	switch {
+	case err != nil:
+		slog.Default().Warn("PR label lock unavailable; reconciling without cross-replica serialization",
+			"owner", owner, "repo", repo, "pr", prNumber, "error", err.Error())
+	case !locked:
+		slog.Default().Debug("PR labels locked by another replica; skipping this reconcile",
+			"owner", owner, "repo", repo, "pr", prNumber, "outcome", string(outcome))
+		return ErrPRLabelsLocked
+	default:
+		defer release()
+		// Re-read under the lock: the replica that held it may have just
+		// written this very outcome.
+		cached, hit = c.cache.Get(ctx, cacheKey)
+		if hit && string(cached) == record {
+			metrics.FetchCacheHits.WithLabelValues("pr_outcome").Inc()
+			return nil
+		}
+	}
+	// Keep the writes inside the lock's TTL, so the lock can't lapse while
+	// this replica still writes and let another one interleave.
+	ctx, cancel := context.WithDeadline(ctx, lockDeadline)
+	defer cancel()
 	metrics.FetchCacheMisses.WithLabelValues("pr_outcome").Inc()
 
 	var add, remove []string
@@ -1669,6 +1776,19 @@ func dedupeNonEmpty(in []string, exclude map[string]struct{}) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// prLabelLockTTL bounds how long one replica holds a PR's label lock. A
+// reconcile is at most three label calls (normally well under a second each);
+// SetPRLabels cuts its writes off at this TTL, so a lapsed lock never covers a
+// write still in flight. A crashed holder blocks the PR's labels for at most
+// this long.
+const prLabelLockTTL = 30 * time.Second
+
+// prLabelLockKey names the lock that serializes SetPRLabels for one PR across
+// replicas, next to the PR's outcome record.
+func prLabelLockKey(owner, repo string, prNumber int) string {
+	return prOutcomeCacheKey(owner, repo, prNumber) + ":lock"
 }
 
 // prOutcomeCacheKey is the cache key for "the outcome this bridge last

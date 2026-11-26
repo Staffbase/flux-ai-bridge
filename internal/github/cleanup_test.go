@@ -61,6 +61,11 @@ func (c *mapCache) Delete(_ context.Context, key string) {
 	delete(c.m, key)
 }
 
+// TryLock always grants the lock, like the in-memory backend.
+func (c *mapCache) TryLock(context.Context, string, time.Duration) (func(), bool, error) {
+	return func() {}, true, nil
+}
+
 func (c *mapCache) snapshot() map[string][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()

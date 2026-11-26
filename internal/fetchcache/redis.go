@@ -16,7 +16,10 @@ package fetchcache
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -110,4 +113,64 @@ func (c *redisCache) Delete(ctx context.Context, key string) {
 		slog.Default().Warn("fetchcache: redis DEL failed",
 			"key", key, "error", err.Error())
 	}
+}
+
+// TryLock takes the lock with `SET <key> <token> NX PX <ttl>` (go-redis sends
+// EX for a whole-second ttl; same effect), where token is random per call. The returned release reads the key (GET) and deletes it
+// (DEL) only while it still holds this call's token, so a holder whose lock
+// already expired doesn't free the lock another replica took since.
+//
+// GET-then-DEL is two commands, not one atomic compare-and-delete: that needs
+// Lua (EVAL), which production ACLs deny. The race this leaves: the lock
+// expires between our GET and our DEL, another replica takes it, and our DEL
+// removes the new holder's lock. That needs the holder to run to within a
+// round-trip of its TTL, and the damage is bounded by the TTL: at worst a
+// third replica may enter while the second still works, which is the
+// unserialized behaviour the lock otherwise prevents. Callers keep their work
+// well inside the TTL to keep the window shut.
+//
+// Acquiring honours the caller's context (bounded by the op timeout); release
+// detaches from it, like Put and Delete, so a pipeline cancelled after taking
+// the lock still frees it instead of blocking the others for the whole TTL.
+func (c *redisCache) TryLock(ctx context.Context, key string, ttl time.Duration) (func(), bool, error) {
+	if ttl <= 0 {
+		return nil, false, fmt.Errorf("fetchcache: lock %q: ttl must be positive, got %s", key, ttl)
+	}
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return nil, false, fmt.Errorf("fetchcache: lock %q: token: %w", key, err)
+	}
+	token := hex.EncodeToString(raw[:])
+	full := c.keyPrefix + key
+
+	opCtx, cancel := context.WithTimeout(ctx, c.opTimeout)
+	defer cancel()
+	ok, err := c.client.SetNX(opCtx, full, token, ttl).Result()
+	if err != nil {
+		return nil, false, fmt.Errorf("fetchcache: lock %q: %w", key, err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	release := func() {
+		ctx, cancel := lifecycle.Detach(ctx, c.opTimeout)
+		defer cancel()
+		cur, err := c.client.Get(ctx, full).Result()
+		if errors.Is(err, redis.Nil) {
+			return // expired; nothing to free
+		}
+		if err != nil {
+			slog.Default().Warn("fetchcache: lock release GET failed; the lock lapses after its TTL",
+				"key", key, "error", err.Error())
+			return
+		}
+		if cur != token {
+			return // expired and taken by another holder: theirs now
+		}
+		if err := c.client.Del(ctx, full).Err(); err != nil {
+			slog.Default().Warn("fetchcache: lock release DEL failed; the lock lapses after its TTL",
+				"key", key, "error", err.Error())
+		}
+	}
+	return release, true, nil
 }

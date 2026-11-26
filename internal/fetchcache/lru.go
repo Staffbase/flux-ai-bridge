@@ -95,3 +95,10 @@ func (c *memCache) Delete(ctx context.Context, key string) {
 	c.lru.Remove(key)
 	c.mu.Unlock()
 }
+
+// TryLock always grants the lock: an in-memory cache serves one process, and
+// the caller's own mutex already serializes work within it (the in-memory
+// backend is only used with a single replica; see docs/caching.md).
+func (c *memCache) TryLock(context.Context, string, time.Duration) (func(), bool, error) {
+	return noopRelease, true, nil
+}

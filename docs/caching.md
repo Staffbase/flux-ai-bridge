@@ -10,7 +10,7 @@ This page documents what is cached, why, how, and how to tune it.
 
 ## Cache surfaces
 
-The bridge has **eight distinct caches**, each tuned for a different mutability profile (a ninth, `pr-outcome:`, is a tiny per-head transition label cache covered under SetPRLabels — head-scoped so a new commit always re-asserts the labels).
+The bridge has **eight distinct caches**, each tuned for a different mutability profile (a ninth, `pr-outcome:`, is a tiny per-head transition label cache covered under SetPRLabels — head-scoped so a new commit always re-asserts the labels; next to it, `pr-outcome:<owner>/<repo>/<pr>:lock` is the [PR label lock](#pr-label-lock-cross-replica), not a cache).
 
 | Cache | Key | TTL | Backend(s) | Saves |
 |---|---|---|---|---|
@@ -94,6 +94,17 @@ The 404-tolerant fallback handles the active-active race. If a peer replica alre
 **Removing a comment on a healthy outcome** (`COMMENT_ON_SUCCESS=false`) uses the same entry: a recorded ID is deleted directly, and afterwards the entry records "no comment" so later healthy events make no API call. Without any entry — after an in-memory restart, or once the Redis backstop expired it — the bridge lists the PR's comments once to find the scope's comment, deletes it, and records "no comment". A stale failure comment therefore can't outlive its cache entry.
 
 **Comment-history mode bypasses this cache** (`config.github.comments.keepHistory=true`). When the operator opts into the append-only comment trail, there's no "previous comment" to delete and the cache would only be dead weight.
+
+### PR label lock (cross-replica)
+
+With `PR_LABEL_ENABLED`, each label reconcile reads the PR's `pr-outcome:` record, adds one label and removes the others, then writes the record. A mutex serializes this per PR inside one replica. Across replicas (two Kustomizations on the same PR handled by different pods), the add/remove calls could interleave and leave conflicting `flux-*` labels, or none. So the fetchcache also offers a lock, `TryLock(key, ttl)`, and the reconcile runs under the PR's lock `pr-outcome:<owner>/<repo>/<pr>:lock`:
+
+- **Take**: `SET <key> <random token> NX PX <ttl>` (the TTL is 30 s; one reconcile is at most three label calls). The reconcile's label writes are cut off at the same deadline, so a lock never lapses while its holder still writes.
+- **Held by another replica**: this reconcile is skipped. It writes no label and no `pr-outcome:` record, logs at `DEBUG`, and reports the labels as not reconciled, so the event's dedupe mark is released and a later event reconciles them (the same retry path as a failed label write). An unchanged outcome (the record already matches) never asks for the lock.
+- **Release**: `GET` the key and `DEL` it only if it still holds this holder's token, so a holder whose lock expired never frees the lock another replica took since. These are two plain commands, not an atomic compare-and-delete (that needs Lua, which production ACLs deny). The race this leaves: the lock expires between the `GET` and the `DEL`, another replica takes it, and the `DEL` removes that replica's lock. It needs a holder to run to within a round-trip of the TTL, and its effect is bounded by the TTL: at worst, a third replica reconciles alongside the second, which is the unserialized behaviour the lock otherwise prevents.
+- **Crashed holder**: the lock lapses after its TTL; until then that PR's label reconciles are skipped and retried.
+- **Backend error** (Redis unreachable): handled like the `pr-outcome:` record's own errors in this path: the reconcile is not skipped on state it couldn't read, it runs serialized within the replica only, and logs a `WARN`.
+- **In-memory backend**: `TryLock` always succeeds. That backend only runs with one replica (see [Active-active behavior](#active-active-behavior)), where the in-process mutex already serializes.
 
 ## Concurrent resolution (single-flight)
 
@@ -181,7 +192,7 @@ Force-pushed commits never appear as parents of new commits (the new commits rep
 
 ## Active-active behavior
 
-With persistent dedupe + persistent fetchcache (both backed by the same Redis), all replicas share the same cache state. The dedupe cache's SETNX ensures only one replica processes each (Kustomization, PR, PR head commit), so cache writes are serialized per cache key by construction.
+With persistent dedupe + persistent fetchcache (both backed by the same Redis), all replicas share the same cache state. The dedupe cache's SETNX ensures only one replica processes each (Kustomization, PR, PR head commit), so cache writes are serialized per cache key by construction. PR labels are PR-wide, so different Kustomizations on one PR can reach them from different replicas; the [PR label lock](#pr-label-lock-cross-replica) serializes those reconciles.
 
 With in-memory fetchcache + multi-replica deployment, each replica has its own cache and they diverge. The bridge handles divergence gracefully:
 
@@ -282,7 +293,7 @@ If your dev branch regularly absorbs hundreds of PRs in one push:
 
 ## Implementation notes
 
-- The **fetch-cache** layer is **fail-open**. Any backend error (Redis down, AUTH rejected, network timeout) is logged at WARN and the call returns `(nil, false)`. The bridge then fetches upstream. Caching is a performance optimization, not a correctness primitive — a Redis outage degrades throughput but doesn't break the pipeline. (The **dedupe admission** is the opposite: it fails **closed** — a Redis error on `MarkPRIfNew` skips the event rather than risking uncoordinated duplicate analysis; see [architecture.md → Dedupe cache](architecture.md#dedupe-cache-per-pr-head-processing).)
+- The **fetch-cache** layer is **fail-open**. Any backend error (Redis down, AUTH rejected, network timeout) is logged at WARN and the call returns `(nil, false)`. The bridge then fetches upstream. Caching is a performance optimization, not a correctness primitive — a Redis outage degrades throughput but doesn't break the pipeline. (The **dedupe admission** is the opposite: it fails **closed** — a Redis error on `MarkPRIfNew` skips the event rather than risking uncoordinated duplicate analysis; see [architecture.md → Dedupe cache](architecture.md#dedupe-cache-per-pr-head-processing).) The one exception inside the fetch-cache is `TryLock`, which returns backend errors instead of hiding them, so a caller can tell "held by another replica" from "couldn't ask"; see [PR label lock](#pr-label-lock-cross-replica).
 - The cache is **best-effort write**: failed `Put` operations are silently dropped (still logged at WARN). The next `Get` will be a miss and refetch upstream.
 - All cache **values are byte slices** at the interface boundary. The `commenter` JSON-encodes structured values (commit parents as `[]string`, PR info as `[]PRInfo`) before `Put` and decodes after `Get`. If a cached value is malformed JSON (corrupted entry, schema drift across versions), the read is treated as a miss and refetched. No wedge state.
 - Cache keys are **stable**. The key formats (`blobrefs:`, `commit:`, `prs-for-commit2:`, `last-comment:`) are versioned implicitly — a future schema change would use a new prefix to invalidate the old keyspace without explicit migration.

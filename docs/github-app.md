@@ -47,6 +47,22 @@ so no PR is ever attributed (public repositories happen to work without it).
 If a commit has no associated PR, the bridge logs and skips (rare in a GitOps
 flow — `ListPullRequestsWithCommit` returns merged PRs too).
 
+### How the bridge recognises its own comments
+
+At startup the bridge calls `GET /app` once, signed with the App's JWT (the
+same key it mints installation tokens with), and reads the App's slug. GitHub
+posts the App's comments as `<slug>[bot]`, so from then on the bridge treats a
+PR comment as its own only when it starts with the bridge's marker **and** is
+authored by `<slug>[bot]`. A comment by another bot or App that copies the
+marker is never edited, kept as current, or deleted as the bridge's.
+
+`GET /app` needs **no extra permission**: any App can read its own metadata
+with its JWT. If the call fails (network, a GitHub outage), the bridge logs a
+`WARN` (`GitHub App identity lookup failed ...`), starts anyway, and falls back
+to recognising its comments by the marker and a non-human author until the next
+restart. On success it logs `GitHub App identity resolved` with the
+`bot_login`.
+
 ### Account & organization permissions
 
 Leave everything unchecked.

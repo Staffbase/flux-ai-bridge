@@ -153,6 +153,18 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create github commenter: %w", err)
 	}
+	// Learn the App's bot login so only comments by this App count as the
+	// bridge's own. A failed lookup doesn't block startup: the commenter then
+	// recognises its comments by marker and non-human author, as before.
+	identityCtx, identityCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err = commenter.ResolveAppIdentity(identityCtx)
+	identityCancel()
+	if err != nil {
+		logger.Warn("GitHub App identity lookup failed; recognising bridge comments by marker and non-human author only",
+			"error", err.Error())
+	} else {
+		logger.Info("GitHub App identity resolved", "bot_login", commenter.BotLogin())
+	}
 	skillDir := os.Getenv("SKILLS_DIR")
 	if skillDir == "" {
 		skillDir = "/skills"

@@ -80,6 +80,21 @@ type Cache interface {
 	// Redis). No-op when the key is absent; errors are logged but not
 	// surfaced — same fail-open contract as Put.
 	Delete(ctx context.Context, key string)
+	// TryLock takes a short-lived exclusive lock named key, for work that
+	// must not interleave across replicas (e.g. a PR's label reconcile).
+	// ok=false with a nil error means another holder has it: the caller
+	// skips its work rather than waiting. A non-nil error means the backend
+	// couldn't be asked; the caller decides how to fail. On success the
+	// caller must call release once its work is done; the lock also lapses
+	// on its own after ttl (which must be positive), so a crashed holder
+	// blocks the others for at most ttl.
+	//
+	// Unlike Get/Put/Delete this is not fail-open: an error is returned, not
+	// hidden, because "couldn't ask" and "someone else holds it" call for
+	// different handling. Backends that serve a single process (in-memory,
+	// disabled) always grant the lock: the process's own mutex already
+	// serializes its callers.
+	TryLock(ctx context.Context, key string, ttl time.Duration) (release func(), ok bool, err error)
 }
 
 // Disabled returns a Cache that misses on every Get and drops every Put.
@@ -93,3 +108,10 @@ type disabled struct{}
 func (disabled) Get(context.Context, string) ([]byte, bool)         { return nil, false }
 func (disabled) Put(context.Context, string, []byte, time.Duration) {}
 func (disabled) Delete(context.Context, string)                     {}
+
+func (disabled) TryLock(context.Context, string, time.Duration) (func(), bool, error) {
+	return noopRelease, true, nil
+}
+
+// noopRelease is the release func of a lock that exists only in-process.
+func noopRelease() {}
