@@ -177,11 +177,11 @@ func (c *Checker) CheckAll(ctx context.Context, refs []string) ([]ResourceStatus
 //
 // Forwards to WaitUntilSettledFunc with a constant refs supplier.
 func (c *Checker) WaitUntilSettled(ctx context.Context, refs []string, interval, timeout time.Duration) (results []ResourceStatus, settled bool, err error) {
-	return c.WaitUntilSettledFunc(ctx, func() []string { return refs }, interval, timeout)
+	return c.WaitUntilSettledFunc(ctx, func(context.Context) []string { return refs }, interval, timeout)
 }
 
 // WaitUntilSettledFunc is the dynamic-refs variant of WaitUntilSettled.
-// On each poll iteration it calls `refsFunc()` to obtain the current ref
+// On each poll iteration it calls `refsFunc(ctx)` to obtain the current ref
 // list — useful when the inventory GROWS mid-poll (a HelmRelease populates
 // `status.history[].inventory` only after helm-controller observes it,
 // so the bridge's HelmRelease-expansion produces zero children for the
@@ -198,10 +198,12 @@ func (c *Checker) WaitUntilSettled(ctx context.Context, refs []string, interval,
 //
 // A cancelled ctx never yields settled=true, and the last sleep stops at the
 // deadline instead of running up to a whole interval past it. Each poll's
-// reads are bounded by the deadline (at least minPollRead per poll): a read
-// the timeout cuts short reads Unknown, so the result is settled=false with a
-// nil error.
-func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []string, interval, timeout time.Duration) (results []ResourceStatus, settled bool, err error) {
+// reads are bounded by the deadline (at least minPollRead per read): the rows
+// and the refs alike, since refsFunc reads too (a HelmRelease expansion is an
+// MCP read per HelmRelease), so refsFunc must make its reads with the ctx it
+// is given. A row read the timeout cuts short reads Unknown, so the result is
+// settled=false with a nil error.
+func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func(context.Context) []string, interval, timeout time.Duration) (results []ResourceStatus, settled bool, err error) {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
@@ -209,17 +211,18 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []st
 		timeout = 3 * time.Minute
 	}
 	deadline := time.Now().Add(timeout)
+	// readRefs calls refsFunc under the same bound as the row reads.
+	readRefs := func() []string {
+		readCtx, cancelRead := readContext(ctx, deadline)
+		defer cancelRead()
+		return refsFunc(readCtx)
+	}
 	for {
-		refs := refsFunc()
+		refs := readRefs()
 		// The poll's MCP reads are bounded by the timeout too (but get at
 		// least minPollRead), so a slow read can't run the poll past it. A
 		// read cut short reads Unknown, which keeps the snapshot unsettled.
-		readStart := time.Now()
-		readDeadline := deadline
-		if floor := readStart.Add(minPollRead); floor.After(readDeadline) {
-			readDeadline = floor
-		}
-		readCtx, cancelRead := context.WithDeadline(ctx, readDeadline)
+		readCtx, cancelRead := readContext(ctx, deadline)
 		results, err = c.CheckAll(readCtx, refs)
 		cancelRead()
 		if err != nil {
@@ -230,7 +233,7 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []st
 		if err := ctx.Err(); err != nil {
 			return results, false, err
 		}
-		if allSettled(results) && slices.Equal(refsFunc(), refs) {
+		if allSettled(results) && slices.Equal(readRefs(), refs) {
 			return results, true, nil
 		}
 		if !time.Now().Before(deadline) {
@@ -247,6 +250,15 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func() []st
 // minPollRead is the least time one poll's reads get, even when the timeout
 // is already spent, so the poll still takes its one snapshot.
 const minPollRead = time.Second
+
+// readContext bounds one read step of the poll by the poll deadline, but
+// gives it at least minPollRead.
+func readContext(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if floor := time.Now().Add(minPollRead); floor.After(deadline) {
+		deadline = floor
+	}
+	return context.WithDeadline(ctx, deadline)
+}
 
 // allSettled returns true iff every row is in a terminal kstatus. InProgress
 // and Unknown count as still-changing so the poll keeps running.

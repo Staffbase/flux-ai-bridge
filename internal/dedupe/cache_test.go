@@ -184,6 +184,47 @@ func TestPRRoster_RoundTrip(t *testing.T) {
 	}
 }
 
+// A pending de-scope marker leaves the roster for every reader but stays
+// visible to ReadPRScopeState until RemovePRScope drops it; re-attributing the
+// scope replaces it. Both backends behave the same, and the Redis write
+// reports a backend error so the caller can keep its retry state.
+func TestPRRoster_DescopingMarker(t *testing.T) {
+	t.Parallel()
+	mem := dedupe.NewNoExpiry(16)
+	rc, mr := newRedis(t)
+	for name, c := range map[string]*dedupe.Cache{"memory": mem, "redis": rc} {
+		c.AddPRScope("o", "r", 42, "ns/k1", time.Hour)
+		c.AddPRScope("o", "r", 42, "ns/k2", time.Hour)
+		if err := c.MarkPRScopeDescoping("o", "r", 42, "ns/k1", time.Hour); err != nil {
+			t.Fatalf("%s: MarkPRScopeDescoping: %v", name, err)
+		}
+		if got := c.PRScopes("o", "r", 42); len(got) != 1 || got[0] != "ns/k2" {
+			t.Errorf("%s: a de-scoping scope must leave the roster; got %v", name, got)
+		}
+		if listed, descoping, err := c.ReadPRScopeState("o", "r", 42, "ns/k1"); err != nil || listed || !descoping {
+			t.Errorf("%s: state = listed %v, descoping %v, err %v; want descoping", name, listed, descoping, err)
+		}
+		c.AddPRScope("o", "r", 42, "ns/k1", time.Hour)
+		if listed, descoping, _ := c.ReadPRScopeState("o", "r", 42, "ns/k1"); !listed || descoping {
+			t.Errorf("%s: re-attributing must replace the marker; listed %v, descoping %v", name, listed, descoping)
+		}
+		_ = c.MarkPRScopeDescoping("o", "r", 42, "ns/k1", time.Hour)
+		if !c.RemovePRScope("o", "r", 42, "ns/k1") {
+			t.Errorf("%s: RemovePRScope must drop the marker", name)
+		}
+		if listed, descoping, _ := c.ReadPRScopeState("o", "r", 42, "ns/k1"); listed || descoping {
+			t.Errorf("%s: marker still present after RemovePRScope", name)
+		}
+	}
+	mr.SetError("LOADING")
+	if err := rc.MarkPRScopeDescoping("o", "r", 42, "ns/k2", time.Hour); err == nil {
+		t.Error("a failed marker write must return the backend error")
+	}
+	if _, _, err := rc.ReadPRScopeState("o", "r", 42, "ns/k2"); err == nil {
+		t.Error("a failed roster read must return the backend error")
+	}
+}
+
 // A nil/disabled cache must no-op the roster without panicking.
 func TestPRRoster_NilSafe(t *testing.T) {
 	t.Parallel()

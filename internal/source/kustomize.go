@@ -260,9 +260,14 @@ func (t *Tree) BuildFileSetWithComponents(startDir string, comps Components) (ma
 	return out, nil
 }
 
-// exists reports whether p is a file or a directory in the tree.
+// exists reports whether p is a file or a directory in the tree. A directory
+// exists if the artifact lists it explicitly (an empty one too) or if a file
+// lies below it.
 func (t *Tree) exists(p string) bool {
 	if _, ok := t.kustomizations[p]; ok || t.HasPath(p) {
+		return true
+	}
+	if _, ok := t.dirs[p]; ok {
 		return true
 	}
 	prefix := p + "/"

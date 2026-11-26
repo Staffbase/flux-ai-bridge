@@ -415,6 +415,55 @@ func TestBuildFileSetWithComponents_ComponentsOnly(t *testing.T) {
 	}
 }
 
+// An artifact can list an empty directory explicitly (a tar directory entry
+// with no file below it). Flux still builds a Kustomization rooted there from
+// its components, so the build set must not fail as a missing spec.path.
+func TestBuildFileSetWithComponents_EmptyDirectoryEntry(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "apps/empty/", Mode: 0o755, Typeflag: tar.TypeDir}); err != nil {
+		t.Fatalf("write dir header: %v", err)
+	}
+	for p, body := range map[string]string{
+		"components/tls/kustomization.yaml": "kind: Component\npatches:\n  - path: tls.yaml\n",
+		"components/tls/tls.yaml":           "kind: Deployment\n",
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: p, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("write header %s: %v", p, err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatalf("write body %s: %v", p, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	tree, err := ReadTarGz(&buf)
+	if err != nil {
+		t.Fatalf("ReadTarGz: %v", err)
+	}
+	if tree.HasPath("apps/empty") {
+		t.Error("a directory entry must not count as a regular file")
+	}
+	comps := Components{Paths: []string{"../../components/tls"}}
+	set, err := tree.BuildFileSetWithComponents("apps/empty", comps)
+	if err != nil {
+		t.Fatalf("BuildFileSetWithComponents on an empty directory entry: %v", err)
+	}
+	for _, p := range []string{"components/tls/kustomization.yaml", "components/tls/tls.yaml"} {
+		if _, ok := set[p]; !ok {
+			t.Errorf("component file %s missing; set = %v", p, keys(set))
+		}
+	}
+	if _, err := tree.BuildFileSetWithComponents("apps/empty", Components{}); err == nil {
+		t.Error("an empty directory with no components must still fail the build set")
+	}
+}
+
 func keys(m map[string]struct{}) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

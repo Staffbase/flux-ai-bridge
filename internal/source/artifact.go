@@ -54,12 +54,19 @@ var kustomizationNames = map[string]struct{}{
 }
 
 // Tree is the in-memory projection of an artifact: every regular file's path,
-// plus the bytes of kustomization files only. It carries no resource bodies.
+// every explicit directory entry, plus the bytes of kustomization files only.
+// It carries no resource bodies.
 type Tree struct {
 	// paths holds every regular-file path in the artifact (cleaned,
 	// slash-separated, repo-root-relative). Used for membership tests and to
 	// tell a referenced file from a referenced directory.
 	paths map[string]struct{}
+	// dirs holds every explicit directory entry in the artifact (same form as
+	// paths). It is kept apart from paths so file membership stays exact, and
+	// is consulted only where the build asks whether a directory exists: an
+	// empty directory has no file below it, yet Flux still builds a
+	// Kustomization rooted there from its components.
+	dirs map[string]struct{}
 	// kustomizations maps a directory path to that directory's kustomization
 	// file. The key is the containing directory (cleaned); "." is the repo
 	// root. The entry keeps the file's real path so editing the kustomization
@@ -105,6 +112,7 @@ func ReadTarGz(r io.Reader) (*Tree, error) {
 
 	t := &Tree{
 		paths:          make(map[string]struct{}),
+		dirs:           make(map[string]struct{}),
 		kustomizations: make(map[string]kustEntry),
 	}
 
@@ -123,8 +131,16 @@ func ReadTarGz(r io.Reader) (*Tree, error) {
 		if entries++; entries > maxEntries {
 			return nil, fmt.Errorf("artifact exceeds %d entries", maxEntries)
 		}
+		if hdr.Typeflag == tar.TypeDir {
+			// Not a build input, but it exists: record it so an empty
+			// directory still counts as a build root.
+			if rel, ok := cleanArtifactPath(hdr.Name); ok {
+				t.dirs[rel] = struct{}{}
+			}
+			continue
+		}
 		if hdr.Typeflag != tar.TypeReg {
-			continue // dirs, symlinks, etc. — not build inputs we track
+			continue // symlinks, etc. — not build inputs we track
 		}
 		rel, ok := cleanArtifactPath(hdr.Name)
 		if !ok {

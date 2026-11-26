@@ -886,7 +886,7 @@ func TestWaitUntilSettledFunc_RefsGrowMidPoll(t *testing.T) {
 	checker := NewChecker(s)
 
 	var refsFuncCalls atomic.Int32
-	refsFunc := func() []string {
+	refsFunc := func(context.Context) []string {
 		n := refsFuncCalls.Add(1)
 		if n <= 2 {
 			return []string{"default_a_apps_Deployment"}
@@ -985,6 +985,30 @@ func TestWaitUntilSettled_ReadsBoundedByTimeout(t *testing.T) {
 	}
 }
 
+// The refs read is bounded like the row reads: a refsFunc that reads slowly
+// (a HelmRelease expansion over MCP) gets a ctx that ends at the poll
+// deadline (at least the 1s floor), so it can't run the poll past the timeout.
+func TestWaitUntilSettledFunc_RefsReadBoundedByTimeout(t *testing.T) {
+	fake := &fakeFetcher{resources: map[string]string{
+		"apps/v1|Deployment|api|default": inProgressDeploymentYAML,
+	}}
+	refsFunc := func(ctx context.Context) []string {
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+		}
+		return []string{"default_api_apps_Deployment"}
+	}
+	start := time.Now()
+	_, settled, err := NewChecker(fake).WaitUntilSettledFunc(context.Background(), refsFunc, 10*time.Millisecond, 50*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("poll returned after %s, want the refs read cut at the 1s floor", elapsed)
+	}
+}
+
 // The refs and the rows are separate reads. When the refs change between
 // them (a HelmRelease finished its install and now lists a child the refs
 // read missed), an all-Current snapshot of the old refs is not settled.
@@ -994,7 +1018,7 @@ func TestWaitUntilSettledFunc_RefsChangedAfterCheck(t *testing.T) {
 		"apps/v1|Deployment|b|default": readyDeploymentYAML,
 	}}
 	var calls atomic.Int32
-	refsFunc := func() []string {
+	refsFunc := func(context.Context) []string {
 		if calls.Add(1) == 1 {
 			return []string{"default_a_apps_Deployment"}
 		}

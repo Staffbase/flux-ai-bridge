@@ -605,10 +605,12 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	// closure below (WaitUntilSettledFunc calls refsFunc synchronously, never
 	// concurrently) — so once the loop exits, it reflects the LAST observed
 	// state: whichever HelmReleases still had no visible children at settle
-	// time (or at timeout). Surfaced in the comment below.
+	// time (or at timeout). Surfaced in the comment below. The expansion reads
+	// use the poll's read context, so they are bounded by the poll timeout
+	// like the row reads; a cut-short read leaves that HelmRelease pending.
 	var pendingHelmReleases []pendingHelmRelease
-	resourceStatuses, settled, err := p.checker.WaitUntilSettledFunc(ctx, func() []string {
-		expanded, pending := p.expandHelmReleaseInventories(ctx, readinessRefs)
+	resourceStatuses, settled, err := p.checker.WaitUntilSettledFunc(ctx, func(readCtx context.Context) []string {
+		expanded, pending := p.expandHelmReleaseInventories(readCtx, readinessRefs)
 		pendingHelmReleases = pending
 		return expanded
 	}, p.cfg.ReadinessPollInterval, pollTimeout)
@@ -1561,22 +1563,53 @@ func (p *Processor) filterPRs(ctx context.Context, owner, repo, ns, name, revisi
 			// recompute whenever EITHER changed. Both removes report presence, so
 			// a PR that never touched this Kustomization still costs nothing.
 			if p.cfg.PRLabelEnabled {
-				removedOutcome := p.dedupe.RemoveScopeOutcome(owner, repo, pr.Number, pr.HeadSHA, ns+"/"+name)
-				removedRoster := p.dedupe.RemovePRScope(owner, repo, pr.Number, ns+"/"+name)
-				if removedOutcome || removedRoster {
-					// Best-effort like the comment cleanup above (logged inside).
-					// A failed write puts the scope back on the roster: with
-					// both entries gone, the next event would find nothing to
-					// remove and never retry the write. Back on the roster, it
-					// holds flux-success (fail closed) until that retry.
-					if err := p.applyPRLabel(ctx, owner, repo, pr.Number, pr.HeadSHA, bridgegithub.OutcomeNone); err != nil {
-						p.dedupe.AddPRScope(owner, repo, pr.Number, ns+"/"+name, labelStateTTL)
-					}
-				}
+				p.descopeLabel(ctx, owner, repo, pr, ns+"/"+name)
 			}
 		}
 	}
 	return out, finalized, prunedToVerify, selfRemovalOnly, nil
+}
+
+// descopeLabel drops a scope the PR no longer touches from its label
+// aggregate (the per-head outcome) and its roster, and rewrites the labels.
+// Best-effort like the comment cleanup: failures are logged, never fatal to
+// the filter.
+//
+// The retry state is written before anything is removed: the roster entry
+// becomes a de-scope marker (MarkPRScopeDescoping), which roster reads skip,
+// so the rewrite already sees the scope as gone. The marker is dropped only
+// after the rewrite succeeds. If the rewrite fails, the next event finds the
+// marker and retries it; removing the entries first would leave nothing for
+// that event to find, and a de-scoped failure or a held success on the PR. If
+// the marker can't be written, or the roster can't be read, nothing is
+// removed, so the next event retries the whole de-scope.
+//
+// A PR that never touched this scope has no roster entry and no outcome, and
+// costs two reads.
+func (p *Processor) descopeLabel(ctx context.Context, owner, repo string, pr bridgegithub.PRInfo, scope string) {
+	listed, descoping, err := p.dedupe.ReadPRScopeState(owner, repo, pr.Number, scope)
+	if err != nil {
+		p.logger.Warn("de-scope label update deferred: PR roster unreadable",
+			"pr", pr.Number, "kustomization", scope, "error", err.Error())
+		return
+	}
+	if !listed && !descoping {
+		if _, ok := p.dedupe.ScopeOutcomes(owner, repo, pr.Number, pr.HeadSHA)[scope]; !ok {
+			return
+		}
+	}
+	if !descoping {
+		if err := p.dedupe.MarkPRScopeDescoping(owner, repo, pr.Number, scope, labelStateTTL); err != nil {
+			p.logger.Warn("de-scope label update deferred: could not record the pending de-scope",
+				"pr", pr.Number, "kustomization", scope, "error", err.Error())
+			return
+		}
+	}
+	p.dedupe.RemoveScopeOutcome(owner, repo, pr.Number, pr.HeadSHA, scope)
+	if err := p.applyPRLabel(ctx, owner, repo, pr.Number, pr.HeadSHA, bridgegithub.OutcomeNone); err != nil {
+		return // logged inside; the marker stays for the next event's retry
+	}
+	p.dedupe.RemovePRScope(owner, repo, pr.Number, scope)
 }
 
 // fluxKustomizationGroupKind is the trailing `<group>_<kind>` of a Flux

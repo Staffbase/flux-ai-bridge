@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -365,6 +366,67 @@ func (c *perPRErrCommenter) RemoveComment(ctx context.Context, owner, repo, ns, 
 		return err
 	}
 	return c.fakeCommenter.RemoveComment(ctx, owner, repo, ns, name, prNumber)
+}
+
+// labelHookCommenter runs onLabel before each label write.
+type labelHookCommenter struct {
+	*fakeCommenter
+	onLabel func()
+}
+
+func (c *labelHookCommenter) SetPRLabels(ctx context.Context, owner, repo string, prNumber int, headSHA string, outcome bridgegithub.Outcome) error {
+	if c.onLabel != nil {
+		c.onLabel()
+	}
+	return c.fakeCommenter.SetPRLabels(ctx, owner, repo, prNumber, headSHA, outcome)
+}
+
+// A de-scope label write that fails must stay retryable even when the backend
+// fails right after it: keeping the retry state may not need a roster write
+// after the failed label write, since that write can fail as well. Here Redis
+// rejects every command from the failed label write until the event ends; once
+// it recovers, the next event retries the write and finishes the de-scope.
+func TestProcess_DeScope_FailedLabelWriteRetriedWhenBackendFailsToo(t *testing.T) {
+	cache, mr := newRedisDedupe(t)
+	owner, repo, pr, head := "owner", "repo", 42, "h-new"
+	cache.AddPRScope(owner, repo, pr, "default/apps", time.Hour)
+	cache.AddPRScope(owner, repo, pr, "default/other", time.Hour)
+	cache.PutScopeOutcome(owner, repo, pr, head, "default/apps", string(bridgegithub.OutcomeSuccess), time.Hour)
+	cache.PutScopeOutcome(owner, repo, pr, head, "default/other", string(bridgegithub.OutcomeFailure), time.Hour)
+
+	mcpMock := &fakeMCPClient{data: []byte(kustomizationOneInventoryEntry)} // inventory: default_any__ConfigMap
+	fc := &fakeCommenter{
+		prNumber: pr, prState: "open", prHeadSHA: head,
+		prFiles:  []bridgegithub.PRFile{{Path: "x.yaml", BlobSHA: "b1", Status: "modified"}},
+		blobs:    map[string][]byte{"b1": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nope\n  namespace: default\n")},
+		labelErr: errors.New("server error"),
+	}
+	commenterMock := &labelHookCommenter{fakeCommenter: fc, onLabel: func() { mr.SetError("LOADING Redis is loading the dataset in memory") }}
+	cfg := &config.Config{GitHubRepo: owner + "/" + repo, LLMProvider: "none", PRLabelEnabled: true, ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, cache, slog.Default())
+	event := eventv1.Event{InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "other", Namespace: "default"}}
+
+	_ = proc.Process(context.Background(), event, "srcrev") // the outage may fail the event too
+	if len(fc.labelCalls) == 0 {
+		t.Fatal("the de-scope did not attempt a label write")
+	}
+
+	mr.SetError("")
+	commenterMock.onLabel = nil
+	fc.labelErr = nil
+	before := len(fc.labelCalls)
+	if err := proc.Process(context.Background(), event, "srcrev"); err != nil {
+		t.Fatalf("Process (retry): %v", err)
+	}
+	if calls := fc.labelCalls[before:]; len(calls) == 0 || calls[len(calls)-1].Outcome != bridgegithub.OutcomeSuccess {
+		t.Fatalf("the failed de-scope label write was not retried; label calls on the next event %+v", calls)
+	}
+	if slices.Contains(cache.PRScopes(owner, repo, pr), "default/other") {
+		t.Fatal("default/other still on the roster after the retried de-scope")
+	}
+	if mr.HGet("p:label:owner/repo:pr42:roster", "default/other") != "" {
+		t.Fatal("the pending de-scope marker outlived the retried label write")
+	}
 }
 
 // A rate-limited label write on one PR keeps its cooldown when a later PR's

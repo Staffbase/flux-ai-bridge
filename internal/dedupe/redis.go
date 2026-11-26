@@ -250,18 +250,25 @@ func (r *redisStore) incrReEval(k Key, ttl time.Duration) int {
 func (r *redisStore) labelKeyOf(key string) string { return r.keyPrefix + "label:" + key }
 
 func (r *redisStore) hsetScopeOutcome(key, field, outcome string, ttl time.Duration) {
+	if err := r.hset(key, field, outcome, ttl); err != nil {
+		slog.Default().Warn("dedupe: redis HSET label-state failed (best-effort)",
+			"key", key, "scope", field, "error", err.Error())
+	}
+}
+
+// hset is hsetScopeOutcome with the backend error, for callers that must
+// not carry on when the write didn't land.
+func (r *redisStore) hset(key, field, value string, ttl time.Duration) error {
 	ctx, cancel := r.ctx()
 	defer cancel()
 	rk := r.labelKeyOf(key)
 	pipe := r.client.Pipeline()
-	pipe.HSet(ctx, rk, field, outcome)
+	pipe.HSet(ctx, rk, field, value)
 	if ttl = r.bound(ttl); ttl > 0 {
 		pipe.Expire(ctx, rk, ttl)
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		slog.Default().Warn("dedupe: redis HSET label-state failed (best-effort)",
-			"key", key, "scope", field, "error", err.Error())
-	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (r *redisStore) hdelScopeOutcome(key, field string) bool {

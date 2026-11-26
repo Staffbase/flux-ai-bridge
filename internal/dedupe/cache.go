@@ -513,34 +513,63 @@ func rosterKey(owner, repo string, pr int) string {
 	return owner + "/" + repo + ":pr" + strconv.Itoa(pr) + ":roster"
 }
 
+// Roster entry values. A listed scope is one the PR is attributed to. A
+// descoping scope is one whose de-scope has not finished: the PR no longer
+// touches it, but the label rewrite that drops it from the aggregate hasn't
+// succeeded yet. The entry is the retry state for that rewrite, so it stays
+// until the rewrite lands; roster reads skip it, so it never holds
+// flux-success.
+const (
+	rosterListed    = "1"
+	rosterDescoping = "descoping"
+)
+
 // AddPRScope records that `scope` is one of the Kustomizations this PR touches
 // (head-independent roster). ttl bounds the Redis record, refreshed each call;
 // the in-memory store is LRU-bounded and ignores ttl. No-op on a nil cache.
+// It replaces a pending de-scope of the same scope: the PR touches it again.
 func (c *Cache) AddPRScope(owner, repo string, pr int, scope string, ttl time.Duration) {
+	if err := c.setPRScope(owner, repo, pr, scope, rosterListed, ttl); err != nil {
+		slog.Default().Warn("dedupe: redis HSET label-state failed (best-effort)",
+			"key", rosterKey(owner, repo, pr), "scope", scope, "error", err.Error())
+	}
+}
+
+// MarkPRScopeDescoping records that `scope` is being de-scoped from the PR: it
+// leaves the roster for every reader, but stays as the retry state for the
+// label rewrite until RemovePRScope drops it. It returns the backend error, so
+// the caller can leave the scope's outcome and roster entry in place, and the
+// de-scope to a later event, when the marker didn't land.
+func (c *Cache) MarkPRScopeDescoping(owner, repo string, pr int, scope string, ttl time.Duration) error {
+	return c.setPRScope(owner, repo, pr, scope, rosterDescoping, ttl)
+}
+
+func (c *Cache) setPRScope(owner, repo string, pr int, scope, value string, ttl time.Duration) error {
 	if c == nil || c.s == nil {
-		return
+		return nil
 	}
 	key := rosterKey(owner, repo, pr)
 	if r, ok := c.s.(*redisStore); ok {
-		r.hsetScopeOutcome(key, scope, "1", ttl)
-		return
+		return r.hset(key, scope, value, ttl)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.labels == nil {
-		return
+		return nil
 	}
 	prev, _ := c.labels.Get(key)
 	next := make(map[string]string, len(prev)+1)
 	for k, v := range prev {
 		next[k] = v
 	}
-	next[scope] = "1"
+	next[scope] = value
 	c.labels.Add(key, next)
+	return nil
 }
 
 // RemovePRScope drops `scope` from the PR roster (when the PR no longer touches
-// that Kustomization). Returns true if it was present.
+// that Kustomization), a pending de-scope marker included. Returns true if it
+// was present.
 func (c *Cache) RemovePRScope(owner, repo string, pr int, scope string) bool {
 	if c == nil || c.s == nil {
 		return false
@@ -586,33 +615,57 @@ func (c *Cache) PRScopes(owner, repo string, pr int) []string {
 
 // ReadPRScopes is PRScopes with the backend read error. Deciding that every
 // known scope has reported (the gate for a flux-success label) must fail
-// closed on an error: an unreadable roster is not an empty one.
+// closed on an error: an unreadable roster is not an empty one. A scope
+// being de-scoped (MarkPRScopeDescoping) is not listed.
 func (c *Cache) ReadPRScopes(owner, repo string, pr int) ([]string, error) {
 	if c == nil || c.s == nil {
 		return nil, nil
 	}
-	key := rosterKey(owner, repo, pr)
-	var m map[string]string
-	if r, ok := c.s.(*redisStore); ok {
-		var err error
-		if m, err = r.hgetall(key); err != nil {
-			return nil, err
-		}
-	} else {
-		c.mu.Lock()
-		if c.labels != nil {
-			if prev, ok := c.labels.Get(key); ok {
-				m = make(map[string]string, len(prev))
-				for k, v := range prev {
-					m[k] = v
-				}
-			}
-		}
-		c.mu.Unlock()
+	m, err := c.readRoster(owner, repo, pr)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
+	for k, v := range m {
+		if v != rosterDescoping {
+			out = append(out, k)
+		}
 	}
 	return out, nil
+}
+
+// ReadPRScopeState reports whether `scope` is on the PR roster (listed) or
+// has a pending de-scope (descoping), with the backend read error.
+func (c *Cache) ReadPRScopeState(owner, repo string, pr int, scope string) (listed, descoping bool, err error) {
+	m, err := c.readRoster(owner, repo, pr)
+	if err != nil {
+		return false, false, err
+	}
+	v, ok := m[scope]
+	return ok && v != rosterDescoping, ok && v == rosterDescoping, nil
+}
+
+// readRoster returns a copy of the PR roster hash: scope → entry value.
+func (c *Cache) readRoster(owner, repo string, pr int) (map[string]string, error) {
+	if c == nil || c.s == nil {
+		return nil, nil
+	}
+	key := rosterKey(owner, repo, pr)
+	if r, ok := c.s.(*redisStore); ok {
+		return r.hgetall(key)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.labels == nil {
+		return nil, nil
+	}
+	prev, ok := c.labels.Get(key)
+	if !ok {
+		return nil, nil
+	}
+	m := make(map[string]string, len(prev))
+	for k, v := range prev {
+		m[k] = v
+	}
+	return m, nil
 }

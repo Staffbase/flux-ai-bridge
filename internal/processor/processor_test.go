@@ -621,6 +621,72 @@ status:
 	}
 }
 
+// slowHelmReleaseMCP serves HelmRelease reads only after delay, or the ctx
+// error if ctx ends first, like an MCP call bound to its context.
+type slowHelmReleaseMCP struct {
+	*fakeMCPClient
+	delay time.Duration
+}
+
+func (s *slowHelmReleaseMCP) GetKubernetesResource(ctx context.Context, apiVersion, kind, name, namespace string) ([]byte, error) {
+	if kind == "HelmRelease" {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.fakeMCPClient.GetKubernetesResource(ctx, apiVersion, kind, name, namespace)
+}
+
+// The HelmRelease expansion reads during the readiness poll are bounded by
+// READINESS_POLL_TIMEOUT (at least 1s per read) like the row reads: a slow
+// MCP read must not run the poll past its timeout. The cut-short expansion
+// leaves the HelmRelease unverified, so the run fails closed to a warning.
+func TestProcess_HelmReleaseExpansionReadsBoundedByPollTimeout(t *testing.T) {
+	mcpMock := &slowHelmReleaseMCP{delay: 6 * time.Second, fakeMCPClient: &fakeMCPClient{
+		data: []byte(`
+status:
+  inventory:
+    entries:
+      - id: "default_app_helm.toolkit.fluxcd.io_HelmRelease"
+`),
+		resources: map[string][]byte{
+			"helm.toolkit.fluxcd.io/v2|HelmRelease|app|default": []byte(helmReleaseReadyNoHistoryYAML),
+		},
+	}}
+	commenterMock := &fakeCommenter{
+		prNumber: 42,
+		prFiles:  []bridgegithub.PRFile{{Path: "release.yaml", BlobSHA: "hr-blob", Status: "modified"}},
+		blobs: map[string][]byte{
+			"hr-blob": []byte("apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: app\n  namespace: default\n"),
+		},
+	}
+	cfg := &config.Config{
+		GitHubRepo:                  "owner/repo",
+		ReadinessExpandHelmReleases: true,
+		ReadinessPollInterval:       time.Millisecond,
+		ReadinessPollTimeout:        10 * time.Millisecond,
+	}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "apps", Namespace: "default"},
+		Severity:       eventv1.EventSeverityInfo,
+		Reason:         "ReconciliationSucceeded",
+	}
+
+	start := time.Now()
+	if err := proc.Process(context.Background(), event, "abc1234"); err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Process took %s: the expansion reads ran past the 10ms poll timeout and its 1s read floor", elapsed)
+	}
+	if !strings.Contains(commenterMock.prCommentBody, "# ⚠️ Flux Status") {
+		t.Errorf("a cut-short expansion must fail closed to a warning, got: %s", commenterMock.prCommentBody)
+	}
+}
+
 // TestProcess_PendingHelmRelease_KeepsLLMInLoop covers the review finding
 // that the pending signal wasn't wired into the LLM path: with
 // LLM_SKIP_ON_HEALTHY=true, a pending-only warning (all tables Current,
