@@ -28,7 +28,7 @@ func TestIsBridgeComment(t *testing.T) {
 	human := &gh.User{Type: gh.String("User"), Login: gh.String("someone")}
 	for name, tc := range map[string]struct {
 		comment  *gh.IssueComment
-		botLogin string // "" = the App's identity is unknown (lookup failed)
+		botLogin string // "" = the App's identity is unknown: no comment matches
 		want     bool
 	}{
 		"bridge comment":                         {&gh.IssueComment{User: bridge, Body: gh.String(marker + "\n# ✅ Flux Status")}, self, true},
@@ -38,8 +38,9 @@ func TestIsBridgeComment(t *testing.T) {
 		"human quoting the marker":               {&gh.IssueComment{User: human, Body: gh.String(marker + "\nplease look")}, self, false},
 		"marker further down the body":           {&gh.IssueComment{User: bridge, Body: gh.String("note\n" + marker + "\n")}, self, false},
 		"other scope's marker":                   {&gh.IssueComment{User: bridge, Body: gh.String(commentMarkerFor("apps", "web-canary") + "\n")}, self, false},
-		"identity unknown: any bot's marker":     {&gh.IssueComment{User: otherBot, Body: gh.String(marker + "\n")}, "", true},
-		"identity unknown: no author info":       {&gh.IssueComment{Body: gh.String(marker + "\nbody")}, "", true},
+		"identity unknown: the bridge's marker":  {&gh.IssueComment{User: bridge, Body: gh.String(marker + "\n")}, "", false},
+		"identity unknown: any bot's marker":     {&gh.IssueComment{User: otherBot, Body: gh.String(marker + "\n")}, "", false},
+		"identity unknown: no author info":       {&gh.IssueComment{Body: gh.String(marker + "\nbody")}, "", false},
 		"identity unknown: human quoting marker": {&gh.IssueComment{User: human, Body: gh.String(marker + "\n")}, "", false},
 	} {
 		if got := isBridgeComment(tc.comment, marker, tc.botLogin); got != tc.want {

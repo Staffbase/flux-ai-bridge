@@ -1170,3 +1170,67 @@ func TestResolverRefresh_KeepsKnownVersionsOnEmptyOrPartialDiscovery(t *testing.
 		}
 	}
 }
+
+// A kind discovery once knew at a version the cluster may no longer serve
+// (a CRD upgraded v1beta1 → v1) reads NotFound there. When the refresh that
+// NotFound triggers fails, or answers without the kind, nothing confirms the
+// cached version is still served, so the NotFound doesn't prove the resource
+// is gone: the row is marked VersionGuessed, like a read at a guessed version.
+// A refresh that lists the kind at the version read confirms it.
+func TestCheckOne_UnconfirmedCachedVersionIsGuessed(t *testing.T) {
+	cached := []VersionEntry{{Group: "example.com", Kind: "Widget", Version: "v1beta1"}}
+	cases := []struct {
+		name    string
+		refresh func(context.Context) ([]VersionEntry, error)
+		want    bool
+	}{
+		{"refresh fails", func(context.Context) ([]VersionEntry, error) {
+			return nil, errors.New("discovery unavailable")
+		}, true},
+		{"refresh answers nothing", func(context.Context) ([]VersionEntry, error) {
+			return nil, nil
+		}, true},
+		{"refresh leaves the kind out", func(context.Context) ([]VersionEntry, error) {
+			return []VersionEntry{{Group: "other.io", Kind: "Gadget", Version: "v1"}}, nil
+		}, true},
+		{"refresh confirms the version", func(context.Context) ([]VersionEntry, error) {
+			return cached, nil
+		}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resolver := NewResolver(cached).WithRefresher(c.refresh)
+			checker := NewChecker(&fakeFetcher{resources: map[string]string{}}).WithResolver(resolver)
+			results, err := checker.CheckAll(context.Background(), []string{"ns1_w1_example.com_Widget"})
+			if err != nil {
+				t.Fatalf("CheckAll: %v", err)
+			}
+			if results[0].Status != "NotFound" {
+				t.Fatalf("status = %q, want NotFound", results[0].Status)
+			}
+			if results[0].VersionGuessed != c.want {
+				t.Errorf("VersionGuessed = %v, want %v", results[0].VersionGuessed, c.want)
+			}
+		})
+	}
+}
+
+// Within the refresh cooldown no new discovery runs, so the latest attempt
+// decides: after a failed refresh, a NotFound at a cached version stays
+// unconfirmed until a later refresh lists it.
+func TestCheckOne_FailedRefreshLeavesCachedVersionUnconfirmedDuringCooldown(t *testing.T) {
+	cached := []VersionEntry{{Group: "example.com", Kind: "Widget", Version: "v1beta1"}}
+	resolver := NewResolver(cached).WithRefresher(func(context.Context) ([]VersionEntry, error) {
+		return nil, errors.New("discovery unavailable")
+	})
+	checker := NewChecker(&fakeFetcher{resources: map[string]string{}}).WithResolver(resolver)
+	for i := range 2 { // the second check falls inside the cooldown
+		results, err := checker.CheckAll(context.Background(), []string{"ns1_w1_example.com_Widget"})
+		if err != nil {
+			t.Fatalf("CheckAll #%d: %v", i, err)
+		}
+		if !results[0].VersionGuessed {
+			t.Errorf("check #%d: VersionGuessed = false, want true (no discovery confirmed the cached version)", i)
+		}
+	}
+}

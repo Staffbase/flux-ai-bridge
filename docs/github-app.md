@@ -58,9 +58,10 @@ marker is never edited, kept as current, or deleted as the bridge's.
 
 `GET /app` needs **no extra permission**: any App can read its own metadata
 with its JWT. If the call fails (network, a GitHub outage), the bridge logs a
-`WARN` (`GitHub App identity lookup failed ...`), starts anyway, and falls back
-to recognising its comments by the marker and a non-human author until the next
-restart. On success it logs `GitHub App identity resolved` with the
+`WARN` (`GitHub App identity lookup failed; retrying on each comment update ...`)
+and starts anyway. Each comment update retries the lookup; while it keeps
+failing, the update fails and no comment is edited or deleted, so the event
+is retried. On success it logs `GitHub App identity resolved` with the
 `bot_login`.
 
 ### Account & organization permissions

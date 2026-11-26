@@ -100,7 +100,7 @@ func (s *commentServer) mux() *http.ServeMux {
 			s.listCalls++
 			var out []map[string]any
 			for id, body := range s.live {
-				out = append(out, map[string]any{"id": float64(id), "body": body})
+				out = append(out, map[string]any{"user": appUser, "id": float64(id), "body": body})
 			}
 			_ = json.NewEncoder(w).Encode(out)
 		case http.MethodPost:
@@ -112,7 +112,7 @@ func (s *commentServer) mux() *http.ServeMux {
 			s.nextID++
 			s.live[id] = in.Body
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id), "body": in.Body})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(id), "body": in.Body})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {

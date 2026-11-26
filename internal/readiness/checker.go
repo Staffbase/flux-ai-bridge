@@ -64,10 +64,13 @@ type ResourceStatus struct {
 	// VersionGuessed reports that the final read of this row used a guessed
 	// apiVersion: the (group, kind) wasn't in MCP's discovery cache, even
 	// after the NotFound refresh in checkOne, so the version came from
-	// fallbackPreferredVersions or the "v1" default. A NotFound under a
-	// guessed version may only mean the bridge asked for a version the
-	// cluster doesn't serve, so it doesn't prove the resource is gone. The
-	// core group ("") is never guessed: it only serves v1.
+	// fallbackPreferredVersions or the "v1" default. A NotFound row is also
+	// marked when its version came from the cache but the latest discovery
+	// attempt didn't confirm it (it failed, came back empty, or left the kind
+	// out). A NotFound under such a version may only mean the bridge asked
+	// for a version the cluster doesn't serve, so it doesn't prove the
+	// resource is gone. The core group ("") is never guessed: it only serves
+	// v1.
 	VersionGuessed bool
 	// Replicas carries the hard replica accounting for workload kinds
 	// (Deployment/StatefulSet/ReplicaSet/DaemonSet); nil for everything else.
@@ -305,16 +308,19 @@ func (c *Checker) checkOne(ctx context.Context, ref string) ResourceStatus {
 		if _, rerr := c.resolver.Refresh(ctx); rerr != nil {
 			c.log().Warn("readiness: discovery refresh failed", "group", parsed.Group, "kind", parsed.Kind, "error", rerr.Error())
 		}
-		if v, nowKnown := c.resolver.apiVersionKnown(parsed.Group, parsed.Kind); nowKnown {
-			// Discovery now knows the kind: either at the version already read
-			// (the NotFound stands, read at a known version) or at another one,
-			// which is re-polled.
-			known = true
-			if v != apiVersion {
-				c.log().Info("readiness: re-resolved apiVersion after NotFound; retrying",
-					"group", parsed.Group, "kind", parsed.Kind, "from", apiVersion, "to", v)
-				rs = c.fetchResource(ctx, parsed, v)
-			}
+		if v, nowKnown := c.resolver.apiVersionKnown(parsed.Group, parsed.Kind); nowKnown && v != apiVersion {
+			// Discovery now knows the kind at another version: re-poll there.
+			c.log().Info("readiness: re-resolved apiVersion after NotFound; retrying",
+				"group", parsed.Group, "kind", parsed.Kind, "from", apiVersion, "to", v)
+			apiVersion, known = v, true
+			rs = c.fetchResource(ctx, parsed, v)
+		}
+		// A NotFound counts as read at a known version only when the latest
+		// discovery attempt lists the kind at the version read. A cache entry
+		// alone isn't enough: a failed, empty or partial refresh keeps it,
+		// though the cluster may no longer serve that version.
+		if rs.Status == "NotFound" {
+			known = c.resolver.confirmedVersion(parsed.Group, parsed.Kind, apiVersion)
 		}
 	}
 	// The core group only serves v1, so its "v1" default is no guess.
@@ -682,6 +688,11 @@ var fallbackPreferredVersions = map[string]string{
 type Resolver struct {
 	cacheMu sync.RWMutex
 	cache   map[groupKind]string
+	// confirmed holds what the latest discovery attempt answered: the startup
+	// entries, then each Refresh's response (empty when it failed or came back
+	// empty). Unlike cache it isn't merged, so an entry a failed or partial
+	// refresh left stale in cache isn't in it. See confirmedVersion.
+	confirmed map[groupKind]string
 
 	// refreshFn re-runs MCP discovery (nil → refresh disabled). Used to pick up
 	// CRDs registered AFTER startup: a resource whose group the resolver doesn't
@@ -716,7 +727,8 @@ const discoveryRefreshCooldown = 60 * time.Second
 // Duplicate (group, kind) pairs from the source take the last entry, which
 // matches MCP's "preferred version wins" semantics.
 func NewResolver(entries []VersionEntry) *Resolver {
-	return &Resolver{cache: cacheFromEntries(entries)}
+	cache := cacheFromEntries(entries)
+	return &Resolver{cache: cache, confirmed: cache}
 }
 
 func cacheFromEntries(entries []VersionEntry) map[groupKind]string {
@@ -775,6 +787,21 @@ func (r *Resolver) apiVersionKnown(group, kind string) (string, bool) {
 	return formatAPIVersion(group, "v1"), false
 }
 
+// confirmedVersion reports whether the latest discovery attempt (the startup
+// discovery, or the last Refresh that ran) listed (group, kind) at apiVersion.
+// A cached entry alone doesn't confirm it: a failed, empty or partial refresh
+// keeps the old entry in the cache, though the cluster may no longer serve
+// that version.
+func (r *Resolver) confirmedVersion(group, kind, apiVersion string) bool {
+	if r == nil {
+		return false
+	}
+	r.cacheMu.RLock()
+	v, ok := r.confirmed[groupKind{Group: group, Kind: kind}]
+	r.cacheMu.RUnlock()
+	return ok && formatAPIVersion(group, v) == apiVersion
+}
+
 // Refresh re-runs MCP discovery and merges the result into the cache,
 // debounced to at most once per cooldown. It's a no-op (changed=false) when no
 // refresher is wired, the cooldown hasn't elapsed, or discovery came back
@@ -784,10 +811,11 @@ func (r *Resolver) apiVersionKnown(group, kind string) (string, bool) {
 // NotFound until the next refresh. An entry a partial response leaves out
 // keeps its old version; if the cluster no longer serves that version, the
 // resource reads NotFound, which triggers the next refresh (see checkOne), so
-// a complete response corrects it. A CRD removed from the cluster lingers in
-// the cache, which is harmless: lookups for it fail either way. Concurrent
-// callers serialise on refreshMu; the loser sees the updated lastRefresh and
-// returns immediately.
+// a complete response corrects it. Such a kept entry is not confirmed (see
+// confirmedVersion): the attempt's own response, empty on error, replaces the
+// confirmed set. A CRD removed from the cluster lingers in the cache, which is
+// harmless: lookups for it fail either way. Concurrent callers serialise on
+// refreshMu; the loser sees the updated lastRefresh and returns immediately.
 func (r *Resolver) Refresh(ctx context.Context) (changed bool, err error) {
 	if r == nil || r.refreshFn == nil {
 		return false, nil
@@ -800,18 +828,22 @@ func (r *Resolver) Refresh(ctx context.Context) (changed bool, err error) {
 	entries, err := r.refreshFn(ctx)
 	r.lastRefresh = time.Now() // stamp even on error so a broken discovery isn't hammered
 	if err != nil {
-		return false, err
+		entries = nil
 	}
 	fresh := cacheFromEntries(entries)
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	r.confirmed = fresh
+	if err != nil {
+		return false, err
+	}
 	if len(fresh) == 0 {
 		return false, nil
 	}
-	r.cacheMu.Lock()
 	merged := make(map[groupKind]string, len(r.cache)+len(fresh))
 	maps.Copy(merged, r.cache)
 	maps.Copy(merged, fresh)
 	r.cache = merged
-	r.cacheMu.Unlock()
 	return true, nil
 }
 

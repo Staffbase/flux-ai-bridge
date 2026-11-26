@@ -115,7 +115,7 @@ type Commenter struct {
 	appClient *gh.Client
 	// botLogin is the login the bridge's comments are authored by
 	// (`<app-slug>[bot]`), set by ResolveAppIdentity. Empty until then, or
-	// when the lookup failed; see isBridgeComment.
+	// while the lookup fails; see appIdentity and isBridgeComment.
 	botLogin atomic.Pointer[string]
 	// keepHistory, when true, makes PostOrUpdateComment skip the delete-prior
 	// step and just create a fresh comment. Useful for testing (you want to
@@ -471,9 +471,10 @@ func newAppTransport(cfg AuthConfig) (*ghinstallation.Transport, *ghinstallation
 // login count as the bridge's own (see isBridgeComment), so another App's
 // comment that copies the marker is never edited, kept or deleted as ours.
 //
-// Call it once at startup. On error the identity stays unknown and comments
-// are recognised as before (marker plus a non-human author); the caller logs
-// and carries on rather than blocking startup on it.
+// Call it once at startup. On error the identity stays unknown; the caller
+// logs and carries on rather than blocking startup on it. Every comment
+// operation that needs the identity then retries the lookup, and fails
+// (editing and deleting no comment) while it still fails; see appIdentity.
 func (c *Commenter) ResolveAppIdentity(ctx context.Context) error {
 	app, resp, err := c.appClient.Apps.Get(ctx, "")
 	recordRateLimit(resp, err)
@@ -1437,11 +1438,28 @@ func (c *Commenter) RemoveComment(ctx context.Context, owner, repo, kustomizatio
 	return nil
 }
 
+// appIdentity returns the App's bot login, looking it up now when the startup
+// lookup failed. Without it the bridge can't tell its own marker comments from
+// another App's copies, so the error stops the caller from editing or deleting
+// any (the event then retries).
+func (c *Commenter) appIdentity(ctx context.Context) (string, error) {
+	if login := c.BotLogin(); login != "" {
+		return login, nil
+	}
+	if err := c.ResolveAppIdentity(ctx); err != nil {
+		return "", fmt.Errorf("GitHub App identity unknown, so the bridge's comments can't be recognised: %w", err)
+	}
+	return c.BotLogin(), nil
+}
+
 // listScopedComments returns the bridge's comments for one scope's marker on a
-// PR, across all pages.
+// PR, across all pages. It fails while the App's identity is unknown.
 func (c *Commenter) listScopedComments(ctx context.Context, owner, repo string, prNumber int, marker string) ([]*gh.IssueComment, error) {
 	var mine []*gh.IssueComment
-	botLogin := c.BotLogin()
+	botLogin, err := c.appIdentity(ctx)
+	if err != nil {
+		return nil, err
+	}
 	opt := &gh.IssueListCommentsOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	for {
 		comments, resp, err := c.client.Issues.ListComments(ctx, owner, repo, prNumber, opt)
@@ -1501,15 +1519,15 @@ func truncateComment(body string) string {
 // whose text echoes it further down.
 //
 // botLogin is the App's bot login (`<slug>[bot]`, see ResolveAppIdentity).
-// When known, the author must be that login (GitHub logins are
-// case-insensitive), so another bot or App posting a copied marker isn't
-// mistaken for the bridge. When unknown (the startup lookup failed), any
-// author that isn't a human account is accepted, as before the lookup existed.
+// The author must be that login (GitHub logins are case-insensitive), so
+// another bot or App posting a copied marker isn't mistaken for the bridge.
+// An empty botLogin (identity unknown) matches nothing: no author can be
+// confirmed.
 func isBridgeComment(comment *gh.IssueComment, marker, botLogin string) bool {
-	if comment.GetUser().GetType() == "User" {
+	if botLogin == "" || comment.GetUser().GetType() == "User" {
 		return false
 	}
-	if botLogin != "" && !strings.EqualFold(comment.GetUser().GetLogin(), botLogin) {
+	if !strings.EqualFold(comment.GetUser().GetLogin(), botLogin) {
 		return false
 	}
 	return strings.HasPrefix(comment.GetBody(), marker+"\n")
@@ -1715,9 +1733,8 @@ const (
 // leave conflicting labels. While another replica holds it, the call writes
 // nothing — not even the outcome record — and returns ErrPRLabelsLocked, so
 // the caller retries on a later event. If the lock can't be asked for (a
-// backend error), the reconcile runs anyway, as it does when the outcome
-// record can't be read. It does not run when the record can't be dropped
-// before the first label write: that error is returned and nothing changes.
+// backend error), nothing changes either and that error is returned, as when
+// the record can't be dropped before the first label write.
 // The in-memory backend serves one replica and grants the lock at once.
 //
 // Any other API error is returned to the caller. The caller (processor)
@@ -1743,15 +1760,14 @@ func (c *Commenter) SetPRLabels(ctx context.Context, owner, repo string, prNumbe
 	// The mutex above serializes this replica only. The label lock serializes
 	// the replicas sharing the Redis/Valkey cache (the in-memory backend grants
 	// it at once). A held lock skips this reconcile: no write, no record, and an
-	// error so the caller retries on a later event. A lock that can't be asked
-	// for is handled like the outcome cache's errors here: the reconcile runs
-	// rather than being skipped on state it couldn't read.
+	// error so the caller retries on a later event. So does a lock that can't
+	// be asked for: running unserialized, two replicas could interleave their
+	// add/remove calls and leave neither outcome label on the PR.
 	lockDeadline := time.Now().Add(prLabelLockTTL) // set before the lock, so it ends no later
 	release, locked, err := c.cache.TryLock(ctx, prLabelLockKey(owner, repo, prNumber), prLabelLockTTL)
 	switch {
 	case err != nil:
-		slog.Default().Warn("PR label lock unavailable; reconciling without cross-replica serialization",
-			"owner", owner, "repo", repo, "pr", prNumber, "error", err.Error())
+		return fmt.Errorf("take PR label lock: %w", err)
 	case !locked:
 		slog.Default().Debug("PR labels locked by another replica; skipping this reconcile",
 			"owner", owner, "repo", repo, "pr", prNumber, "outcome", string(outcome))

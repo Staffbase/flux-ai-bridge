@@ -67,8 +67,27 @@ func appAuth(t *testing.T, baseURL string) bridgegithub.AuthConfig {
 	}
 }
 
+// appUser is the author GitHub reports on the test App's comments: the slug
+// serveAppIdentity answers, plus "[bot]".
+var appUser = map[string]any{"login": "flux-ai-bridge[bot]", "type": "Bot"}
+
+// serveAppIdentity answers GET /app with the test App's slug, unless the test
+// routes /app itself (a catch-all pattern doesn't count). The commenter looks
+// the App up before it lists comments, since only comments by the App's bot
+// login count as its own.
+func serveAppIdentity(mux *http.ServeMux) {
+	if _, pattern := mux.Handler(httptest.NewRequest(http.MethodGet, "/api/v3/app", nil)); strings.HasSuffix(pattern, "/api/v3/app") {
+		return
+	}
+	mux.HandleFunc("/api/v3/app", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 12345, "slug": "flux-ai-bridge"})
+	})
+}
+
 func newCommenter(t *testing.T, mux *http.ServeMux) *bridgegithub.Commenter {
 	t.Helper()
+	serveAppIdentity(mux)
 	// ghinstallation's transport refreshes installation tokens by POSTing
 	// to /app/installations/<id>/access_tokens against the BaseURL we set
 	// on the AuthConfig. The mock-github tests don't care about the token
@@ -1001,7 +1020,7 @@ func TestPostOrUpdateComment_CreatesNew(t *testing.T) {
 		case http.MethodPost:
 			created = true
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "body": "ok"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": 1, "body": "ok"})
 		}
 	})
 	c := newCommenter(t, mux)
@@ -1034,9 +1053,9 @@ func TestPostOrUpdateComment_PreservesOtherKustomizationMarkers(t *testing.T) {
 	//   id=101  → ns/B      (must be PRESERVED; different Kustomization)
 	//   id=102  → unscoped  (must be PRESERVED; legacy bridge versions)
 	priors := []any{
-		map[string]any{"id": float64(100), "body": "<!-- flux-ai-bridge:flux-system/a -->\nold A"},
-		map[string]any{"id": float64(101), "body": "<!-- flux-ai-bridge:flux-system/b -->\nold B"},
-		map[string]any{"id": float64(102), "body": "<!-- flux-ai-bridge -->\nlegacy"},
+		map[string]any{"user": appUser, "id": float64(100), "body": "<!-- flux-ai-bridge:flux-system/a -->\nold A"},
+		map[string]any{"user": appUser, "id": float64(101), "body": "<!-- flux-ai-bridge:flux-system/b -->\nold B"},
+		map[string]any{"user": appUser, "id": float64(102), "body": "<!-- flux-ai-bridge -->\nlegacy"},
 	}
 
 	mux := http.NewServeMux()
@@ -1048,7 +1067,7 @@ func TestPostOrUpdateComment_PreservesOtherKustomizationMarkers(t *testing.T) {
 		case http.MethodPost:
 			created = true
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 200, "body": "new"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": 200, "body": "new"})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -1079,7 +1098,7 @@ func TestPostOrUpdateComment_RecreatesOnChange(t *testing.T) {
 	var deleted, created bool
 	// Same-scoped prior comment with a DIFFERENT body must be deleted and a
 	// fresh one posted (so the reviewer gets a notification for the update).
-	existing := map[string]any{"id": float64(99), "body": "<!-- flux-ai-bridge:flux-system/podinfo -->\nold text"}
+	existing := map[string]any{"user": appUser, "id": float64(99), "body": "<!-- flux-ai-bridge:flux-system/podinfo -->\nold text"}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -1090,7 +1109,7 @@ func TestPostOrUpdateComment_RecreatesOnChange(t *testing.T) {
 		case http.MethodPost:
 			created = true
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "body": "new"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": 100, "body": "new"})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/99", func(w http.ResponseWriter, r *http.Request) {
@@ -1124,7 +1143,7 @@ func TestPostOrUpdateComment_SkipsWhenUnchanged(t *testing.T) {
 	// PostOrUpdateComment uses the body as its own key).
 	sum := sha256.Sum256([]byte(marker + "\nsame body"))
 	keyMarker := "<!-- flux-ai-bridge-key:" + hex.EncodeToString(sum[:]) + " -->"
-	existing := map[string]any{"id": float64(99), "body": marker + "\n" + keyMarker + "\nsame body"}
+	existing := map[string]any{"user": appUser, "id": float64(99), "body": marker + "\n" + keyMarker + "\nsame body"}
 	var deleted, created, edited bool
 
 	mux := http.NewServeMux()
@@ -1136,7 +1155,7 @@ func TestPostOrUpdateComment_SkipsWhenUnchanged(t *testing.T) {
 		case http.MethodPost:
 			created = true
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": 100})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/99", func(w http.ResponseWriter, r *http.Request) {
@@ -1147,7 +1166,7 @@ func TestPostOrUpdateComment_SkipsWhenUnchanged(t *testing.T) {
 		case http.MethodPatch:
 			edited = true
 			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(99)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(99)})
 		}
 	})
 	c := newCommenter(t, mux)
@@ -1206,6 +1225,7 @@ func TestPostOrUpdateComment_Pagination(t *testing.T) {
 		out := make([]map[string]any, 0, end-start)
 		for _, id := range alive[start:end] {
 			out = append(out, map[string]any{
+				"user": appUser,
 				"id":   float64(id),
 				"body": marker + "\ncomment " + strconv.Itoa(id),
 			})
@@ -1233,7 +1253,7 @@ func TestPostOrUpdateComment_Pagination(t *testing.T) {
 		}
 		if r.Method == http.MethodPost {
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 200, "body": "new"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": 200, "body": "new"})
 			return
 		}
 	})
@@ -1304,10 +1324,10 @@ func TestPostOrUpdateComment_SerializesConcurrentPostsForSameScope(t *testing.T)
 			mu.Lock()
 			id := nextID
 			nextID++
-			comments = append(comments, map[string]any{"id": float64(id), "body": body.Body})
+			comments = append(comments, map[string]any{"user": appUser, "id": float64(id), "body": body.Body})
 			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "body": body.Body})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": id, "body": body.Body})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -1339,7 +1359,7 @@ func TestPostOrUpdateComment_SerializesConcurrentPostsForSameScope(t *testing.T)
 			}
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id), "body": body.Body})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(id), "body": body.Body})
 		default:
 			http.NotFound(w, r)
 		}
@@ -1380,7 +1400,7 @@ func TestPostOrUpdateComment_SerializesConcurrentPostsForSameScope(t *testing.T)
 // chronological trail on the PR.
 func TestPostOrUpdateComment_KeepHistory_DoesNotDelete(t *testing.T) {
 	var deleted, created bool
-	existing := map[string]any{"id": float64(99), "body": "<!-- flux-ai-bridge -->\nold text"}
+	existing := map[string]any{"user": appUser, "id": float64(99), "body": "<!-- flux-ai-bridge -->\nold text"}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -1391,7 +1411,7 @@ func TestPostOrUpdateComment_KeepHistory_DoesNotDelete(t *testing.T) {
 		case http.MethodPost:
 			created = true
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "body": "new"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": 100, "body": "new"})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/99", func(w http.ResponseWriter, r *http.Request) {
@@ -1463,6 +1483,7 @@ func TestNewCommenter_AppMissingInstallationID(t *testing.T) {
 // Otherwise identical to newCommenter — same mock-token endpoint setup.
 func newCommenterWithOptions(t *testing.T, mux *http.ServeMux, opts bridgegithub.Options) *bridgegithub.Commenter {
 	t.Helper()
+	serveAppIdentity(mux)
 	mux.HandleFunc("/api/v3/app/installations/67890/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -1875,7 +1896,7 @@ func TestPostOrUpdateComment_LastCommentCacheSkipsListComments(t *testing.T) {
 
 	marker := "<!-- flux-ai-bridge:apps/api -->"
 	live := map[int64]map[string]any{
-		7: {"id": float64(7), "body": marker + "\nold"},
+		7: {"user": appUser, "id": float64(7), "body": marker + "\nold"},
 	}
 	nextID := int64(8)
 
@@ -1897,10 +1918,10 @@ func TestPostOrUpdateComment_LastCommentCacheSkipsListComments(t *testing.T) {
 			createCalls++
 			id := nextID
 			nextID++
-			live[id] = map[string]any{"id": float64(id), "body": marker + "\nfresh"}
+			live[id] = map[string]any{"user": appUser, "id": float64(id), "body": marker + "\nfresh"}
 			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id), "body": marker + "\nfresh"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(id), "body": marker + "\nfresh"})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -1988,7 +2009,7 @@ func TestPostOrUpdateComment_DeleteCache404Tolerant(t *testing.T) {
 			id := 100 + createCalls
 			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(id)})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -2053,7 +2074,7 @@ func TestPostOrUpdateComment_KeepHistoryBypassesLastCommentCache(t *testing.T) {
 			id := 500 + createCalls
 			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(id)})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -2553,7 +2574,7 @@ func TestPostOrUpdateComment_CreateBeforeDelete(t *testing.T) {
 			ops = append(ops, "list")
 			var out []map[string]any
 			for id, body := range live {
-				out = append(out, map[string]any{"id": float64(id), "body": body})
+				out = append(out, map[string]any{"user": appUser, "id": float64(id), "body": body})
 			}
 			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(out)
@@ -2576,7 +2597,7 @@ func TestPostOrUpdateComment_CreateBeforeDelete(t *testing.T) {
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(id)})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -2668,7 +2689,7 @@ func TestPostOrUpdateComment_DeleteFailureForcesSweep(t *testing.T) {
 			id := 100 + createCalls
 			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(id)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(id)})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -2739,11 +2760,11 @@ func TestPostOrUpdateComment_SlowPathDeleteFailureTolerated(t *testing.T) {
 			// One pre-existing marker comment with a DIFFERENT body → the
 			// slow path swaps: create fresh, then sweep this one.
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"id": float64(90), "body": "<!-- flux-ai-bridge:apps/api -->\nold body"},
+				{"user": appUser, "id": float64(90), "body": "<!-- flux-ai-bridge:apps/api -->\nold body"},
 			})
 		case http.MethodPost:
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(101)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(101)})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {
@@ -2794,7 +2815,7 @@ func TestPostOrUpdateCommentKeyed_ColdCacheHonorsEmbeddedKey(t *testing.T) {
 	sum := sha256.Sum256([]byte(marker + "\nstable state A"))
 	keyMarker := "<!-- flux-ai-bridge-key:" + hex.EncodeToString(sum[:]) + " -->"
 	// The PR carries a comment posted under state A with "wording one".
-	existing := map[string]any{"id": float64(99), "body": marker + "\n" + keyMarker + "\nwording one"}
+	existing := map[string]any{"user": appUser, "id": float64(99), "body": marker + "\n" + keyMarker + "\nwording one"}
 	var created, deleted bool
 	mu := sync.Mutex{}
 
@@ -2809,7 +2830,7 @@ func TestPostOrUpdateCommentKeyed_ColdCacheHonorsEmbeddedKey(t *testing.T) {
 			created = true
 			mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": float64(100)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"user": appUser, "id": float64(100)})
 		}
 	})
 	mux.HandleFunc("/api/v3/repos/owner/repo/issues/comments/", func(w http.ResponseWriter, r *http.Request) {

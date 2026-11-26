@@ -161,17 +161,27 @@ func (lockErrCache) TryLock(context.Context, string, time.Duration) (func(), boo
 	return nil, false, errors.New("lock backend unavailable")
 }
 
-// A lock that can't be taken because the backend fails is handled like the
-// outcome cache's read errors in SetPRLabels: the reconcile is not skipped on
-// state it couldn't read, so the labels still match the verdict.
-func TestSetPRLabels_LockBackendErrorStillReconciles(t *testing.T) {
+// A lock that can't be asked for (the backend fails) doesn't let the
+// reconcile run unserialized: two replicas both failing to lock could
+// interleave their add/remove calls and leave neither outcome label, while
+// their outcome records vouch for one. No label changes, no record is
+// written, and the error makes the event retry.
+func TestSetPRLabels_LockBackendErrorWritesNoLabels(t *testing.T) {
 	var calls atomic.Int32
-	c := newCommenterWithOptions(t, labelCallMux(&calls, nil), bridgegithub.Options{Cache: lockErrCache{fetchcache.NewLRU(64)}})
-	if err := c.SetPRLabels(context.Background(), "owner", "repo", 42, "h1", bridgegithub.OutcomeFailure); err != nil {
-		t.Fatalf("SetPRLabels with a failing lock backend: %v", err)
+	store := fetchcache.NewLRU(64)
+	c := newCommenterWithOptions(t, labelCallMux(&calls, nil), bridgegithub.Options{Cache: lockErrCache{store}})
+	err := c.SetPRLabels(context.Background(), "owner", "repo", 42, "h1", bridgegithub.OutcomeFailure)
+	if err == nil {
+		t.Fatal("SetPRLabels with a failing lock backend returned nil; want an error so the event retries")
 	}
-	if calls.Load() == 0 {
-		t.Error("labels not written when the lock backend failed")
+	if errors.Is(err, bridgegithub.ErrPRLabelsLocked) {
+		t.Errorf("err = %v; a backend failure must not read as a lock held by another replica", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("label writes with a failing lock backend = %d, want 0", n)
+	}
+	if _, hit := store.Get(context.Background(), "pr-outcome:owner/repo/42"); hit {
+		t.Error("outcome record written although no label was reconciled")
 	}
 }
 

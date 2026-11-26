@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -101,10 +102,10 @@ func TestResolveAppIdentity_OtherAppsCommentIsNotTheBridges(t *testing.T) {
 	}
 }
 
-// A failed lookup must not block startup: ResolveAppIdentity reports the error
-// and the commenter keeps recognising its comments as before (marker + an
-// author that isn't a human account).
-func TestResolveAppIdentity_LookupFailureFallsBack(t *testing.T) {
+// While the App's identity is unknown (GET /app keeps failing), the bridge
+// can't tell its own marker comments from another App's copies, so it edits
+// and deletes none: the post fails and the event retries.
+func TestResolveAppIdentity_UnknownIdentityTouchesNoComments(t *testing.T) {
 	mux, deleted := appIdentityMux(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
 	})
@@ -117,11 +118,45 @@ func TestResolveAppIdentity_LookupFailureFallsBack(t *testing.T) {
 	if got := c.BotLogin(); got != "" {
 		t.Errorf("BotLogin after a failed lookup = %q, want empty", got)
 	}
+	if err := c.PostOrUpdateComment(ctx, "owner", "repo", "flux-system", "podinfo", 42, "new text"); err == nil {
+		t.Fatal("PostOrUpdateComment with the App identity unknown returned nil; want an error so the event retries")
+	}
+	if err := c.RemoveComment(ctx, "owner", "repo", "flux-system", "podinfo", 42); err == nil {
+		t.Fatal("RemoveComment with the App identity unknown returned nil; want an error")
+	}
+	if got := deleted(); len(got) != 0 {
+		t.Errorf("deleted comments = %v, want none while the App identity is unknown", got)
+	}
+}
+
+// A failed startup lookup is not final: the next comment operation retries
+// GET /app, and once it answers, only the bridge's own comment is replaced.
+func TestResolveAppIdentity_RetriedOnUse(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	mux, deleted := appIdentityMux(t, func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 12345, "slug": "flux-ai-bridge"})
+	})
+	c := newCommenter(t, mux)
+	ctx := context.Background()
+	if err := c.ResolveAppIdentity(ctx); err == nil {
+		t.Fatal("ResolveAppIdentity: want an error for a failed GET /app")
+	}
+
+	fail.Store(false)
 	if err := c.PostOrUpdateComment(ctx, "owner", "repo", "flux-system", "podinfo", 42, "new text"); err != nil {
 		t.Fatalf("PostOrUpdateComment: %v", err)
 	}
-	if got := deleted(); !slices.Equal(got, []int64{98, 99}) {
-		t.Errorf("deleted comments = %v, want both marker comments [98 99] (fallback)", got)
+	if got := c.BotLogin(); got != "flux-ai-bridge[bot]" {
+		t.Errorf("BotLogin after the retried lookup = %q, want flux-ai-bridge[bot]", got)
+	}
+	if got := deleted(); !slices.Equal(got, []int64{99}) {
+		t.Errorf("deleted comments = %v, want only the bridge's [99]", got)
 	}
 }
 
