@@ -366,7 +366,10 @@ ct-install: ## Install the chart with ct (once per ci/*-values.yaml) into the ki
 	kubectl --context $(CT_CONTEXT) -n $(CT_NAMESPACE) wait \
 	  kustomization/podinfo \
 	  --for=condition=Ready \
-	  --timeout=5m
+	  --timeout=5m \
+	|| { kubectl --context $(CT_CONTEXT) -n $(CT_NAMESPACE) get gitrepository,kustomization \
+	       -o custom-columns='KIND:.kind,NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,MESSAGE:.status.conditions[?(@.type=="Ready")].message'; \
+	     exit 1; }
 	@echo "==> Running ct install"
 	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/ct-install.XXXXXX"); \
 	trap 'rm -rf "$$tmp"' EXIT; \

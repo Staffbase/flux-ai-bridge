@@ -89,11 +89,14 @@ jobs:
 
       # Builds the bridge image from this commit, installs the Flux Operator,
       # Flux (FluxInstance) and a podinfo Kustomization from this pull
-      # request's merge ref, then runs `ct install` with dummy GitHub App
+      # request's head ref, then runs `ct install` with dummy GitHub App
       # credentials. The bridge needs no GitHub access to become ready.
+      # The head ref, not github.ref: source-controller can't resolve the
+      # commit of GitHub's synthetic refs/pull/N/merge. refs/pull/N/head
+      # exists in this repository for fork PRs too.
       - name: Run chart-testing (install)
         if: steps.list-changed.outputs.changed == 'true'
         env:
           CT_GIT_URL: ${{ github.server_url }}/${{ github.repository }}
-          CT_GIT_REF: ${{ github.ref }}
+          CT_GIT_REF: refs/pull/${{ github.event.pull_request.number }}/head
         run: make ct-install CT_CLUSTER_NAME=flux-ai-bridge-ct
