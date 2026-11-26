@@ -104,9 +104,9 @@ func TestBuildFileSet_DevOverlayExcludesSiblingProd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	set, err := tree.BuildFileSet("./apps/web/dev/r1")
+	set, err := tree.BuildFileSetWithComponents("./apps/web/dev/r1", Components{})
 	if err != nil {
-		t.Fatalf("BuildFileSet: %v", err)
+		t.Fatalf("BuildFileSetWithComponents: %v", err)
 	}
 
 	wantIn := []string{
@@ -141,7 +141,7 @@ func TestBuildFileSet_MissingStartPathErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	if _, err := tree.BuildFileSet("apps/web/stage/r1"); err == nil {
+	if _, err := tree.BuildFileSetWithComponents("apps/web/stage/r1", Components{}); err == nil {
 		t.Error("expected error for a path with no kustomization, got nil")
 	}
 }
@@ -156,9 +156,9 @@ func TestBuildFileSet_RemoteBaseIgnoredNotError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	set, err := tree.BuildFileSet("apps/web/dev")
+	set, err := tree.BuildFileSetWithComponents("apps/web/dev", Components{})
 	if err != nil {
-		t.Fatalf("BuildFileSet should ignore remote bases, got: %v", err)
+		t.Fatalf("BuildFileSetWithComponents should ignore remote bases, got: %v", err)
 	}
 	if _, ok := set["apps/web/base/deployment.yaml"]; !ok {
 		t.Error("local base resource missing from build set")
@@ -173,7 +173,7 @@ func TestBuildFileSet_UnresolvedLocalRefErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	if _, err := tree.BuildFileSet("apps/web/dev"); err == nil {
+	if _, err := tree.BuildFileSetWithComponents("apps/web/dev", Components{}); err == nil {
 		t.Error("expected error for an unresolved local reference, got nil")
 	}
 }
@@ -197,9 +197,9 @@ func TestBuildFileSet_GeneratedKustomization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	set, err := tree.BuildFileSet("./apps/plain")
+	set, err := tree.BuildFileSetWithComponents("./apps/plain", Components{})
 	if err != nil {
-		t.Fatalf("BuildFileSet: %v", err)
+		t.Fatalf("BuildFileSetWithComponents: %v", err)
 	}
 	want := []string{
 		"apps/plain/deployment.yaml",
@@ -239,9 +239,9 @@ func TestBuildFileSet_PluginAndReplacementRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	set, err := tree.BuildFileSet("apps/web")
+	set, err := tree.BuildFileSetWithComponents("apps/web", Components{})
 	if err != nil {
-		t.Fatalf("BuildFileSet: %v", err)
+		t.Fatalf("BuildFileSetWithComponents: %v", err)
 	}
 	for p := range files {
 		if _, ok := set[p]; !ok {
@@ -268,16 +268,16 @@ func TestBuildFileSet_InlineStrategicMergePatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	set, err := tree.BuildFileSet("apps/web")
+	set, err := tree.BuildFileSetWithComponents("apps/web", Components{})
 	if err != nil {
-		t.Fatalf("BuildFileSet with inline patches: %v", err)
+		t.Fatalf("BuildFileSetWithComponents with inline patches: %v", err)
 	}
 	for _, p := range []string{"apps/web/kustomization.yaml", "apps/web/deploy.yaml", "apps/web/patch.yaml"} {
 		if _, ok := set[p]; !ok {
 			t.Errorf("missing %s; set = %v", p, keys(set))
 		}
 	}
-	if _, err := tree.BuildFileSet("apps/bad"); err == nil {
+	if _, err := tree.BuildFileSetWithComponents("apps/bad", Components{}); err == nil {
 		t.Error("a missing patchesStrategicMerge file must still fail the build set")
 	}
 }
@@ -295,9 +295,9 @@ func TestBuildFileSet_LocalPathLookingRemote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	set, err := tree.BuildFileSet("apps/web")
+	set, err := tree.BuildFileSetWithComponents("apps/web", Components{})
 	if err != nil {
-		t.Fatalf("BuildFileSet: %v", err)
+		t.Fatalf("BuildFileSetWithComponents: %v", err)
 	}
 	for p := range files {
 		if _, ok := set[p]; !ok {
@@ -319,9 +319,9 @@ func TestBuildFileSet_PathWhitespaceIsLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadTarGz: %v", err)
 	}
-	set, err := tree.BuildFileSet("apps/web")
+	set, err := tree.BuildFileSetWithComponents("apps/web", Components{})
 	if err != nil {
-		t.Fatalf("BuildFileSet: %v", err)
+		t.Fatalf("BuildFileSetWithComponents: %v", err)
 	}
 	if _, ok := set[CleanPath("apps/web/config.yaml ")]; !ok {
 		t.Errorf("referenced file with trailing space missing; set = %q", keys(set))

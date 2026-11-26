@@ -131,24 +131,6 @@ func generatorFiles(g generator) []string {
 	return out
 }
 
-// BuildFileSet resolves, from tree data alone (no I/O), the set of repo files
-// that feed the kustomize build rooted at startDir — typically a Kustomization's
-// spec.path. The returned set holds repo-root-relative paths; a PR file is part
-// of this build iff its cleaned path is in the set.
-//
-// A startDir without a kustomization file is built the way Flux's
-// kustomize-controller generates one for it: every .yaml/.yml file below it,
-// except that a subdirectory with its own kustomization file is included as a
-// kustomize directory (its build inputs, not every file in it).
-//
-// Remote references (URLs, git::/oci:: bases) are skipped: they live in another
-// repo and can never be one of THIS repo's changed files. Any LOCAL reference
-// that can't be resolved is returned as an error, so the caller can skip rather
-// than attribute against an incomplete view (the exact-or-skip contract).
-func (t *Tree) BuildFileSet(startDir string) (map[string]struct{}, error) {
-	return t.BuildFileSetWithComponents(startDir, Components{})
-}
-
 // Components are a Flux Kustomization's spec.components: component
 // directories, relative to spec.path, that kustomize-controller adds to the
 // kustomization it builds there. With IgnoreMissing
@@ -159,11 +141,25 @@ type Components struct {
 	IgnoreMissing bool
 }
 
-// BuildFileSetWithComponents is BuildFileSet for a Kustomization that also
-// sets spec.components: the files those components read are build inputs too.
-// A component Flux would reject (remote or absolute, outside the source,
-// missing without IgnoreMissing, or without a kustomization file) is an error,
-// as for any other unresolvable reference.
+// BuildFileSetWithComponents resolves, from tree data alone (no I/O), the set
+// of repo files that feed the kustomize build rooted at startDir — typically a
+// Kustomization's spec.path. The returned set holds repo-root-relative paths; a
+// PR file is part of this build iff its cleaned path is in the set.
+//
+// A startDir without a kustomization file is built the way Flux's
+// kustomize-controller generates one for it: every .yaml/.yml file below it,
+// except that a subdirectory with its own kustomization file is included as a
+// kustomize directory (its build inputs, not every file in it).
+//
+// Remote references (URLs, git::/oci:: bases) are skipped: they live in another
+// repo and can never be one of THIS repo's changed files. Any LOCAL reference
+// that can't be resolved is returned as an error, so the caller can skip rather
+// than attribute against an incomplete view (the exact-or-skip contract).
+//
+// comps are the Kustomization's spec.components: the files those components
+// read are build inputs too. A component Flux would reject (remote or absolute,
+// outside the source, missing without IgnoreMissing, or without a kustomization
+// file) is an error, as for any other unresolvable reference.
 func (t *Tree) BuildFileSetWithComponents(startDir string, comps Components) (map[string]struct{}, error) {
 	start := cleanRel(startDir)
 	out := make(map[string]struct{})
@@ -322,7 +318,7 @@ func (t *Tree) topKustomizationDir(start, dir string) (string, bool) {
 }
 
 // isRemoteRef reports whether a kustomization reference points outside this
-// repo (a URL or a kustomize remote-base spec). BuildFileSet asks only after
+// repo (a URL or a kustomize remote-base spec). BuildFileSetWithComponents asks only after
 // the ref didn't resolve inside the tree, the order kustomize uses; a remote
 // ref is never one of this repo's changed files, so it's skipped.
 func isRemoteRef(ref string) bool {

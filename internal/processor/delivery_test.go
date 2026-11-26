@@ -29,6 +29,7 @@ import (
 
 	"github.com/staffbase/flux-ai-bridge/internal/config"
 	"github.com/staffbase/flux-ai-bridge/internal/dedupe"
+	bridgegithub "github.com/staffbase/flux-ai-bridge/internal/github"
 	"github.com/staffbase/flux-ai-bridge/internal/lifecycle"
 	"github.com/staffbase/flux-ai-bridge/internal/readiness"
 )
@@ -308,5 +309,28 @@ func TestProcess_HealthyLLMFallbackIsReEvaluated(t *testing.T) {
 	}
 	if strings.Contains(commenterMock.prCommentBody, "LLM analysis unavailable") {
 		t.Fatalf("degraded comment not replaced after the LLM recovered: %q", commenterMock.prCommentBody)
+	}
+}
+
+// A roster that can't be read is not an empty roster. Taking "no known scopes"
+// as "every scope reported" would label a head flux-success from one scope's
+// green outcome while other Kustomizations of the PR haven't reported. The
+// success is held and the head labelled flux-warning instead.
+func TestReconcileLabels_UnreadableRosterHoldsSuccess(t *testing.T) {
+	cache, mr := newRedisDedupe(t)
+	// A roster key of the wrong type makes HGETALL fail (WRONGTYPE) while the
+	// per-head outcome hash stays readable.
+	if err := mr.Set("p:label:o/r:pr42:roster", "not-a-hash"); err != nil {
+		t.Fatalf("seed roster key: %v", err)
+	}
+	commenterMock := &fakeCommenter{}
+	proc := New(&config.Config{PRLabelEnabled: true}, nil, nil, nil, commenterMock, nil, cache, slog.Default())
+
+	if err := proc.reconcileLabels(context.Background(), "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess); err != nil {
+		t.Fatalf("reconcileLabels: %v", err)
+	}
+	calls := commenterMock.labelCalls
+	if len(calls) != 1 || calls[0].Outcome != bridgegithub.OutcomeWarning {
+		t.Fatalf("an unreadable roster must hold flux-success and label the head flux-warning; got %+v", calls)
 	}
 }

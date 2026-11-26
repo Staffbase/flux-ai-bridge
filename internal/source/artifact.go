@@ -173,8 +173,9 @@ func cleanRel(p string) string {
 	return strings.TrimPrefix(p, "/")
 }
 
-// CleanPath normalises a repo-relative path to the same form BuildFileSet keys
-// use, so callers can test membership of a PR file path in a build set.
+// CleanPath normalises a repo-relative path to the same form
+// BuildFileSetWithComponents keys use, so callers can test membership of a PR
+// file path in a build set.
 func CleanPath(p string) string {
 	return cleanRel(p)
 }

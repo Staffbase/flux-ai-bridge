@@ -92,16 +92,12 @@ func NewResolver(getter ResourceGetter, apiVersionFor func(group, kind string) s
 	}
 }
 
-// BuildFiles returns the set of repo files that feed the build at specPath, for
-// the source named by ref, but only when the source's current artifact is at
-// revisionSHA (the event's revision). Otherwise it returns ErrRevisionMismatch
-// / ErrNoArtifact and the caller skips the event.
-func (r *Resolver) BuildFiles(ctx context.Context, ref Ref, specPath, revisionSHA string) (map[string]struct{}, error) {
-	return r.BuildFilesWithComponents(ctx, ref, specPath, Components{}, revisionSHA)
-}
-
-// BuildFilesWithComponents is BuildFiles for a Kustomization that also sets
-// spec.components (see Tree.BuildFileSetWithComponents).
+// BuildFilesWithComponents returns the set of repo files that feed the build
+// at specPath with the Kustomization's spec.components (see
+// Tree.BuildFileSetWithComponents), for the source named by ref, but only when
+// the source's current artifact is at revisionSHA (the event's revision).
+// Otherwise it returns ErrRevisionMismatch / ErrNoArtifact and the caller
+// skips the event.
 func (r *Resolver) BuildFilesWithComponents(ctx context.Context, ref Ref, specPath string, comps Components, revisionSHA string) (map[string]struct{}, error) {
 	if ref.Kind == "" || ref.Name == "" {
 		return nil, fmt.Errorf("kustomization has no usable sourceRef")

@@ -278,8 +278,10 @@ func TestProcess_RetryFooterOnNonGreenComment(t *testing.T) {
 }
 
 // The revision gate applies ONLY to the success path. A failing reconcile or a
-// dependency wait inherently lags lastAppliedRevision (the apply never landed),
-// but those are exactly the ❌/⚠️ states the bridge must report — deferring them
+// dependency wait inherently lags lastAppliedRevision (the apply failed or never
+// ran, or health checks or pruning failed after it: lastAppliedRevision is set
+// only once health checks pass), but those are exactly the ❌/⚠️ states the
+// bridge must report — deferring them
 // would leave a failing PR silently unlabelled. Both must proceed to analysis
 // despite the revision mismatch.
 func TestProcess_DoesNotDeferFailureOrWaitEvents(t *testing.T) {

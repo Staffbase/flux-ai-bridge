@@ -30,14 +30,28 @@ import (
 )
 
 // fakeScope is a stand-in ScopeResolver: it returns a fixed build file set (or
-// an error) regardless of input.
+// an error), plus the files of each spec.components entry it is given that
+// componentFiles lists.
 type fakeScope struct {
-	files map[string]struct{}
-	err   error
+	files          map[string]struct{}
+	componentFiles map[string][]string
+	err            error
 }
 
-func (f fakeScope) BuildFiles(_ context.Context, _ bridgesource.Ref, _, _ string) (map[string]struct{}, error) {
-	return f.files, f.err
+func (f fakeScope) BuildFilesWithComponents(_ context.Context, _ bridgesource.Ref, _ string, comps bridgesource.Components, _ string) (map[string]struct{}, error) {
+	if f.err != nil || len(comps.Paths) == 0 {
+		return f.files, f.err
+	}
+	out := make(map[string]struct{}, len(f.files))
+	for k := range f.files {
+		out[k] = struct{}{}
+	}
+	for _, c := range comps.Paths {
+		for _, file := range f.componentFiles[c] {
+			out[file] = struct{}{}
+		}
+	}
+	return out, nil
 }
 
 func newScopeTestProc(t *testing.T, scope ScopeResolver, commenter *fakeCommenter, analyzer *fakeAnalyzer) *Processor {
@@ -103,6 +117,57 @@ func TestProcess_ScopeGate_AdmitsFileInBuild(t *testing.T) {
 	}
 	if commenter.prCommentBody == "" {
 		t.Error("expected a comment when the PR file is in the build set")
+	}
+}
+
+// kustomizationWithComponents is kustomizationWithInventory with a
+// spec.components entry: kustomize-controller adds that component to the build
+// at spec.path.
+const kustomizationWithComponents = `
+spec:
+  path: ./apps/web/dev
+  components:
+    - ../../../components/tls
+  sourceRef:
+    name: flux-system
+    kind: GitRepository
+status:
+  inventory:
+    entries:
+      - id: "_blackbox-exporter__Namespace"
+      - id: "blackbox-exporter_blackbox_helm.toolkit.fluxcd.io_HelmRelease"
+`
+
+// A file only a spec.components entry pulls into the build (a component's
+// patch) is a build input: a PR that changes only that file is attributed. The
+// build scope must be resolved with the Kustomization's components, not just
+// its path.
+func TestProcess_ScopeGate_AdmitsFileOnlyReachableThroughComponents(t *testing.T) {
+	commenter := &fakeCommenter{
+		prNumber: 42,
+		prFiles: []bridgegithub.PRFile{
+			{Path: "components/tls/tls.yaml", BlobSHA: "blob-tls", Status: "modified"},
+		},
+		// Declares a resource NOT in the inventory: only build membership can
+		// attribute it.
+		blobs: map[string][]byte{"blob-tls": []byte(unrelatedHelmRelease)},
+	}
+	analyzer := &fakeAnalyzer{result: "## Status\nok"}
+	scope := fakeScope{
+		files: map[string]struct{}{"apps/web/dev/kustomization.yaml": {}},
+		componentFiles: map[string][]string{
+			"../../../components/tls": {"components/tls/kustomization.yaml", "components/tls/tls.yaml"},
+		},
+	}
+	mcp := &fakeMCPClient{data: []byte(kustomizationWithComponents)}
+	cfg := &config.Config{GitHubRepo: "owner/repo", LLMProvider: "claude", ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+	proc := New(cfg, mcp, readiness.NewChecker(mcp), analyzer, commenter, nil, nil, slog.Default()).WithScopeResolver(scope)
+
+	if err := proc.Process(context.Background(), scopeTestEvent(), "abc1234"); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if commenter.prCommentBody == "" {
+		t.Error("expected a comment: a file the Kustomization's spec.components pull in is a build input")
 	}
 }
 

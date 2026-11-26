@@ -114,8 +114,10 @@ const labelLockStripes = 64
 // A PR file attributes to the Kustomization only if it's in that set. Returns a
 // non-nil error (e.g. source.ErrRevisionMismatch) when the exact scope can't be
 // determined for this revision, signalling the processor to skip-and-retry.
+// comps are the Kustomization's spec.components: their files are build inputs
+// too.
 type ScopeResolver interface {
-	BuildFiles(ctx context.Context, ref bridgesource.Ref, specPath, revisionSHA string) (map[string]struct{}, error)
+	BuildFilesWithComponents(ctx context.Context, ref bridgesource.Ref, specPath string, comps bridgesource.Components, revisionSHA string) (map[string]struct{}, error)
 }
 
 // New constructs a Processor. All cluster reads go through MCP — the bridge
@@ -196,8 +198,10 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	// The gate ONLY applies to the success path. A failing reconcile
 	// (severity=error / Ready=False) or a dependency wait (DependencyNotReady)
 	// inherently leaves lastAppliedRevision behind the analysed revision — the
-	// apply never landed — yet those are exactly the ❌/⚠️ states the bridge must
-	// report, not swallow. So when the controller is already signalling a
+	// apply failed or never ran, or (HealthCheckFailed, PruneFailed) it was
+	// applied but health checks or pruning failed: kustomize-controller sets
+	// lastAppliedRevision only after health checks pass — yet those are exactly
+	// the ❌/⚠️ states the bridge must report, not swallow. So when the controller is already signalling a
 	// failure/wait we skip the gate and let analysis surface that verdict.
 	//
 	// Deferral requires a CONFIDENT mismatch (revisionMismatch): both revisions
@@ -298,7 +302,8 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 		if ref.Namespace == "" {
 			ref.Namespace = event.InvolvedObject.Namespace
 		}
-		bf, serr := p.scope.BuildFiles(ctx, ref, kspec.Spec.Path, sha)
+		comps := bridgesource.Components{Paths: kspec.Spec.Components, IgnoreMissing: kspec.Spec.IgnoreMissingComponents}
+		bf, serr := p.scope.BuildFilesWithComponents(ctx, ref, kspec.Spec.Path, comps, sha)
 		if serr != nil {
 			// Couldn't resolve the exact build scope for this revision (source
 			// advanced + GC'd the matching artifact, a fetch error, or an
@@ -686,10 +691,13 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 
 	// The inventory/pod snapshot reflects what's RUNNING — the last
 	// successfully-applied state, not necessarily the analysed revision. When
-	// the Kustomization's own reconcile is failing (dry-run/build/apply), the
+	// the Kustomization's own reconcile is failing, the snapshot can't be
+	// trusted to describe the change: after a dry-run/build/apply failure the
 	// change never reached the cluster and an all-Current snapshot describes
-	// the OLD state — fold the controller's own verdict into the outcome so a
-	// rejected deploy can't read ✅ (see reconcileFailureMessage). A dependency
+	// the OLD state; after HealthCheckFailed / PruneFailed it was applied, but
+	// the controller still judges it failing. Fold the controller's own verdict
+	// into the outcome so a failing deploy can't read ✅ (see
+	// reconcileFailureMessage). A dependency
 	// WAIT (DependencyNotReady) is a self-resolving ordering state → ⚠️, never ❌.
 	// (reconcileFailedMsg / reconcileWaitingMsg were classified up front, before
 	// the revision-applied gate.)
@@ -1216,6 +1224,7 @@ func (p *Processor) reconcileLabels(ctx context.Context, owner, repo, scope, hea
 // scope can falsify, so it's the only one that waits for a complete roster.
 // While it waits, the head is labelled flux-warning: leaving the labels as they
 // are would keep a PREVIOUS head's flux-success on a head nothing verified yet.
+// A roster that can't be read holds success the same way (fail closed).
 //
 // The aggregate is read and written under a per-PR lock: computed outside it, a
 // worker holding an all-green view could write flux-success after another
@@ -1248,7 +1257,15 @@ func (p *Processor) applyPRLabel(ctx context.Context, owner, repo string, prNumb
 		}
 	}
 	if agg == bridgegithub.OutcomeSuccess {
-		if roster := p.dedupe.PRScopes(owner, repo, prNumber); !headCoversRoster(scopes, roster) {
+		// An unreadable roster is not an empty one: "no known scopes" would make
+		// any partial all-green view look complete. Hold success like a partial
+		// roster does.
+		roster, rerr := p.dedupe.ReadPRScopes(owner, repo, prNumber)
+		if rerr != nil {
+			p.logger.Warn("holding flux-success: PR roster unreadable; labelling the head flux-warning meanwhile",
+				"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA, "error", rerr.Error())
+			agg = bridgegithub.OutcomeWarning
+		} else if !headCoversRoster(scopes, roster) {
 			p.logger.Info("holding flux-success: not all known scopes have reported for this head; labelling it flux-warning meanwhile",
 				"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA,
 				"reported", len(scopes), "roster", len(roster))
@@ -2214,6 +2231,12 @@ type kustomizationSpec struct {
 		// artifact to scope PR attribution to this overlay's actual build inputs
 		// (see ScopeResolver / internal/source).
 		Path string `yaml:"path"`
+		// Components are component directories, relative to Path, that
+		// kustomize-controller adds to the build; their files are build inputs
+		// too. IgnoreMissingComponents leaves out a component the source
+		// doesn't contain instead of failing the build.
+		Components              []string `yaml:"components"`
+		IgnoreMissingComponents bool     `yaml:"ignoreMissingComponents"`
 		// TargetNamespace is Flux's "deploy everything here" override. When set
 		// it's the authoritative namespace the Kustomization's workloads live
 		// in; when empty (the common case, where resources carry their own
@@ -3399,8 +3422,11 @@ const dependencyNotReadyReason = "DependencyNotReady"
 // (failedMsg, waitingMsg) — at most one non-empty:
 //
 //   - failedMsg: the reconcile FAILED (error event or Ready=False) — dry-run
-//     rejection, build/apply error. The analysed revision did not apply; the
-//     outcome must be ❌ however green the (last-good) snapshot polls.
+//     rejection, build/apply error, failed health check or prune. On a
+//     dry-run/build/apply failure the analysed revision did not apply; on
+//     HealthCheckFailed / PruneFailed it was applied, but health checks or
+//     pruning failed. Either way the outcome must be ❌ however green the
+//     snapshot polls.
 //   - waitingMsg: the reconcile is WAITING on a dependency
 //     (reason DependencyNotReady, from either source). The Kustomization
 //     hasn't failed — it just hasn't run yet — so this is ⚠️, not ❌: flagging
@@ -3656,9 +3682,10 @@ func computeOutcome(statuses, podStatuses []readiness.ResourceStatus, settled, r
 	podFailed, podNotCurrent := countStatuses(podStatuses)
 	switch {
 	case reconcileFailed:
-		// The Kustomization's own reconcile failed (dry-run/build/apply) — the
-		// analysed revision never reached the cluster, so however green the
-		// LIVE inventory polls, the deploy under review is a failure.
+		// The Kustomization's own reconcile failed: a dry-run/build/apply
+		// failure kept the analysed revision off the cluster, a failed health
+		// check or prune left it applied but failing. Either way, however
+		// green the LIVE inventory polls, the deploy under review is a failure.
 		return bridgegithub.OutcomeFailure
 	case invFailed > 0 || podFailed > 0:
 		return bridgegithub.OutcomeFailure

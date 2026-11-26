@@ -80,9 +80,9 @@ func TestResolver_BuildFiles_HappyPathAndCache(t *testing.T) {
 	getter := &fakeGetter{yaml: sourceYAML(srv.URL, "dev@sha1:deadbeefcafe0001", digestOf(tarball))}
 	r := NewResolver(getter, nil, srv.Client())
 
-	set, err := r.BuildFiles(context.Background(), Ref{Kind: "GitRepository", Name: "cluster", Namespace: "flux-system"}, "apps/web/dev/r1", "deadbeefcafe0001")
+	set, err := r.BuildFilesWithComponents(context.Background(), Ref{Kind: "GitRepository", Name: "cluster", Namespace: "flux-system"}, "apps/web/dev/r1", Components{}, "deadbeefcafe0001")
 	if err != nil {
-		t.Fatalf("BuildFiles: %v", err)
+		t.Fatalf("BuildFilesWithComponents: %v", err)
 	}
 	if _, ok := set["apps/web/base/helmrelease.yaml"]; !ok {
 		t.Error("expected base resource in build set")
@@ -92,8 +92,8 @@ func TestResolver_BuildFiles_HappyPathAndCache(t *testing.T) {
 	}
 
 	// Second call at the same digest must be served from cache (no second GET).
-	if _, err := r.BuildFiles(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", "deadbeefcafe0001"); err != nil {
-		t.Fatalf("BuildFiles (cached): %v", err)
+	if _, err := r.BuildFilesWithComponents(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", Components{}, "deadbeefcafe0001"); err != nil {
+		t.Fatalf("BuildFilesWithComponents (cached): %v", err)
 	}
 	if hits != 1 {
 		t.Errorf("artifact fetched %d times, want 1 (digest cache)", hits)
@@ -123,14 +123,14 @@ func TestResolver_BuildFiles_SingleflightCollapsesConcurrentMisses(t *testing.T)
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = r.BuildFiles(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", "deadbeefcafe0001")
+			_, errs[i] = r.BuildFilesWithComponents(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", Components{}, "deadbeefcafe0001")
 		}(i)
 	}
 	wg.Wait()
 
 	for i, e := range errs {
 		if e != nil {
-			t.Fatalf("BuildFiles[%d]: %v", i, e)
+			t.Fatalf("BuildFilesWithComponents[%d]: %v", i, e)
 		}
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
@@ -148,11 +148,11 @@ func TestResolver_BuildFiles_RevisionMismatchSkips(t *testing.T) {
 	defer srv.Close()
 
 	// Source artifact is at a NEWER revision than the event — the matching bytes
-	// are gone. BuildFiles must refuse (and never fetch the wrong tarball).
+	// are gone. BuildFilesWithComponents must refuse (and never fetch the wrong tarball).
 	getter := &fakeGetter{yaml: sourceYAML(srv.URL, "dev@sha1:newrevision999", "sha256:d")}
 	r := NewResolver(getter, nil, srv.Client())
 
-	_, err := r.BuildFiles(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", "oldrevision111")
+	_, err := r.BuildFilesWithComponents(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", Components{}, "oldrevision111")
 	if err == nil {
 		t.Fatal("expected ErrRevisionMismatch, got nil")
 	}
@@ -178,14 +178,14 @@ func TestResolver_BuildFiles_DigestlessCacheKeyedByRevision(t *testing.T) {
 	r := NewResolver(getter, nil, srv.Client())
 	ref := Ref{Kind: "GitRepository", Name: "cluster"}
 
-	if _, err := r.BuildFiles(context.Background(), ref, "apps/web", "aaaaaaaa00000001"); err != nil {
-		t.Fatalf("BuildFiles at revision A: %v", err)
+	if _, err := r.BuildFilesWithComponents(context.Background(), ref, "apps/web", Components{}, "aaaaaaaa00000001"); err != nil {
+		t.Fatalf("BuildFilesWithComponents at revision A: %v", err)
 	}
 	serving.Store(&revB)
 	getter.yaml = sourceYAML(url, "main@sha1:bbbbbbbb00000002", "")
-	set, err := r.BuildFiles(context.Background(), ref, "apps/web", "bbbbbbbb00000002")
+	set, err := r.BuildFilesWithComponents(context.Background(), ref, "apps/web", Components{}, "bbbbbbbb00000002")
 	if err != nil {
-		t.Fatalf("BuildFiles at revision B: %v", err)
+		t.Fatalf("BuildFilesWithComponents at revision B: %v", err)
 	}
 	if _, ok := set["apps/web/b.yaml"]; !ok {
 		t.Fatalf("revision B got a stale tree: set = %v, want apps/web/b.yaml", keys(set))
@@ -195,7 +195,7 @@ func TestResolver_BuildFiles_DigestlessCacheKeyedByRevision(t *testing.T) {
 func TestResolver_BuildFiles_NoArtifact(t *testing.T) {
 	getter := &fakeGetter{yaml: "apiVersion: source.toolkit.fluxcd.io/v1\nkind: GitRepository\nstatus: {}\n"}
 	r := NewResolver(getter, nil, http.DefaultClient)
-	if _, err := r.BuildFiles(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", "abc"); err == nil {
+	if _, err := r.BuildFilesWithComponents(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", Components{}, "abc"); err == nil {
 		t.Fatal("expected ErrNoArtifact for a source with no ready artifact")
 	}
 }
@@ -216,7 +216,7 @@ func TestResolver_BuildFiles_RejectsDigestMismatch(t *testing.T) {
 	defer srv.Close()
 	getter := &fakeGetter{yaml: sourceYAML(srv.URL, "dev@sha1:deadbeefcafe0001", "sha256:"+strings.Repeat("0", 64))}
 	r := NewResolver(getter, nil, srv.Client())
-	_, err := r.BuildFiles(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", "deadbeefcafe0001")
+	_, err := r.BuildFilesWithComponents(context.Background(), Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", Components{}, "deadbeefcafe0001")
 	if !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("err = %v, want ErrDigestMismatch", err)
 	}
@@ -243,14 +243,14 @@ func TestResolver_BuildFiles_ShutdownStopsSharedDownload(t *testing.T) {
 	defer stopProcess()
 	buildErr := make(chan error, 1)
 	go func() {
-		_, err := r.BuildFiles(lifecycle.WithShutdown(context.Background(), shutdown),
-			Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", "deadbeefcafe0001")
+		_, err := r.BuildFilesWithComponents(lifecycle.WithShutdown(context.Background(), shutdown),
+			Ref{Kind: "GitRepository", Name: "cluster"}, "apps/web/dev/r1", Components{}, "deadbeefcafe0001")
 		buildErr <- err
 	}()
 	select {
 	case <-arrived:
 	case err := <-buildErr:
-		t.Fatalf("BuildFiles returned before requesting the artifact: %v", err)
+		t.Fatalf("BuildFilesWithComponents returned before requesting the artifact: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the artifact request never arrived")
 	}
@@ -287,7 +287,7 @@ func TestResolver_BuildFiles_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderErr := make(chan error, 1)
 	go func() {
-		_, err := r.BuildFiles(leaderCtx, ref, "apps/web/dev/r1", "deadbeefcafe0001")
+		_, err := r.BuildFilesWithComponents(leaderCtx, ref, "apps/web/dev/r1", Components{}, "deadbeefcafe0001")
 		leaderErr <- err
 	}()
 	select { // leader is now inside the shared download
@@ -299,7 +299,7 @@ func TestResolver_BuildFiles_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 	}
 	followerErr := make(chan error, 1)
 	go func() {
-		_, err := r.BuildFiles(context.Background(), ref, "apps/web/dev/r1", "deadbeefcafe0001")
+		_, err := r.BuildFilesWithComponents(context.Background(), ref, "apps/web/dev/r1", Components{}, "deadbeefcafe0001")
 		followerErr <- err
 	}()
 	time.Sleep(20 * time.Millisecond)

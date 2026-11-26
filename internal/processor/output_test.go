@@ -77,7 +77,10 @@ func TestNeutralizeMentions(t *testing.T) {
 		"unmatched ` backtick @erin":               "unmatched ` backtick @" + zw + "erin",
 		"```\n@frank in a fence\n```\n@grace":      "```\n@frank in a fence\n```\n@" + zw + "grace",
 		"- ~~~\n  @heidi\n  ~~~\nthen @ivan":       "- ~~~\n  @heidi\n  ~~~\nthen @" + zw + "ivan",
-		"no mentions here":                         "no mentions here",
+		// A list-item fence never closed ends with its item: prose after the
+		// item is neutralized again.
+		"- ~~~\n  @heidi\n\nOutside: ping @ops": "- ~~~\n  @heidi\n\nOutside: ping @" + zw + "ops",
+		"no mentions here":                      "no mentions here",
 	} {
 		if got := neutralizeMentions(in); got != want {
 			t.Errorf("neutralizeMentions(%q) = %q, want %q", in, got, want)
