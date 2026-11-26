@@ -220,7 +220,7 @@ func run(logger *slog.Logger) error {
 		MaxConcurrent:     parseIntEnv("WEBHOOK_MAX_CONCURRENT", 16),
 		HMACSecret:        hmacSecret,
 		Filter:            filter,
-		ProcessingTimeout: cfg.ReadinessPollTimeout + 2*time.Minute,
+		ProcessingTimeout: cfg.ProcessingTimeout(),
 	})
 
 	mux := http.NewServeMux()

@@ -434,6 +434,10 @@ spec:
             - name: GITHUB_API_URL
               value: {{ .Values.config.github.apiUrl | quote }}
             {{- end }}
+            {{- if .Values.config.github.allowInsecure }}
+            - name: GITHUB_API_ALLOW_INSECURE
+              value: "true"
+            {{- end }}
             {{- with .Values.config.kustomizations }}
             {{- /* An empty pattern renders as nothing in the joined env var, so
             `include: [""]` would silently admit everything; reject it here. */}}

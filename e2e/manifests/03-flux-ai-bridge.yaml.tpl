@@ -7,6 +7,7 @@
 #   E2E_ANTHROPIC_API_KEY  — Anthropic key (mock value unless real Anthropic is used)
 #   E2E_GITHUB_REPO        — owner/repo passed as bridge config.github.repo
 #   E2E_GITHUB_API_URL     — bridge config.github.apiUrl (empty = default api.github.com)
+#   E2E_GITHUB_API_ALLOW_INSECURE — bridge config.github.allowInsecure ("true" for the plain-HTTP mock)
 #   E2E_KEEP_COMMENT_HISTORY — bridge config.github.comments.keepHistory ("true"/"false"; default "false")
 #   E2E_LLM_PROVIDER       — bridge config.llm.provider (claude | openai-compatible)
 #   E2E_LLM_MODEL          — bridge config.llm.model (provider-specific name)
@@ -125,6 +126,9 @@ spec:
       github:
         repo: "${E2E_GITHUB_REPO}"
         apiUrl: "${E2E_GITHUB_API_URL}"
+        # The mock GitHub speaks plain HTTP, which the bridge refuses
+        # unless allowInsecure is set; real-GitHub mode keeps it false.
+        allowInsecure: ${E2E_GITHUB_API_ALLOW_INSECURE}
         comments:
           # When true, the bridge appends each new comment instead of
           # deleting+recreating. Useful when iterating on a workload that

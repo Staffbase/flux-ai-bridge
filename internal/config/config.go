@@ -34,6 +34,11 @@ type Config struct {
 	FailureFetchMetrics      bool
 	GitHubAPIURL             string
 	GitHubRepo               string
+	// GitHubAPIAllowInsecure permits a plain-HTTP GitHubAPIURL. Without it
+	// Load refuses an `http://` URL, which would send the App JWT and the
+	// installation tokens unencrypted. Meant for an in-cluster test mock only.
+	// Set via GITHUB_API_ALLOW_INSECURE.
+	GitHubAPIAllowInsecure bool
 	// GitHubKeepCommentHistory disables the default delete-prior-marker
 	// step in the commenter. Each analysis is posted as a fresh comment;
 	// the PR accumulates a trail. Useful for testing iterations across
@@ -165,7 +170,9 @@ type Config struct {
 	// minutes after a green deploy) without a new commit. The comment layer
 	// is idempotent, so a re-eval that finds identical state touches nothing.
 	// Zero (default) disables re-evaluation: each PR-head is analysed exactly
-	// once. Set via DEDUPE_PR_REEVAL_TTL (e.g. "30m").
+	// once. A positive value must cover one analysis (ProcessingTimeout), or a
+	// slow failed analysis could release a newer analysis's mark; Load
+	// rejects shorter values. Set via DEDUPE_PR_REEVAL_TTL (e.g. "30m").
 	DedupePRReEvalTTL time.Duration
 	// DedupeReEvalFailedOnly narrows re-evaluation (when DedupePRReEvalTTL > 0)
 	// to PR-heads whose LAST analysis was NOT healthy. A previously-green deploy
@@ -261,6 +268,23 @@ type Config struct {
 	ReadinessPodQuietPeriod time.Duration
 }
 
+// processingSlack is what one event's pipeline gets on top of the readiness
+// poll: failure-context fetches, the LLM call and comment delivery.
+const processingSlack = 2 * time.Minute
+
+// processingTimeout is the per-event pipeline budget for a readiness poll
+// timeout. A single derivation keeps the webhook deadline and the re-eval TTL
+// floor in step.
+func processingTimeout(pollTimeout time.Duration) time.Duration {
+	return pollTimeout + processingSlack
+}
+
+// ProcessingTimeout caps one event's full pipeline (readiness poll plus
+// processingSlack). main.go hands it to the webhook handler.
+func (c *Config) ProcessingTimeout() time.Duration {
+	return processingTimeout(c.ReadinessPollTimeout)
+}
+
 // instanceIDPattern is a DNS label: safe inside an HTML comment marker and a
 // Redis key.
 var instanceIDPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -300,6 +324,12 @@ func Load() (*Config, error) {
 	}
 	if prReEvalTTL < 0 {
 		return nil, fmt.Errorf("DEDUPE_PR_REEVAL_TTL must be >= 0, got %s", prReEvalTTL)
+	}
+	// A re-eval window shorter than one analysis lets a slow failed analysis
+	// roll back the admission mark that a newer analysis of the same PR-head
+	// took after the window expired. 0 (never re-evaluate) has no window.
+	if floor := processingTimeout(pollTimeout); prReEvalTTL > 0 && prReEvalTTL < floor {
+		return nil, fmt.Errorf("DEDUPE_PR_REEVAL_TTL (%s) must be 0 or at least READINESS_POLL_TIMEOUT (%s) + %s = %s, the time one analysis may take", prReEvalTTL, pollTimeout, processingSlack, floor)
 	}
 	// The quiet window comes out of the poll budget: one that doesn't fit
 	// would end every healthy analysis unsettled (⚠️). The default shrinks to
@@ -361,6 +391,7 @@ func Load() (*Config, error) {
 		LLMSkipOnHealthy:            boolEnv("LLM_SKIP_ON_HEALTHY", true),
 		GitHubAPIURL:                strings.TrimSpace(os.Getenv("GITHUB_API_URL")),
 		GitHubRepo:                  strings.TrimSpace(os.Getenv("GITHUB_REPO")),
+		GitHubAPIAllowInsecure:      boolEnv("GITHUB_API_ALLOW_INSECURE", false),
 		GitHubKeepCommentHistory:    boolEnv("GITHUB_KEEP_COMMENT_HISTORY", false),
 		CommentIncludeSummary:       boolEnv("COMMENT_INCLUDE_SUMMARY", true),
 		CommentIncludeFooter:        boolEnv("COMMENT_INCLUDE_FOOTER", true),
@@ -392,6 +423,9 @@ func Load() (*Config, error) {
 	}
 	if boolErr != nil {
 		return nil, boolErr
+	}
+	if strings.HasPrefix(strings.ToLower(cfg.GitHubAPIURL), "http://") && !cfg.GitHubAPIAllowInsecure {
+		return nil, fmt.Errorf("GITHUB_API_URL %q uses plain HTTP, which sends the GitHub App credentials unencrypted; use https:// or set GITHUB_API_ALLOW_INSECURE=true (test mocks only)", cfg.GitHubAPIURL)
 	}
 	if cfg.InstanceID != "" && !instanceIDPattern.MatchString(cfg.InstanceID) {
 		return nil, fmt.Errorf("INSTANCE_ID %q must be a DNS label: lowercase letters, digits and '-', at most 63 characters, starting and ending alphanumeric", cfg.InstanceID)

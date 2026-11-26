@@ -398,6 +398,7 @@ if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
   fi; \
   E2E_GITHUB_REPO="$$GITHUB_REPO"; \
   E2E_GITHUB_API_URL=""; \
+  E2E_GITHUB_API_ALLOW_INSECURE="false"; \
   E2E_PODINFO_GIT_URL="https://github.com/$$GITHUB_REPO.git"; \
   E2E_PODINFO_GIT_REF="$${E2E_PODINFO_GIT_REF:-main}"; \
   E2E_PODINFO_GIT_PROVIDER="github"; \
@@ -405,6 +406,7 @@ if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
 else \
   E2E_GITHUB_REPO="test-owner/test-repo"; \
   E2E_GITHUB_API_URL="http://mock-github.mock.svc.cluster.local/"; \
+  E2E_GITHUB_API_ALLOW_INSECURE="true"; \
   E2E_PODINFO_GIT_URL="http://git-server.git-server.svc.cluster.local/flux-ai-bridge.git"; \
   E2E_PODINFO_GIT_REF="main"; \
   E2E_PODINFO_GIT_PROVIDER="generic"; \
@@ -492,7 +494,7 @@ else \
   E2E_DEDUPE_SENTINEL_PASSWORD_KEY=""; \
   E2E_WEBHOOK_MAX_CONCURRENT=""; \
 fi; \
-export E2E_GITHUB_REPO E2E_GITHUB_API_URL \
+export E2E_GITHUB_REPO E2E_GITHUB_API_URL E2E_GITHUB_API_ALLOW_INSECURE \
        E2E_LLM_PROVIDER E2E_LLM_MODEL E2E_ANTHROPIC_API_KEY \
        E2E_ANTHROPIC_BASE_URL E2E_OPENAI_BASE_URL E2E_OPENAI_API_KEY \
        E2E_OLLAMA_ENABLED E2E_LOG_LEVEL E2E_KEEP_COMMENT_HISTORY \

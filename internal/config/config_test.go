@@ -37,7 +37,7 @@ var configEnvVars = []string{
 	"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL",
 	"LLM_MODEL", "LLM_MAX_TOKENS", "LLM_SKIP_ON_HEALTHY",
 	"GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_PRIVATE_KEY_FILE",
-	"GITHUB_API_URL", "GITHUB_REPO", "GITHUB_KEEP_COMMENT_HISTORY",
+	"GITHUB_API_URL", "GITHUB_API_ALLOW_INSECURE", "GITHUB_REPO", "GITHUB_KEEP_COMMENT_HISTORY",
 	"KUSTOMIZATIONS_INCLUDE", "KUSTOMIZATIONS_EXCLUDE",
 	"DEDUPE_PERSISTENCE_MAX_TTL", "SHUTDOWN_TIMEOUT",
 	"READINESS_POLL_INTERVAL", "READINESS_POLL_TIMEOUT", "DEDUPE_PR_REEVAL_TTL",
@@ -450,14 +450,38 @@ func equalSlices(a, b []string) bool {
 
 func TestLoad_GitHubAPIURL(t *testing.T) {
 	env := baseClaudeEnv()
-	env["GITHUB_API_URL"] = "http://mock-github:80/"
+	env["GITHUB_API_URL"] = "https://github.example.com/api/v3/"
 	setEnv(t, env)
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.GitHubAPIURL != "http://mock-github:80/" {
-		t.Errorf("GitHubAPIURL = %q, want %q", cfg.GitHubAPIURL, "http://mock-github:80/")
+	if cfg.GitHubAPIURL != "https://github.example.com/api/v3/" {
+		t.Errorf("GitHubAPIURL = %q, want %q", cfg.GitHubAPIURL, "https://github.example.com/api/v3/")
+	}
+}
+
+// A plain-HTTP GitHub API URL would send the App JWT and the installation
+// tokens unencrypted, so it is refused unless GITHUB_API_ALLOW_INSECURE opts
+// in (an in-cluster test mock).
+func TestLoad_GitHubAPIURLRefusesPlainHTTP(t *testing.T) {
+	for _, u := range []string{"http://mock-github:80/", "HTTP://mock-github/"} {
+		setEnv(t, mergeEnv(baseClaudeEnv(), map[string]string{"GITHUB_API_URL": u}))
+		if _, err := config.Load(); err == nil || !strings.Contains(err.Error(), "GITHUB_API_ALLOW_INSECURE") {
+			t.Errorf("GITHUB_API_URL=%s: err = %v, want a refusal naming GITHUB_API_ALLOW_INSECURE", u, err)
+		}
+	}
+
+	setEnv(t, mergeEnv(baseClaudeEnv(), map[string]string{
+		"GITHUB_API_URL":            "http://mock-github:80/",
+		"GITHUB_API_ALLOW_INSECURE": "true",
+	}))
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("plain HTTP with GITHUB_API_ALLOW_INSECURE=true: %v", err)
+	}
+	if cfg.GitHubAPIURL != "http://mock-github:80/" || !cfg.GitHubAPIAllowInsecure {
+		t.Errorf("got (%q, %t), want (%q, true)", cfg.GitHubAPIURL, cfg.GitHubAPIAllowInsecure, "http://mock-github:80/")
 	}
 }
 
@@ -538,6 +562,47 @@ func TestLoad_PodQuietPeriodDefaultFitsShortPollTimeout(t *testing.T) {
 	setEnv(t, mergeEnv(baseClaudeEnv(), map[string]string{"READINESS_POLL_TIMEOUT": "1m", "READINESS_POD_QUIET_PERIOD": "1m"}))
 	if _, err := config.Load(); err == nil || !strings.Contains(err.Error(), "must be shorter than READINESS_POLL_TIMEOUT") {
 		t.Errorf("explicit quiet period = poll timeout: err = %v, want the shorter-than error", err)
+	}
+}
+
+// A positive DEDUPE_PR_REEVAL_TTL shorter than one event's processing budget
+// (READINESS_POLL_TIMEOUT plus the fixed slack) lets a slow failed analysis
+// release the dedupe mark of a newer analysis of the same PR-head, so it is
+// rejected at startup. 0 (never re-evaluate) stays allowed.
+func TestLoad_PRReEvalTTLCoversOneAnalysis(t *testing.T) {
+	for _, tc := range []struct {
+		pollTimeout, ttl string
+		ok               bool
+	}{
+		{"", "", true},          // unset: never re-evaluate
+		{"", "0", true},         // explicit 0: never re-evaluate
+		{"", "4m59s", false},    // default 3m poll + 2m slack = 5m
+		{"", "5m", true},        // exactly one analysis
+		{"", "30m", true},       // the documented example
+		{"10m", "11m", false},   // follows READINESS_POLL_TIMEOUT
+		{"10m", "12m", true},    // 10m + 2m
+		{"30s", "2m29s", false}, // a short poll timeout still needs the slack
+	} {
+		setEnv(t, mergeEnv(baseClaudeEnv(), map[string]string{
+			"READINESS_POLL_TIMEOUT": tc.pollTimeout,
+			"DEDUPE_PR_REEVAL_TTL":   tc.ttl,
+		}))
+		_, err := config.Load()
+		if tc.ok && err != nil {
+			t.Errorf("poll=%q ttl=%q: err = %v, want accepted", tc.pollTimeout, tc.ttl, err)
+		}
+		if !tc.ok && (err == nil || !strings.Contains(err.Error(), "DEDUPE_PR_REEVAL_TTL") || !strings.Contains(err.Error(), "READINESS_POLL_TIMEOUT")) {
+			t.Errorf("poll=%q ttl=%q: err = %v, want a rejection naming DEDUPE_PR_REEVAL_TTL and READINESS_POLL_TIMEOUT", tc.pollTimeout, tc.ttl, err)
+		}
+	}
+}
+
+// ProcessingTimeout is the per-event pipeline budget main.go hands the
+// webhook handler; the re-eval TTL floor above is derived from it.
+func TestConfig_ProcessingTimeout(t *testing.T) {
+	cfg := config.Config{ReadinessPollTimeout: 3 * time.Minute}
+	if got := cfg.ProcessingTimeout(); got != 5*time.Minute {
+		t.Errorf("ProcessingTimeout() = %s, want 5m (poll timeout + 2m)", got)
 	}
 }
 

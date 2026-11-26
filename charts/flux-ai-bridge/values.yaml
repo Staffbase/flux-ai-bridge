@@ -201,6 +201,8 @@ config:
       # updates the comment if state changed (idempotent — unchanged state writes
       # nothing). The trade-off is cost: each PR re-runs the readiness poll + LLM
       # + GitHub write once per window. Pick a value balancing freshness vs that.
+      # The bridge refuses a value shorter than one analysis
+      # (config.readiness.pollTimeout + 2m, so 5m with the defaults).
       #
       # Enabling this on a RUNNING install also applies to PRs analysed before
       # the change: their existing admission records get the expiry attached on
@@ -270,6 +272,10 @@ config:
     # Override the GitHub API base URL (useful for GitHub Enterprise or
     # testing). Leave empty to use the default github.com API endpoint.
     apiUrl: ""
+    # Accept a plain-HTTP apiUrl (env GITHUB_API_ALLOW_INSECURE). The bridge
+    # refuses an http:// URL by default, as it would send the GitHub App JWT
+    # and installation tokens unencrypted. Only for an in-cluster test mock.
+    allowInsecure: false
     # GitHub fetch-cache tuning. The fetch cache is what keeps the bridge
     # under GitHub's API rate limit; these knobs trade a little
     # freshness/depth for fewer calls. All optional — empty = bridge default.
@@ -941,6 +947,22 @@ volumeMounts: []
 # values by default. Set create: false to manage the binding yourself.
 mcpRbac:
   create: true
+  # The wildcard also grants `get` on nodes/proxy, which the kubelet accepts
+  # for exec over WebSocket. excludeNodeProxy: true binds a role that lists
+  # API groups instead, without nodes/proxy (and without pods/exec,
+  # pods/attach, pods/portforward, pods/proxy, services/proxy): the core
+  # resources incl. pods/log and events, the built-in groups (apps, batch,
+  # networking, policy, autoscaling, rbac, apiextensions, …) and all Flux
+  # groups. It MUST be extended for your CRDs via extraRules: a group it
+  # misses shows up as unreadable resources in the PR comment.
+  excludeNodeProxy: false
+  # Extra rules added to the MCP role, e.g. for CRD groups with
+  # excludeNodeProxy. verbs defaults to [get, list, watch]; any other verb
+  # fails the render (the role stays read-only).
+  #   extraRules:
+  #     - apiGroups: ["example.com"]
+  #       resources: ["*"]
+  extraRules: []
 
 flux-operator-mcp:
   enabled: true

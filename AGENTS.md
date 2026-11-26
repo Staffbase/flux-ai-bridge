@@ -45,7 +45,9 @@ that test code shells out to. Never rely on the kubeconfig current-context. The 
   `flux-operator-mcp` and the opt-in `FAILURE_FETCH_FLUX_INSTANCE` use Operator objects.
 - **All cluster reads go through MCP.** The bridge has no Kubernetes client and no RBAC of its own. The MCP server is
   bound to a read-only role. Its own secret masking protects secrets. Grant it access by role, never by a list of API
-  groups: such a list breaks each time a CRD is added to the cluster.
+  groups: such a list breaks each time a CRD is added to the cluster. The exception is the opt-in
+  `mcpRbac.excludeNodeProxy` role, which lists groups so it can leave out `nodes/proxy`; users extend it for their
+  CRDs with `mcpRbac.extraRules`.
 - **The verdict is deterministic.** The emoji, label and tables come from kstatus. The LLM writes only the prose
   between the header and the footer. Comment idempotency keys on the kstatus part (the stability key), so LLM rewording
   never replaces a comment. A change to the verdict logic needs a matching update to the SKILL prompt in
