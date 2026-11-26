@@ -271,16 +271,14 @@ func (r *redisStore) hset(key, field, value string, ttl time.Duration) error {
 	return err
 }
 
-func (r *redisStore) hdelScopeOutcome(key, field string) bool {
+func (r *redisStore) hdelScopeOutcome(key, field string) (bool, error) {
 	ctx, cancel := r.ctx()
 	defer cancel()
 	n, err := r.client.HDel(ctx, r.labelKeyOf(key), field).Result()
 	if err != nil {
-		slog.Default().Warn("dedupe: redis HDEL label-state failed (best-effort)",
-			"key", key, "scope", field, "error", err.Error())
-		return false
+		return false, err
 	}
-	return n > 0
+	return n > 0, nil
 }
 
 func (r *redisStore) hgetallScopeOutcomes(key string) map[string]string {

@@ -429,6 +429,51 @@ func TestProcess_DeScope_FailedLabelWriteRetriedWhenBackendFailsToo(t *testing.T
 	}
 }
 
+// A de-scope whose per-head outcome can't be removed must not go on: the label
+// rewrite would still count the stale outcome, and dropping the marker after it
+// would leave no retry state. The marker stays, and once the outcome can be
+// removed, the next event finishes the de-scope.
+func TestProcess_DeScope_FailedOutcomeRemovalKeepsMarker(t *testing.T) {
+	cache, mr := newRedisDedupe(t)
+	owner, repo, pr, head := "owner", "repo", 42, "h-new"
+	roster, outcomes := "p:label:owner/repo:pr42:roster", "p:label:owner/repo:pr42:h-new"
+	cache.AddPRScope(owner, repo, pr, "default/apps", time.Hour)
+	cache.AddPRScope(owner, repo, pr, "default/other", time.Hour)
+	// A per-head outcome key of the wrong type makes HDEL fail (WRONGTYPE).
+	if err := mr.Set(outcomes, "not-a-hash"); err != nil {
+		t.Fatalf("seed outcome key: %v", err)
+	}
+
+	mcpMock := &fakeMCPClient{data: []byte(kustomizationOneInventoryEntry)} // inventory: default_any__ConfigMap
+	fc := &fakeCommenter{
+		prNumber: pr, prState: "open", prHeadSHA: head,
+		prFiles: []bridgegithub.PRFile{{Path: "x.yaml", BlobSHA: "b1", Status: "modified"}},
+		blobs:   map[string][]byte{"b1": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nope\n  namespace: default\n")},
+	}
+	cfg := &config.Config{GitHubRepo: owner + "/" + repo, LLMProvider: "none", PRLabelEnabled: true, ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, fc, nil, cache, slog.Default())
+	event := eventv1.Event{InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "other", Namespace: "default"}}
+
+	_ = proc.Process(context.Background(), event, "srcrev")
+	if got := mr.HGet(roster, "default/other"); got != "descoping" {
+		t.Fatalf("a failed outcome removal must keep the de-scope marker; roster entry = %q", got)
+	}
+
+	mr.Del(outcomes)
+	cache.PutScopeOutcome(owner, repo, pr, head, "default/apps", string(bridgegithub.OutcomeSuccess), time.Hour)
+	cache.PutScopeOutcome(owner, repo, pr, head, "default/other", string(bridgegithub.OutcomeFailure), time.Hour)
+	before := len(fc.labelCalls)
+	if err := proc.Process(context.Background(), event, "srcrev"); err != nil {
+		t.Fatalf("Process (retry): %v", err)
+	}
+	if calls := fc.labelCalls[before:]; len(calls) == 0 || calls[len(calls)-1].Outcome != bridgegithub.OutcomeSuccess {
+		t.Fatalf("the retried de-scope did not drop the stale failure; label calls %+v", calls)
+	}
+	if mr.HGet(roster, "default/other") != "" {
+		t.Fatal("the de-scope marker outlived the finished de-scope")
+	}
+}
+
 // A rate-limited label write on one PR keeps its cooldown when a later PR's
 // comment write (post, or removal when suppressed) then fails for another
 // reason: returning only that error's zero cooldown would release the first

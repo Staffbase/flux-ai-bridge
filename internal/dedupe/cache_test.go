@@ -138,10 +138,10 @@ func TestScopeOutcomes_RoundTrip(t *testing.T) {
 		t.Errorf("a different head must not inherit scope outcomes, got %v", got)
 	}
 	// Removing a tracked scope reports true; an untracked one false.
-	if !c.RemoveScopeOutcome("o", "r", 42, "h1", "ns/k1") {
+	if ok, err := c.RemoveScopeOutcome("o", "r", 42, "h1", "ns/k1"); !ok || err != nil {
 		t.Error("removing a tracked scope must report true")
 	}
-	if c.RemoveScopeOutcome("o", "r", 42, "h1", "ns/nope") {
+	if ok, err := c.RemoveScopeOutcome("o", "r", 42, "h1", "ns/nope"); ok || err != nil {
 		t.Error("removing an untracked scope must report false")
 	}
 	if got := c.ScopeOutcomes("o", "r", 42, "h1"); len(got) != 1 || got["ns/k2"] != "success" {

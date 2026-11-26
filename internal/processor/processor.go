@@ -1582,7 +1582,9 @@ func (p *Processor) filterPRs(ctx context.Context, owner, repo, ns, name, revisi
 // marker and retries it; removing the entries first would leave nothing for
 // that event to find, and a de-scoped failure or a held success on the PR. If
 // the marker can't be written, or the roster can't be read, nothing is
-// removed, so the next event retries the whole de-scope.
+// removed, so the next event retries the whole de-scope. If the outcome can't
+// be removed, the labels aren't rewritten (they would count it) and the
+// marker stays.
 //
 // A PR that never touched this scope has no roster entry and no outcome, and
 // costs two reads.
@@ -1605,7 +1607,11 @@ func (p *Processor) descopeLabel(ctx context.Context, owner, repo string, pr bri
 			return
 		}
 	}
-	p.dedupe.RemoveScopeOutcome(owner, repo, pr.Number, pr.HeadSHA, scope)
+	if _, err := p.dedupe.RemoveScopeOutcome(owner, repo, pr.Number, pr.HeadSHA, scope); err != nil {
+		p.logger.Warn("de-scope label update deferred: could not remove the scope's outcome",
+			"pr", pr.Number, "kustomization", scope, "error", err.Error())
+		return // the marker stays for the next event's retry
+	}
 	if err := p.applyPRLabel(ctx, owner, repo, pr.Number, pr.HeadSHA, bridgegithub.OutcomeNone); err != nil {
 		return // logged inside; the marker stays for the next event's retry
 	}

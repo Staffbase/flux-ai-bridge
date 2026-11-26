@@ -446,10 +446,11 @@ func (c *Cache) PutScopeOutcome(owner, repo string, pr int, headSHA, scope, outc
 
 // RemoveScopeOutcome drops a Kustomization scope from a PR-head's map (used when
 // a PR no longer touches that Kustomization). Returns true if the scope was
-// present, so callers only recompute the label when something actually changed.
-func (c *Cache) RemoveScopeOutcome(owner, repo string, pr int, headSHA, scope string) bool {
+// present, and the backend error, so a de-scope whose outcome stays can be
+// retried instead of rewriting the label from the stale outcome.
+func (c *Cache) RemoveScopeOutcome(owner, repo string, pr int, headSHA, scope string) (bool, error) {
 	if c == nil || c.s == nil {
-		return false
+		return false, nil
 	}
 	key := labelStateKey(owner, repo, pr, headSHA)
 	if r, ok := c.s.(*redisStore); ok {
@@ -458,14 +459,14 @@ func (c *Cache) RemoveScopeOutcome(owner, repo string, pr int, headSHA, scope st
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.labels == nil {
-		return false
+		return false, nil
 	}
 	prev, ok := c.labels.Get(key)
 	if !ok {
-		return false
+		return false, nil
 	}
 	if _, present := prev[scope]; !present {
-		return false
+		return false, nil
 	}
 	next := make(map[string]string, len(prev))
 	for k, v := range prev {
@@ -474,7 +475,7 @@ func (c *Cache) RemoveScopeOutcome(owner, repo string, pr int, headSHA, scope st
 		}
 	}
 	c.labels.Add(key, next)
-	return true
+	return true, nil
 }
 
 // ScopeOutcomes returns the PR-head's scope→outcome map (a copy), or an empty
@@ -576,7 +577,12 @@ func (c *Cache) RemovePRScope(owner, repo string, pr int, scope string) bool {
 	}
 	key := rosterKey(owner, repo, pr)
 	if r, ok := c.s.(*redisStore); ok {
-		return r.hdelScopeOutcome(key, scope)
+		removed, err := r.hdelScopeOutcome(key, scope)
+		if err != nil {
+			slog.Default().Warn("dedupe: redis HDEL roster failed (best-effort)",
+				"key", key, "scope", scope, "error", err.Error())
+		}
+		return removed
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

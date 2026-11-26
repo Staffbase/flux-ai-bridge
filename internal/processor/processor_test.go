@@ -1439,7 +1439,9 @@ func TestReconcileLabels_DeScopeReleasesHeldSuccess(t *testing.T) {
 
 	// `slow` is de-scoped (PR no longer touches it): roster shrinks to {fast},
 	// which is now covered → the held success releases.
-	dd.RemoveScopeOutcome("o", "r", 42, "h2", "ns/slow")
+	if _, err := dd.RemoveScopeOutcome("o", "r", 42, "h2", "ns/slow"); err != nil {
+		t.Fatalf("RemoveScopeOutcome: %v", err)
+	}
 	dd.RemovePRScope("o", "r", 42, "ns/slow")
 	_ = proc.applyPRLabel(ctx, "o", "r", 42, "h2", bridgegithub.OutcomeNone)
 	if got := commenterMock.labelCalls[len(commenterMock.labelCalls)-1].Outcome; got != bridgegithub.OutcomeSuccess || len(commenterMock.labelCalls) == base {
