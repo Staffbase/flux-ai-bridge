@@ -12,3 +12,5 @@ charts/flux-ai-bridge/Chart.lock
 e2e/fixtures/mock-app-key.pem
 .omo/*
 mise.toml
+# Local AI agent state (settings, worktrees).
+.claude/
