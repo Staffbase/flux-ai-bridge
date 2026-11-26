@@ -39,6 +39,8 @@ Every common dev task is wrapped in a `make` target. Prefer these over running `
 | `make e2e-valkey-setup` | Set up Valkey + Sentinel and the secrets in the e2e cluster for the persistence tests (run automatically by `E2E_DEDUPE_PERSISTENCE=1 make e2e-up`) |
 | `make e2e-persistence` | Run the persistence test suite against Bitnami Valkey + Sentinel (requires `E2E_DEDUPE_PERSISTENCE=1 make e2e-up`) |
 | `make e2e-down` | Delete the kind cluster |
+| `make flux-install` | Install the Flux Operator (`FLUX_OPERATOR_VERSION`) and Flux through `e2e/manifests/01-flux-instance.yaml` into the kind cluster `CLUSTER_NAME` (run by `e2e-up` and `ct-install`) |
+| `make ct-install` | What the `install-chart` CI job runs: build and load the image, install Flux and a podinfo Kustomization, then `ct install` the chart once per `ci/*-values.yaml` with dummy GitHub App credentials. Needs an existing kind cluster `CT_CLUSTER_NAME` (default `flux-ai-bridge-ct`): `kind create cluster --name flux-ai-bridge-ct --config .github/kind-config.yaml` |
 
 Switches that combine with the e2e targets: `E2E_REAL_GITHUB=1` (target a real PR), `E2E_LLM=ollama|azure|none` (real LLM), `E2E_KEEP_COMMENT_HISTORY=true` (don't delete prior comments), `E2E_DEDUPE_PERSISTENCE=1` (Valkey + Sentinel). See [docs/e2e-real-github.md](e2e-real-github.md) and [docs/e2e-real-llm.md](e2e-real-llm.md).
 

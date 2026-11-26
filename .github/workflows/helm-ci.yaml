@@ -1,26 +1,28 @@
 name: helm-ci
 
-permissions: read-all
+permissions:
+  contents: read
 
-on: 
+on:
   pull_request:
     paths:
       - 'charts/**/**'
 
 env:
-  helm-version: "v4.1.4"
-  kubeconform-version: "v0.7.0"
+  helm-version: "v4.3.2"
+  kubeconform-version: "v0.8.0"
 
 jobs:
   lint-chart:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Set up Helm
-        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: "${{ env.helm-version }}"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -31,45 +33,67 @@ jobs:
       - name: Run chart-testing (lint)
         run: ct lint --config .github/ct.yaml
 
-  # install-chart:
-  #   name: install-chart
-  #   runs-on: ubuntu-24.04
-  #   needs: 
-  #     - lint-chart
-  #   strategy:
-  #     matrix:
-  #       k8s:
-  #         - v1.33.7
-  #         - v1.34.3
-  #         - v1.35.1
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v7
-  #       with:
-  #         fetch-depth: 0
+  # Installs the chart into a kind cluster running Flux, once per
+  # charts/flux-ai-bridge/ci/*-values.yaml, and waits until every resource
+  # (bridge, bundled MCP server, Flux Provider and Alert) is ready. The steps
+  # live in `make ct-install`, so they run the same way locally.
+  install-chart:
+    name: install-chart (${{ matrix.k8s.version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs:
+      - lint-chart
+    strategy:
+      fail-fast: false
+      matrix:
+        # The node images of the kind release below for the three newest
+        # Kubernetes minors, pinned by digest as the kind release notes list
+        # them.
+        k8s:
+          - version: v1.35.8
+            image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+          - version: v1.36.4
+            image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+          - version: v1.37.0
+            image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-  #     - name: Set up Helm
-  #       uses: azure/setup-helm@v5
-  #       with:
-  #         version: "${{ env.helm-version }}"
+      - name: Set up Helm
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: "${{ env.helm-version }}"
 
-  #     - uses: actions/setup-python@v7.0.0
-  #       with:
-  #         python-version: 3.11
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
 
-  #     - name: Set up chart-testing
-  #       uses: helm/chart-testing-action@v2.9.0
+      - name: Run chart-testing (list-changed)
+        id: list-changed
+        run: |
+          if [ -n "$(ct list-changed --config .github/ct.yaml)" ]; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
 
-  #     - name: Run chart-testing (list-changed)
-  #       id: list-changed
-  #       run: if [[ -n "$(ct list-changed --config .github/ct.yaml)" ]]; then echo 'changed=true' >> "$GITHUB_OUTPUT"; fi
+      - name: Create kind cluster
+        if: steps.list-changed.outputs.changed == 'true'
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          version: v0.33.0
+          config: .github/kind-config.yaml
+          node_image: ${{ matrix.k8s.image }}
+          cluster_name: flux-ai-bridge-ct
 
-  #     - name: Create kind cluster
-  #       uses: helm/kind-action@v1.14.0
-  #       if: steps.list-changed.outputs.changed == 'true'
-  #       with:
-  #         config: .github/kind-config.yaml
-  #         node_image: kindest/node:${{ matrix.k8s }}
-
-  #     - name: Run chart-testing (install)
-  #       run: ct install --config .github/ct.yaml
+      # Builds the bridge image from this commit, installs the Flux Operator,
+      # Flux (FluxInstance) and a podinfo Kustomization from this pull
+      # request's merge ref, then runs `ct install` with dummy GitHub App
+      # credentials. The bridge needs no GitHub access to become ready.
+      - name: Run chart-testing (install)
+        if: steps.list-changed.outputs.changed == 'true'
+        env:
+          CT_GIT_URL: ${{ github.server_url }}/${{ github.repository }}
+          CT_GIT_REF: ${{ github.ref }}
+        run: make ct-install CT_CLUSTER_NAME=flux-ai-bridge-ct

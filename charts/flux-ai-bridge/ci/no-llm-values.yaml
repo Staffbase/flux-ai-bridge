@@ -1,6 +1,8 @@
 # LLM_PROVIDER=none — the bridge posts a deterministic comment built from
 # kstatus output alone. No API key required. Verifies the chart renders
-# cleanly without anthropicApiKey / openaiApiKey set.
+# cleanly without anthropicApiKey / openaiApiKey set. The placeholder key only
+# renders: `make ct-install` (the helm-ci install job) replaces it with a
+# generated RSA key, as the bridge parses the key at startup.
 flux:
   notification:
     enabled: false

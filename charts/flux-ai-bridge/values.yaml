@@ -735,12 +735,12 @@ networkPolicy:
 # When enabled, creates a Flux Provider and Alert that point to the bridge webhook,
 # so the Notification Controller automatically forwards Kustomization events.
 #
-# Enabled by default — without it the bridge has no event source. For chart-test
-# and `helm lint` runs on clusters without Flux installed (the kind cluster in
-# helm-ci.yaml), override to `false` via the chart-testing values file at
-# charts/flux-ai-bridge/ci/no-flux-values.yaml. The `-values.yaml` suffix
-# is required — `ct install` globs `ci/*-values.yaml` and silently skips
-# anything else.
+# Enabled by default — without it the bridge has no event source. Set it to
+# `false` on clusters without Flux's notification-controller, or when you
+# manage the Provider and Alert yourself. The chart-testing values file
+# charts/flux-ai-bridge/ci/no-flux-values.yaml installs the chart that way
+# (the `-values.yaml` suffix is required — `ct install` globs
+# `ci/*-values.yaml` and silently skips anything else).
 flux:
   notification:
     enabled: true

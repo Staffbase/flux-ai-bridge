@@ -20,6 +20,26 @@ CLUSTER_NAME := flux-ai-bridge-e2e
 CONTEXT      := kind-$(CLUSTER_NAME)
 E2E_IMAGE    := flux-ai-bridge:e2e
 MANIFESTS    := $(REPO_ROOT)/e2e/manifests
+# Throwaway GitHub App key for clusters that never talk to GitHub (mock-mode
+# e2e, ct-install). The bridge parses the PEM at startup, so it must be a real
+# RSA key. Generated on first use; gitignored.
+MOCK_APP_KEY := $(REPO_ROOT)/e2e/fixtures/mock-app-key.pem
+
+# Flux Operator chart that `make flux-install` (e2e-up, ct-install) installs.
+# Pinned so a new release can't change CI on its own; keep it in step with the
+# flux-operator-mcp sub-chart version in charts/flux-ai-bridge/Chart.yaml.
+FLUX_OPERATOR_VERSION ?= 0.63.1
+
+# `make ct-install`: an existing kind cluster, the namespace ct installs every
+# release into, and the Git source of the podinfo Kustomization the chart's
+# Alert watches. CI sets the source to the pull request's merge ref.
+CT_CLUSTER_NAME ?= flux-ai-bridge-ct
+CT_CONTEXT      := kind-$(CT_CLUSTER_NAME)
+CT_NAMESPACE    ?= flux-ai-bridge
+CT_IMAGE_REPO   := flux-ai-bridge
+CT_IMAGE_TAG    := ct
+CT_GIT_URL      ?= https://github.com/Staffbase/flux-ai-bridge
+CT_GIT_REF      ?= refs/heads/main
 
 # Default model used when E2E_LLM=ollama. Two equivalent override knobs:
 #   - OLLAMA_MODEL=…  on the make invocation (this variable)
@@ -250,6 +270,116 @@ test-all: ## Full pre-PR check: vet, unit tests, golangci-lint, helm lint + a fu
 	@echo ""
 	@echo "==> test-all PASS (cluster left running — \`make e2e-down\` to clean up)"
 
+# `make flux-install` installs the Flux Operator, then Flux through the
+# FluxInstance in e2e/manifests/01-flux-instance.yaml, into the kind cluster
+# $(CLUSTER_NAME). Shared by e2e-up and ct-install.
+.PHONY: flux-install
+flux-install: ## Install the Flux Operator and Flux (FluxInstance) into the kind cluster CLUSTER_NAME
+	@echo "==> Installing flux-operator $(FLUX_OPERATOR_VERSION) into $(CONTEXT)"
+	helm upgrade --install flux-operator \
+	  oci://ghcr.io/controlplaneio-fluxcd/charts/flux-operator \
+	  --version $(FLUX_OPERATOR_VERSION) \
+	  --namespace flux-system \
+	  --create-namespace \
+	  --wait --timeout 3m \
+	  --kube-context $(CONTEXT)
+	kubectl --context $(CONTEXT) apply -f $(MANIFESTS)/01-flux-instance.yaml
+	@echo "==> Waiting for FluxInstance to be Ready"
+	kubectl --context $(CONTEXT) -n flux-system wait \
+	  fluxinstance/flux \
+	  --for=condition=Ready \
+	  --timeout=5m
+	@echo "==> Waiting for Flux controllers"
+	@for deploy in source-controller kustomize-controller helm-controller notification-controller; do \
+	  kubectl --context $(CONTEXT) -n flux-system wait \
+	    --for=condition=Available deployment/"$$deploy" \
+	    --timeout=5m; \
+	done
+
+# `make ct-install` runs `ct install` the way the helm-ci workflow does, against
+# an existing kind cluster (create one with
+# `kind create cluster --name $(CT_CLUSTER_NAME) --config .github/kind-config.yaml`):
+#   1. builds the bridge image from the working tree and loads it into the
+#      cluster (the chart then runs the code it ships with);
+#   2. installs Flux (flux-install) and a podinfo Kustomization in
+#      $(CT_NAMESPACE), so the chart's Alert has events to forward;
+#   3. creates the Secrets that ci/extra-env-values.yaml expects to exist, with
+#      dummy GitHub App credentials (the bridge starts without reaching GitHub);
+#   4. installs the chart once per ci/*-values.yaml into $(CT_NAMESPACE) and
+#      waits until every resource is ready. --set gives each install the local
+#      image and the dummy App key.
+# ct has no context flag, so it gets a kubeconfig holding only this cluster. It
+# also gets its own Helm repository list: ct adds the repos from .github/ct.yaml
+# and fails when one of those names already points elsewhere.
+.PHONY: ct-install
+ct-install: ## Install the chart with ct (once per ci/*-values.yaml) into the kind cluster CT_CLUSTER_NAME
+	@for cmd in kind kubectl helm docker ct openssl; do \
+	  command -v "$$cmd" >/dev/null 2>&1 || { echo "ERROR: $$cmd not found in PATH" >&2; exit 1; }; \
+	done
+	docker build -t $(CT_IMAGE_REPO):$(CT_IMAGE_TAG) $(REPO_ROOT)
+	kind load docker-image $(CT_IMAGE_REPO):$(CT_IMAGE_TAG) --name $(CT_CLUSTER_NAME)
+	@$(MAKE) --no-print-directory flux-install CLUSTER_NAME=$(CT_CLUSTER_NAME)
+	@if [ ! -f "$(MOCK_APP_KEY)" ]; then \
+	  echo "==> Generating throwaway GitHub App key ($(MOCK_APP_KEY))"; \
+	  mkdir -p "$(dir $(MOCK_APP_KEY))"; \
+	  openssl genrsa -out "$(MOCK_APP_KEY)" 2048 2>/dev/null; \
+	fi
+	@echo "==> Preparing namespace $(CT_NAMESPACE)"
+	kubectl --context $(CT_CONTEXT) create namespace $(CT_NAMESPACE) --dry-run=client -o yaml \
+	  | kubectl --context $(CT_CONTEXT) apply -f -
+	kubectl --context $(CT_CONTEXT) -n $(CT_NAMESPACE) create secret generic flux-ai-bridge \
+	  --from-literal=GITHUB_APP_ID=1 \
+	  --from-literal=GITHUB_APP_INSTALLATION_ID=1 \
+	  --from-file=GITHUB_APP_PRIVATE_KEY="$(MOCK_APP_KEY)" \
+	  --dry-run=client -o yaml \
+	  | kubectl --context $(CT_CONTEXT) apply -f -
+	kubectl --context $(CT_CONTEXT) -n $(CT_NAMESPACE) create secret generic flux-ai-bridge-llm \
+	  --from-literal=api-key=unused \
+	  --dry-run=client -o yaml \
+	  | kubectl --context $(CT_CONTEXT) apply -f -
+	@echo "==> Applying the podinfo Kustomization ($(CT_GIT_URL) $(CT_GIT_REF))"
+	@printf '%s\n' \
+	  'apiVersion: source.toolkit.fluxcd.io/v1' \
+	  'kind: GitRepository' \
+	  'metadata:' \
+	  '  name: flux-ai-bridge' \
+	  '  namespace: $(CT_NAMESPACE)' \
+	  'spec:' \
+	  '  interval: 10m' \
+	  '  url: $(CT_GIT_URL)' \
+	  '  ref:' \
+	  '    name: $(CT_GIT_REF)' \
+	  '---' \
+	  'apiVersion: kustomize.toolkit.fluxcd.io/v1' \
+	  'kind: Kustomization' \
+	  'metadata:' \
+	  '  name: podinfo' \
+	  '  namespace: $(CT_NAMESPACE)' \
+	  'spec:' \
+	  '  interval: 10m' \
+	  '  path: ./e2e/podinfo-kustomize' \
+	  '  prune: true' \
+	  '  sourceRef:' \
+	  '    kind: GitRepository' \
+	  '    name: flux-ai-bridge' \
+	  | kubectl --context $(CT_CONTEXT) apply -f -
+	kubectl --context $(CT_CONTEXT) -n $(CT_NAMESPACE) wait \
+	  kustomization/podinfo \
+	  --for=condition=Ready \
+	  --timeout=5m
+	@echo "==> Running ct install"
+	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/ct-install.XXXXXX"); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	kind get kubeconfig --name $(CT_CLUSTER_NAME) > "$$tmp/kubeconfig"; \
+	cd $(REPO_ROOT) && KUBECONFIG="$$tmp/kubeconfig" \
+	  HELM_REPOSITORY_CONFIG="$$tmp/repositories.yaml" \
+	  HELM_REPOSITORY_CACHE="$$tmp/repository" \
+	  ct install \
+	  --config .github/ct.yaml \
+	  --charts charts/flux-ai-bridge \
+	  --namespace $(CT_NAMESPACE) \
+	  --helm-extra-set-args "--set=image.repository=$(CT_IMAGE_REPO) --set=image.tag=$(CT_IMAGE_TAG) --set=image.pullPolicy=Never --set=credentials.githubApp.appId=1 --set=credentials.githubApp.installationId=1 --set-file=credentials.githubApp.privateKey=$(MOCK_APP_KEY)"
+
 # Renders e2e/manifests/03-flux-ai-bridge.yaml.tpl for the current mode
 # (E2E_REAL_GITHUB, E2E_LLM, E2E_DEDUPE_PERSISTENCE) and applies it. Shared
 # by e2e-up and e2e-update, so a new mode or template variable is added once.
@@ -466,27 +596,9 @@ e2e-up: ## Provision the kind e2e cluster and install the bridge + dependencies
 	  docker save $(OLLAMA_IMAGE) -o "$$tmp"; \
 	  kind load image-archive "$$tmp" --name $(CLUSTER_NAME); \
 	fi
-	@echo "==> Installing flux-operator"
-	helm upgrade --install flux-operator \
-	  oci://ghcr.io/controlplaneio-fluxcd/charts/flux-operator \
-	  --namespace flux-system \
-	  --create-namespace \
-	  --wait --timeout 3m \
-	  --kube-context $(CONTEXT)
+	@$(MAKE) --no-print-directory flux-install
 	@echo "==> Applying manifests"
 	kubectl --context $(CONTEXT) apply -f $(MANIFESTS)/00-git-server.yaml
-	kubectl --context $(CONTEXT) apply -f $(MANIFESTS)/01-flux-instance.yaml
-	@echo "==> Waiting for FluxInstance to be Ready"
-	kubectl --context $(CONTEXT) -n flux-system wait \
-	  fluxinstance/flux \
-	  --for=condition=Ready \
-	  --timeout=5m
-	@echo "==> Waiting for Flux controllers"
-	@for deploy in source-controller kustomize-controller helm-controller notification-controller; do \
-	  kubectl --context $(CONTEXT) -n flux-system wait \
-	    --for=condition=Available deployment/"$$deploy" \
-	    --timeout=5m; \
-	done
 	@# flux-operator-mcp is now a sub-chart of the bridge (enabled by default
 	@# in charts/flux-ai-bridge/values.yaml), so no separate helm install is
 	@# needed here. Keeping this comment as a tombstone — if e2e ever needs

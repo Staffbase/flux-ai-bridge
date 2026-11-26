@@ -1,5 +1,6 @@
 # The LLM API key comes from its own Secret via extraEnv; the rest from
-# existingSecret.
+# existingSecret. `make ct-install` (the helm-ci install job) creates both
+# Secrets before the install.
 existingSecret: flux-ai-bridge
 config:
   llm:
