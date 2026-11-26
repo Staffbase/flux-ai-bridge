@@ -3303,13 +3303,13 @@ func formatCondition(c readiness.Condition) string {
 // heading match; "## Next steps" alone is accepted so minor phrasing drift
 // doesn't trigger a pointless retry, and so is a deeper level (`###`); the
 // phrase must end at a word boundary (see sectionTitle). Only
-// real headings count: one quoted inside a fenced or indented code block
+// real headings count: one quoted inside a code block or an HTML block
 // gives the reviewer no section (same scan as stripFailureSections).
 func llmMissingFailureSections(reply string) bool {
-	var fences markdown.Tracker
+	kinds := markdown.LineKinds(reply)
 	rootCause, nextSteps := false, false
-	for _, line := range strings.Split(reply, "\n") {
-		if fences.Line(line) {
+	for i, line := range strings.Split(reply, "\n") {
+		if kinds[i] != markdown.Prose {
 			continue
 		}
 		if level, title, ok := atxHeading(line); ok && level >= 2 {
@@ -3322,16 +3322,16 @@ func llmMissingFailureSections(reply string) bool {
 
 // stripFailureSections removes the `## Root Cause` and `## Next steps to fix`
 // sections — each heading plus everything up to the next `#`/`##` heading —
-// from an LLM reply. Headings inside fenced or indented code blocks are
-// quoted text, not structure, and don't count: per CommonMark a heading has at
-// most three leading spaces, so a tab or four spaces makes it code.
+// from an LLM reply. Headings inside code blocks or HTML blocks are quoted
+// text, not structure, and don't count: per CommonMark a heading has at most
+// three leading spaces, so a tab or four spaces makes it code.
 func stripFailureSections(reply string) string {
+	kinds := markdown.LineKinds(reply)
 	lines := strings.Split(reply, "\n")
 	out := lines[:0]
-	var fences markdown.Tracker
 	dropping := false
-	for _, line := range lines {
-		if !fences.Line(line) {
+	for i, line := range lines {
+		if kinds[i] == markdown.Prose {
 			if level, title, ok := atxHeading(line); ok && level <= 2 {
 				dropping = level == 2 && (sectionTitle(title, "root cause") || sectionTitle(title, "next steps"))
 			}
@@ -3386,19 +3386,20 @@ const boxDrawingRunes = "─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠�
 // headings from Markdown. The skill now forbids decoration, but models drift,
 // so this strips it deterministically: lines consisting solely of
 // box-drawing runes are dropped, and lines wrapped in │…│ / ║…║ are unwrapped
-// to their content. Tables (ASCII `|`), prose, and FENCED CODE BLOCKS pass
-// through untouched — box-drawing inside ``` / ~~~ fences is quoted evidence
-// (log excerpts, tree output), not decoration. Runs BEFORE the
-// failure-section check so a boxed heading is judged by its unwrapped form.
+// to their content. Tables (ASCII `|`), prose, and CODE BLOCKS (fenced or
+// indented, and raw HTML blocks) pass through untouched — box-drawing inside
+// them is quoted evidence (log excerpts, tree output), not decoration. Runs
+// BEFORE the failure-section check so a boxed heading is judged by its
+// unwrapped form.
 func stripBoxDecoration(reply string) string {
 	if !strings.ContainsAny(reply, boxDrawingRunes) {
 		return reply
 	}
+	kinds := markdown.LineKinds(reply)
 	lines := strings.Split(reply, "\n")
 	out := lines[:0]
-	var fences markdown.Tracker
-	for _, line := range lines {
-		if fences.Line(line) {
+	for i, line := range lines {
+		if kinds[i] != markdown.Prose {
 			out = append(out, line)
 			continue
 		}
@@ -3742,18 +3743,19 @@ var mentionPattern = regexp.MustCompile(`(^|\W)@(\w)`)
 // The reply quotes untrusted text (pod logs, event messages, PR-authored
 // YAML), and a quoted `@user` or `@org/team` would otherwise notify them from
 // the bridge's comment. markdownSafe itself doesn't fit: its HTML escaping
-// would break the reply's Markdown (blockquotes, `<`/`>` in code). Fenced
+// would break the reply's Markdown (blockquotes, `<`/`>` in code). Code
 // blocks and code spans are left alone — GitHub doesn't link mentions there,
 // and an inserted character would corrupt a quoted value such as a cron
-// `@daily` the reader is meant to copy.
+// `@daily` the reader is meant to copy. HTML blocks are not code: GitHub
+// links mentions in their text.
 func neutralizeMentions(reply string) string {
 	if !strings.Contains(reply, "@") {
 		return reply
 	}
+	kinds := markdown.LineKinds(reply)
 	lines := strings.Split(reply, "\n")
-	var fences markdown.Tracker
 	for i, line := range lines {
-		if fences.Line(line) || !strings.Contains(line, "@") {
+		if kinds[i] == markdown.Code || !strings.Contains(line, "@") {
 			continue
 		}
 		lines[i] = mapOutsideCodeSpans(line, func(text string) string {

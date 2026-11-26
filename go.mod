@@ -13,6 +13,7 @@ require (
 	github.com/openai/openai-go/v3 v3.99.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/redis/go-redis/v9 v9.23.0
+	github.com/yuin/goldmark v1.8.7
 	golang.org/x/sync v0.25.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.37.2

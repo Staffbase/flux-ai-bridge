@@ -2852,6 +2852,17 @@ func TestStripFailureSections(t *testing.T) {
 			want: "## Kustomization Status\nok",
 		},
 		{name: "no sections", in: "## Kustomization Status\nok", want: "## Kustomization Status\nok"},
+		{
+			// Dropping it would also drop the comment's end and hide the rest.
+			name: "heading inside an HTML comment is content",
+			in:   "## Kustomization Status\nok\n<!--\n## Root Cause\n-->\nafter",
+			want: "## Kustomization Status\nok\n<!--\n## Root Cause\n-->\nafter",
+		},
+		{
+			name: "heading after a fence that follows a thematic break",
+			in:   "## Kustomization Status\n- - -\n  ~~~\nx\n  ~~~\n## Root Cause\nx",
+			want: "## Kustomization Status\n- - -\n  ~~~\nx\n  ~~~",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3387,6 +3398,12 @@ func TestStripBoxDecoration(t *testing.T) {
 		"boxed\n"
 	if got := stripBoxDecoration(fenced); got != wantFenced {
 		t.Fatalf("fenced content must be untouched:\n got %q\nwant %q", got, wantFenced)
+	}
+
+	// So is box-drawing in an indented code block.
+	indented := "tree:\n\n    ├── a\n    │ b │\n    ───\n\nafter"
+	if got := stripBoxDecoration(indented); got != indented {
+		t.Fatalf("indented code must be untouched:\n got %q\nwant %q", got, indented)
 	}
 }
 

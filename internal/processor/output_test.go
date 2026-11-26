@@ -85,6 +85,25 @@ func TestNeutralizeMentions(t *testing.T) {
 		"- item\n  ~~~\n  @heidi\n\nOutside: ping @ops": "- item\n  ~~~\n  @heidi\n\nOutside: ping @" + zw + "ops",
 		"- item\n  ~~~\n  @heidi\n- ping @ops":          "- item\n  ~~~\n  @heidi\n- ping @" + zw + "ops",
 		"no mentions here":                              "no mentions here",
+		// Indented code is code too.
+		"para\n\n    @daily\n\n@ops": "para\n\n    @daily\n\n@" + zw + "ops",
+		// GitHub links mentions in the text of an HTML block.
+		"<details>\n<summary>ping @ops</summary>\n</details>": "<details>\n<summary>ping @" + zw + "ops</summary>\n</details>",
+		// CommonMark cases a line-based fence tracker got wrong: each left
+		// the final prose inside a phantom fence, with its mention live.
+		// A tab-indented content line of a list item's fence.
+		"- ~~~\n\t@daily\n  ~~~\nOutside: ping @ops": "- ~~~\n\t@daily\n  ~~~\nOutside: ping @" + zw + "ops",
+		// A fence in a nested list item.
+		"100. outer\n     - ~~~\n       @daily\n       ~~~\n     ping @ops": "100. outer\n     - ~~~\n       @daily\n       ~~~\n     ping @" + zw + "ops",
+		// A fence in the outer item after a nested one.
+		"- outer\n  - inner\n    text\n  ~~~\n  @daily\n\nprose @ops": "- outer\n  - inner\n    text\n  ~~~\n  @daily\n\nprose @" + zw + "ops",
+		// A fence in a third-level item.
+		"- a\n  - b\n    - ~~~\n      @daily\n      ~~~\n    prose @ops": "- a\n  - b\n    - ~~~\n      @daily\n      ~~~\n    prose @" + zw + "ops",
+		// A fence inside an HTML comment opens no block.
+		"<!--\n```\n-->\nPing @ops": "<!--\n```\n-->\nPing @" + zw + "ops",
+		// `- - -` is a thematic break, not a list item.
+		"- - -\n  ~~~\n@daily\n  ~~~\nprose @ops": "- - -\n  ~~~\n@daily\n  ~~~\nprose @" + zw + "ops",
+		"* * *\n  ~~~\n@daily\n  ~~~\nprose @ops": "* * *\n  ~~~\n@daily\n  ~~~\nprose @" + zw + "ops",
 	} {
 		if got := neutralizeMentions(in); got != want {
 			t.Errorf("neutralizeMentions(%q) = %q, want %q", in, got, want)
@@ -92,7 +111,7 @@ func TestNeutralizeMentions(t *testing.T) {
 	}
 }
 
-// Fence boundaries come from the shared tracker: a mention inside a
+// Fence boundaries come from the markdown package: a mention inside a
 // four-backtick or tilde block — including a ``` line quoted inside it — stays
 // untouched, and prose after the block is neutralized again.
 func TestNeutralizeMentions_FenceKinds(t *testing.T) {

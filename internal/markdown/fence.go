@@ -12,157 +12,222 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package markdown tracks fenced code blocks in Markdown text, for the places
-// that edit LLM output and comment bodies line by line and must not change
-// quoted code, or must close a block that was cut off.
+// Package markdown finds the code in Markdown text, for the places that edit
+// LLM output and comment bodies line by line and must not change quoted code,
+// or must close a code block that a length cut left open. It reads the text
+// with a CommonMark parser (goldmark), so list items, tab stops, block quotes,
+// thematic breaks and HTML blocks are taken as GitHub renders them.
 package markdown
 
-import "strings"
+import (
+	"slices"
+	"sort"
+	"strings"
 
-// Fence is the delimiter of a fenced code block: its character (` or ~) and
-// how many of them open it.
-type Fence struct {
-	Char byte
-	Len  int
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
+)
+
+// Kind is what a line of Markdown text belongs to.
+type Kind uint8
+
+const (
+	// Prose is any line outside code and HTML blocks: paragraphs, headings,
+	// list items, tables. Code spans inside it are left to the caller.
+	Prose Kind = iota
+	// Code is a line of a fenced code block, its delimiter lines included,
+	// or of an indented code block. GitHub links no mentions there, and
+	// readers copy from it.
+	Code
+	// HTML is a line of a raw HTML block, e.g. a comment or a <details>
+	// block. A fence inside it opens no code block. GitHub renders the text
+	// in it (and links mentions there), so it is neither prose nor code.
+	HTML
+)
+
+// codeBlock is a code or HTML block. first and last are line indexes into
+// strings.Split(s, "\n"), inclusive.
+type codeBlock struct {
+	first, last int
+	html        bool
+	fence       string // the opening delimiter run of a fenced block, else ""
+	col         int    // byte offset of the fence in its opening line
+	closed      bool   // a fenced block's last line is its closing delimiter
 }
 
-// String returns the delimiter, e.g. "```" or "~~~~".
-func (f Fence) String() string {
-	return strings.Repeat(string(f.Char), f.Len)
-}
-
-// Tracker follows fenced code blocks line by line, per CommonMark: a block
-// opens with at least three backticks or tildes (indented at most three
-// spaces) and closes with a run of the same character at least as long and
-// nothing after it. A backtick or tilde line that doesn't close the open
-// block is part of its content. A fence may also open inside a list item,
-// right after its marker (`- ~~~`) or on a continuation line indented to the
-// item's content; its closer is then indented to the item's content, and the
-// block also ends with the item: at the first non-blank line indented less
-// than the item's content (an outdented paragraph or a sibling item). Only
-// the innermost item is tracked; once a line leaves it, later fences count
-// as top-level ones.
-type Tracker struct {
-	open   Fence
-	inside bool
-	indent int // content indent of the list item that opened the block
-	item   int // content indent of the list item outside a block, or 0
-}
-
-// Line feeds the next line and reports whether it belongs to a fenced block,
-// counting the opening and closing delimiter lines as part of it.
-func (t *Tracker) Line(line string) bool {
-	lead := len(line) - len(strings.TrimLeft(line, " "))
-	if t.inside && t.indent > 0 && !blank(line) && lead < t.indent {
-		t.inside = false // the list item, and with it the block, ended
-	}
-	if t.inside {
-		f, rest, ok := delimiter(dedent(line, t.indent))
-		if ok && f.Char == t.open.Char && f.Len >= t.open.Len && blank(rest) {
-			t.inside = false
+// LineKinds reports the Kind of each line of strings.Split(s, "\n").
+func LineKinds(s string) []Kind {
+	lines, blocks := codeBlocks(s)
+	kinds := make([]Kind, len(lines))
+	for _, b := range blocks {
+		k := Code
+		if b.html {
+			k = HTML
 		}
-		return true
-	}
-	w, body := listMarkerWidth(line), line
-	switch {
-	case w > 0:
-		t.item, body = w, line[w:] // a new item; the fence may follow its marker
-	case t.item > 0 && lead >= t.item:
-		w, body = t.item, dedent(line, t.item) // a continuation line of the item
-	case !blank(line):
-		t.item = 0 // the line left the item
-	}
-	f, rest, ok := delimiter(body)
-	if ok && (f.Char != '`' || !strings.Contains(rest, "`")) {
-		t.open, t.inside, t.indent = f, true, w
-		return true
-	}
-	return false
-}
-
-// blank reports whether line holds only spaces and tabs (and the \r of a
-// CRLF line ending): CommonMark's blank line, and all it allows after a
-// closing fence. Other Unicode spaces, such as U+00A0, are content.
-func blank(line string) bool {
-	return strings.Trim(strings.TrimSuffix(line, "\r"), " \t") == ""
-}
-
-// listMarkerWidth returns the width of a list item marker that starts line
-// (up to three spaces, then -, * or +, or 1-9 digits and . or ), then one to
-// four spaces), or 0 when the line doesn't start a list item.
-func listMarkerWidth(line string) int {
-	i := len(line) - len(strings.TrimLeft(line, " "))
-	if i > 3 || i == len(line) {
-		return 0
-	}
-	switch c := line[i]; {
-	case c == '-' || c == '*' || c == '+':
-		i++
-	case c >= '0' && c <= '9':
-		d := i
-		for i < len(line) && i-d < 9 && line[i] >= '0' && line[i] <= '9' {
-			i++
+		for i := b.first; i <= b.last; i++ {
+			kinds[i] = k
 		}
-		if i == len(line) || (line[i] != '.' && line[i] != ')') {
-			return 0
-		}
-		i++
-	default:
-		return 0
 	}
-	spaces := len(line[i:]) - len(strings.TrimLeft(line[i:], " "))
-	if spaces < 1 || spaces > 4 {
-		return 0
-	}
-	return i + spaces
+	return kinds
 }
 
-// dedent removes up to n leading spaces from line.
-func dedent(line string, n int) string {
-	for n > 0 && len(line) > 0 && line[0] == ' ' {
-		line, n = line[1:], n-1
-	}
-	return line
-}
-
-// Open returns the delimiter of the block still open after the last line.
-func (t *Tracker) Open() (Fence, bool) {
-	return t.open, t.inside
-}
-
-// CloseOpenFence appends a closing delimiter matching the fenced block s
-// leaves open, if any — e.g. for text cut off at a length limit, where the
-// open block would otherwise swallow everything appended after it. A block
-// inside a list item is closed at the item's content indent, so the closer
-// stays inside the item.
+// CloseOpenFence appends a closing delimiter when s ends inside a fenced code
+// block that has none — e.g. for text cut off at a length limit, where the
+// open block would otherwise swallow everything appended after it. The closer
+// repeats the opening run and is indented to the content column of the
+// block's container (list item, block quote), so it stays inside it. A block
+// its container already ended needs no closer.
 func CloseOpenFence(s string) string {
-	var t Tracker
-	for _, line := range strings.Split(s, "\n") {
-		t.Line(line)
+	lines, blocks := codeBlocks(s)
+	i := slices.IndexFunc(blocks, func(b codeBlock) bool {
+		return b.fence != "" && !b.closed && blankFrom(lines, b.last+1)
+	})
+	if i < 0 {
+		return s
 	}
-	if f, open := t.Open(); open {
-		return s + "\n" + strings.Repeat(" ", t.indent) + f.String()
+	open := blocks[i]
+	sep := "\n" // a trailing newline already ends the last line
+	if strings.HasSuffix(s, "\n") {
+		sep = ""
+	}
+	prefix, keep := containerPrefix(lines[open.first][:open.col])
+	// The opener may sit up to three spaces beyond its container's content
+	// column, and a block quote's optional space can shift that column on
+	// the next line. Try the closer from that column on, three columns to
+	// either side of the opener's, and let the parser confirm that it closes
+	// this block and that a line after it is outside of code. If none does,
+	// the container already ended the block (a blank line ends a block quote).
+	trailing := len(prefix) - len(strings.TrimRight(prefix, " "))
+	for shift := -min(3, trailing, len(prefix)-keep); shift <= 3; shift++ {
+		lead := prefix[:len(prefix)+min(shift, 0)] + strings.Repeat(" ", max(shift, 0))
+		if closed := s + sep + lead + open.fence; closes(closed, open.first) {
+			return closed
+		}
 	}
 	return s
 }
 
-// delimiter reports whether line starts with a fence run: up to three spaces,
-// then at least three backticks or tildes. rest is what follows the run.
-func delimiter(line string) (f Fence, rest string, ok bool) {
-	indent := len(line) - len(strings.TrimLeft(line, " "))
-	if indent > 3 || indent == len(line) {
-		return Fence{}, "", false
+// closes reports whether the last line of s closes the fenced block that
+// opens on line first, so that a line appended after it is outside of code.
+func closes(s string, first int) bool {
+	lines, blocks := codeBlocks(s + "\nx")
+	at := len(lines) - 2
+	for _, b := range blocks {
+		if b.last > at || b.first == first && b.fence != "" && (!b.closed || b.last != at) {
+			return false
+		}
 	}
-	c := line[indent]
-	if c != '`' && c != '~' {
-		return Fence{}, "", false
+	return true
+}
+
+// blankFrom reports whether lines[from:] hold only spaces and tabs.
+func blankFrom(lines []string, from int) bool {
+	for _, l := range lines[min(from, len(lines)):] {
+		if strings.Trim(l, " \t\r") != "" {
+			return false
+		}
 	}
-	n := indent
-	for n < len(line) && line[n] == c {
-		n++
+	return true
+}
+
+// containerPrefix turns the part of an opening fence line before the fence
+// into the prefix of a line in the same container: block quote markers stay,
+// list markers become spaces, tabs are expanded to their four-column stops.
+// keep is the length of the block quote markers (and the space after the
+// last one) that must not be trimmed.
+func containerPrefix(lead string) (prefix string, keep int) {
+	var b strings.Builder
+	for _, c := range lead {
+		switch c {
+		case '>':
+			b.WriteByte('>')
+		case '\t':
+			b.WriteString(strings.Repeat(" ", 4-b.Len()%4))
+		default:
+			b.WriteByte(' ')
+		}
 	}
-	if n-indent < 3 {
-		return Fence{}, "", false
+	prefix = b.String()
+	if i := strings.LastIndexByte(prefix, '>'); i >= 0 {
+		keep = i + 1
+		if keep < len(prefix) {
+			keep++ // the space after the marker
+		}
 	}
-	return Fence{Char: c, Len: n - indent}, line[n:], true
+	return prefix, keep
+}
+
+// codeBlocks parses s and returns its lines and its code-like blocks.
+func codeBlocks(s string) ([]string, []codeBlock) {
+	lines := strings.Split(s, "\n")
+	starts := make([]int, len(lines)) // byte offset of each line
+	for i := 1; i < len(lines); i++ {
+		starts[i] = starts[i-1] + len(lines[i-1]) + 1
+	}
+	lineOf := func(off int) int {
+		return sort.Search(len(starts), func(i int) bool { return starts[i] > off }) - 1
+	}
+	// A segment's start can lie past a tab the parser expanded, its end
+	// can't: the line of a segment is the line of its last byte.
+	segLine := func(seg text.Segment) int {
+		if seg.Stop == seg.Start {
+			return lineOf(seg.Start)
+		}
+		return lineOf(seg.Stop - 1)
+	}
+	segLines := func(segs *text.Segments) (first, last int) {
+		return segLine(segs.At(0)), segLine(segs.At(segs.Len() - 1))
+	}
+
+	var blocks []codeBlock
+	doc := goldmark.DefaultParser().Parse(text.NewReader([]byte(s)))
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		var b codeBlock
+		switch n := n.(type) {
+		case *ast.FencedCodeBlock:
+			// The parser keeps the content lines, not the delimiter lines.
+			// The opener is the line of the node's position (which a tab
+			// can shift by up to three bytes, never past the fence's end).
+			b.first = lineOf(n.Pos())
+			b.col = strings.IndexAny(lines[b.first], "`~")
+			opener := lines[b.first][b.col:]
+			b.fence = opener[:len(opener)-len(strings.TrimLeft(opener, opener[:1]))]
+			b.last = b.first
+			if n.Lines().Len() > 0 {
+				_, b.last = segLines(n.Lines())
+			}
+			// The closer is the line after the content, if it is one.
+			if next := b.last + 1; next < len(lines) {
+				rest, ok := strings.CutPrefix(strings.TrimLeft(lines[next], " \t>"), b.fence)
+				if ok && strings.Trim(strings.TrimLeft(rest, b.fence[:1]), " \t\r") == "" {
+					b.last, b.closed = next, true
+				}
+			}
+		case *ast.CodeBlock:
+			b.first, b.last = segLines(n.Lines())
+		case *ast.HTMLBlock:
+			b.html = true
+			b.first, b.last = segLines(n.Lines())
+			if n.HasClosure() {
+				b.last = segLine(n.ClosureLine)
+			}
+		default:
+			return ast.WalkContinue, nil
+		}
+		blocks = append(blocks, b)
+		return ast.WalkSkipChildren, nil
+	})
+	// A delimiter-like line that starts a block of its own didn't close the
+	// fence before it: the fence's container (a list item) ended first.
+	for i := range blocks {
+		b := &blocks[i]
+		if b.closed && slices.ContainsFunc(blocks, func(o codeBlock) bool { return o.first == b.last }) {
+			b.last, b.closed = b.last-1, false
+		}
+	}
+	return lines, blocks
 }
