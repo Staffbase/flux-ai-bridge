@@ -415,12 +415,32 @@ func TestMarkdownTableCell(t *testing.T) {
 		"with|pipe":      "with\\|pipe",
 		"line1\nline2":   "line1 line2",
 		"line1\r\nline2": "line1 line2",
+		"line1\rline2":   "line1 line2",
 		"  spaced  ":     "spaced",
 		"two|pipes|here": "two\\|pipes\\|here",
 	}
 	for in, want := range cases {
 		if got := markdownTableCell(in); got != want {
 			t.Errorf("markdownTableCell(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Only real headings satisfy the failure-section contract: the same headings
+// quoted inside a code block give the reviewer no section, so the corrective
+// retry must still run.
+func TestLLMMissingFailureSections(t *testing.T) {
+	for reply, want := range map[string]bool{
+		"## Root Cause\nx\n## Next steps to fix\n1. y":                        false,
+		"## root cause\nx\n### Next steps\n1. y":                              false,
+		"## Kustomization Status\nok":                                         true,
+		"## Root Cause\nx":                                                    true,
+		"```\n## Root Cause\n## Next steps to fix\n```":                       true,
+		"## Kustomization Status\n~~~md\n## Root Cause\n~~~\n## Next steps\n": true,
+		"    ## Root Cause\n    ## Next steps to fix":                         true,
+	} {
+		if got := llmMissingFailureSections(reply); got != want {
+			t.Errorf("llmMissingFailureSections(%q) = %v, want %v", reply, got, want)
 		}
 	}
 }
@@ -724,6 +744,48 @@ func TestBuildKstatusBody_FailingPodFlipsToRed(t *testing.T) {
 	}
 }
 
+// A Running pod whose containers are all ready but whose own Ready condition
+// is False (a readiness gate that hasn't passed) isn't Current yet: it would
+// otherwise settle the wait and count toward flux-success.
+func TestPodKstatus_ReadinessGatePending(t *testing.T) {
+	pods, err := parsePodListAll([]byte(`items:
+- metadata:
+    name: web-0
+    namespace: apps
+  status:
+    phase: Running
+    conditions:
+    - type: ContainersReady
+      status: "True"
+    - type: Ready
+      status: "False"
+      reason: ReadinessGatesNotReady
+    containerStatuses:
+    - name: app
+      ready: true
+- metadata:
+    name: web-1
+    namespace: apps
+  status:
+    phase: Running
+    conditions:
+    - type: Ready
+      status: "True"
+    containerStatuses:
+    - name: app
+      ready: true
+`))
+	if err != nil || len(pods) != 2 {
+		t.Fatalf("parsePodListAll = %d pods, %v", len(pods), err)
+	}
+	if got := podKstatus(pods[0], time.Now()); got.Status != "InProgress" {
+		t.Errorf("gated pod: Status = %q, want InProgress (msg=%q)", got.Status, got.Message)
+	}
+	if got := podKstatus(pods[1], time.Now()); got.Status != "Current" {
+		t.Errorf("ready pod: Status = %q, want Current (msg=%q)", got.Status, got.Message)
+	}
+}
+
 // TestPodKstatus_NonFailingClassification exercises the non-failing branches
 // (Running+Ready, Running+NotReady, Pending, Succeeded, Unknown). The failing
 // branch is already covered by isFailingPod's own tests.
@@ -884,6 +946,9 @@ func TestExpandHelmReleaseInventories_DisabledByFlag(t *testing.T) {
 	if len(got) != 1 || got[0] != base[0] {
 		t.Errorf("flag-disabled expansion must return base unchanged, got %v", got)
 	}
+	if mcpMock.resourceCalls != 0 {
+		t.Errorf("flag-disabled expansion made %d MCP reads, want 0", mcpMock.resourceCalls)
+	}
 }
 
 // TestExpandHelmReleaseInventories_NoHelmReleaseInBase asserts that a
@@ -900,6 +965,9 @@ func TestExpandHelmReleaseInventories_NoHelmReleaseInBase(t *testing.T) {
 	got, _ := proc.expandHelmReleaseInventories(context.Background(), base)
 	if len(got) != len(base) {
 		t.Errorf("expected base unchanged, got %v", got)
+	}
+	if mcpMock.resourceCalls != 0 {
+		t.Errorf("HelmRelease-free inventory made %d MCP reads, want 0", mcpMock.resourceCalls)
 	}
 }
 
@@ -1593,6 +1661,9 @@ func TestResolvePodController_StatefulSetDirect(t *testing.T) {
 	if got != "StatefulSet/postgres" {
 		t.Errorf("Controller = %q, want StatefulSet/postgres", got)
 	}
+	if mcpMock.resourceCalls != 0 {
+		t.Errorf("StatefulSet-owned pod made %d MCP reads, want 0", mcpMock.resourceCalls)
+	}
 }
 
 // TestResolvePodController_NakedPod: pod with no ownerReferences (e.g.
@@ -1680,9 +1751,34 @@ func TestResolvePodController_ReplicaSetCacheReusesPriorLookup(t *testing.T) {
 			t.Errorf("pod %d Controller = %q, want Deployment/podinfo", i, got)
 		}
 	}
-	// One entry in the cache for the shared RS — proves dedup.
+	// One entry in the cache for the shared RS, fetched once — proves dedup.
 	if len(cache) != 1 {
 		t.Errorf("expected cache to dedupe to a single entry, got %d: %v", len(cache), cache)
+	}
+	if mcpMock.resourceCalls != 1 {
+		t.Errorf("three pods of one ReplicaSet made %d MCP reads, want 1", mcpMock.resourceCalls)
+	}
+}
+
+// A failed ReplicaSet read isn't cached: the next scan retries it, so one
+// transient MCP error doesn't hide the Deployment for the whole settle wait.
+func TestResolvePodController_ReplicaSetFetchFailureNotCached(t *testing.T) {
+	const key = "apps/v1|ReplicaSet|podinfo-7d4f9b6c8|podinfo"
+	mcpMock := &fakeMCPClient{
+		resources:    map[string][]byte{key: []byte(replicaSetWithDeploymentOwnerYAML)},
+		resourceErrs: map[string]int{key: 1},
+	}
+	proc := New(&config.Config{}, mcpMock, nil, nil, nil, nil, nil, slog.Default())
+	pod := podInfo{Metadata: podMetadata{
+		Name: "podinfo-7d4f9b6c8-abc", Namespace: "podinfo",
+		OwnerReferences: []ownerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "podinfo-7d4f9b6c8", Controller: true}},
+	}}
+	cache := map[string]string{}
+	if got := proc.resolvePodController(context.Background(), pod, cache); got != "ReplicaSet/podinfo-7d4f9b6c8" {
+		t.Fatalf("first scan Controller = %q, want the ReplicaSet fallback", got)
+	}
+	if got := proc.resolvePodController(context.Background(), pod, cache); got != "Deployment/podinfo" {
+		t.Errorf("second scan Controller = %q, want Deployment/podinfo after the read recovered", got)
 	}
 }
 

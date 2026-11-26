@@ -140,6 +140,58 @@ func TestProcess_DefersWhenRevisionNotApplied(t *testing.T) {
 	}
 }
 
+// A new Kustomization's first reconcile: nothing applied yet (blank
+// lastAppliedRevision) while Ready is Unknown/Progressing. Its snapshot shows
+// none of the analysed revision, so the event defers instead of reading green.
+// With Ready=True a blank value still falls through.
+func TestProcess_DefersFirstApplyInProgress(t *testing.T) {
+	const firstApply = `
+spec:
+  sourceRef:
+    name: flux-system
+    kind: GitRepository
+status:
+  conditions:
+    - type: Ready
+      status: "Unknown"
+      reason: Progressing
+      message: Reconciliation in progress
+  inventory:
+    entries:
+      - id: "ns_app__ConfigMap"
+`
+	for name, tc := range map[string]struct {
+		data      string
+		wantDefer bool
+	}{
+		"first apply in progress": {data: firstApply, wantDefer: true},
+		"blank but Ready":         {data: strings.Replace(firstApply, `status: "Unknown"`, `status: "True"`, 1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cm := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n  namespace: ns\n")
+			mcpMock := &fakeMCPClient{data: []byte(tc.data), resources: map[string][]byte{"v1|ConfigMap|app|ns": cm}}
+			commenterMock := &fakeCommenter{
+				prNumber: 5,
+				prFiles:  []bridgegithub.PRFile{{Path: "app.yaml", BlobSHA: "cm", Status: "modified"}},
+				blobs:    map[string][]byte{"cm": cm},
+			}
+			cfg := &config.Config{GitHubRepo: "owner/repo", LLMProvider: "none", PRLabelEnabled: true,
+				ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+			proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+			event := eventv1.Event{
+				InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "app-ks", Namespace: "flux-system"},
+				Severity:       eventv1.EventSeverityInfo, Reason: "Progressing",
+			}
+			if err := proc.Process(context.Background(), event, "1111111111111111111111111111111111111111"); err != nil {
+				t.Fatalf("Process() error: %v", err)
+			}
+			if deferred := commenterMock.owner == ""; deferred != tc.wantDefer {
+				t.Errorf("deferred = %v, want %v (labels %+v)", deferred, tc.wantDefer, commenterMock.labelCalls)
+			}
+		})
+	}
+}
+
 const appliedKustomization = `
 spec:
   sourceRef:
@@ -302,5 +354,48 @@ func TestReconcileFailureMessage_IgnoresOtherRevisionsAttempt(t *testing.T) {
 		if (failed != "") != wantFailed {
 			t.Errorf("lastAttemptedRevision=%q: failed=%q, want failed=%v", attempted, failed, wantFailed)
 		}
+	}
+}
+
+// The live reads take up to the whole readiness budget. When the Kustomization
+// applies a newer revision meanwhile, the green snapshot may be that revision's
+// state: the analysed revision's PRs must not be certified with it. The
+// verdict is deferred to the newer revision's own event.
+func TestProcess_DefersGreenWhenRevisionMovedOnDuringAnalysis(t *testing.T) {
+	const appliedR1 = "dev@sha1:1111111111111111111111111111111111111111"
+	atR1 := strings.Replace(notYetAppliedKustomization, "dev@sha1:0000000000000000000000000000000000000000", appliedR1, 1)
+	atR2 := notYetAppliedKustomization // applied a different revision since
+	for name, tc := range map[string]struct {
+		next     string
+		wantPost bool
+	}{
+		"moved on": {next: atR2},
+		"stayed":   {next: atR1, wantPost: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cm := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n  namespace: ns\n")
+			mcpMock := &fakeMCPClient{
+				dataQueue: [][]byte{[]byte(atR1), []byte(tc.next)},
+				resources: map[string][]byte{"v1|ConfigMap|app|ns": cm},
+			}
+			commenterMock := &fakeCommenter{
+				prNumber: 5,
+				prFiles:  []bridgegithub.PRFile{{Path: "app.yaml", BlobSHA: "cm", Status: "modified"}},
+				blobs:    map[string][]byte{"cm": cm},
+			}
+			cfg := &config.Config{GitHubRepo: "owner/repo", LLMProvider: "none", PRLabelEnabled: true, CommentOnSuccess: true,
+				ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+			proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+			event := eventv1.Event{
+				InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "app-ks", Namespace: "flux-system"},
+				Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
+			}
+			if err := proc.Process(context.Background(), event, "1111111111111111111111111111111111111111"); err != nil {
+				t.Fatalf("Process() error: %v", err)
+			}
+			if posted := commenterMock.prCommentBody != "" || len(commenterMock.labelCalls) > 0; posted != tc.wantPost {
+				t.Errorf("delivered = %v, want %v (body %q, labels %+v)", posted, tc.wantPost, commenterMock.prCommentBody, commenterMock.labelCalls)
+			}
+		})
 	}
 }

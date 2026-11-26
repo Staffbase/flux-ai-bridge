@@ -550,8 +550,10 @@ func TestBuildSelfRemovalBody_ResourceWording(t *testing.T) {
 	if body := buildSelfRemovalBody("legacy-crds", "flux-system/cluster-base", "path not found", "", false); !strings.Contains(body, "stay on the cluster") {
 		t.Errorf("orphaning body doesn't say the resources stay:\n%s", body)
 	}
-	if body := buildSelfRemovalBody("legacy-crds", "flux-system/cluster-base", "path not found", "", true); !strings.Contains(body, "also deletes the resources it manages") {
-		t.Errorf("deleting body doesn't say the resources go:\n%s", body)
+	// Flux skips objects excluded from pruning (the prune or reconcile key set
+	// to disabled) even then, so the body mustn't promise every one goes.
+	if body := buildSelfRemovalBody("legacy-crds", "flux-system/cluster-base", "path not found", "", true); !strings.Contains(body, "also prunes the resources it manages, except those excluded from pruning") {
+		t.Errorf("deleting body doesn't describe the pruning policy:\n%s", body)
 	}
 }
 
@@ -608,21 +610,72 @@ func TestResourceIDsFromYAML_NamedListKindKeepsID(t *testing.T) {
 
 // The parent must still be able to prune when it drops the child: a snapshot
 // that turned Ready=False (a failed prune), stopped pruning or got suspended
-// while the check waited doesn't count.
+// while the check waited doesn't count, nor does one that switched to another
+// build than the PR was judged against. The child is terminating in every
+// case, so only the parent gate decides; a Ready, pruning parent is the
+// positive control.
 func TestParentDroppedChild_RechecksParentGates(t *testing.T) {
 	pruneFailed := strings.Replace(strings.Replace(selfRemovalParent, `status: "True"`, `status: "False"`, 1),
 		"reason: ReconciliationSucceeded", "reason: PruneFailed", 1)
-	for name, snapshot := range map[string]string{
-		"prune failed":     pruneFailed,
-		"prune disabled":   strings.Replace(selfRemovalParent, "prune: true", "prune: false", 1),
-		"parent suspended": strings.Replace(selfRemovalParent, "prune: true", "prune: true\n  suspend: true", 1),
+	var attributed kustomizationSpec
+	if err := yaml.Unmarshal([]byte(selfRemovalParent), &attributed); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		snapshot string
+		want     bool
+	}{
+		"ready, pruning parent": {snapshot: selfRemovalParent, want: true},
+		"prune failed":          {snapshot: pruneFailed},
+		"prune disabled":        {snapshot: strings.Replace(selfRemovalParent, "prune: true", "prune: false", 1)},
+		"parent suspended":      {snapshot: strings.Replace(selfRemovalParent, "prune: true", "prune: true\n  suspend: true", 1)},
+		"path switched":         {snapshot: strings.Replace(selfRemovalParent, "path: ./clusters/base", "path: ./clusters/other", 1)},
+		"source switched":       {snapshot: strings.Replace(selfRemovalParent, "name: cluster-base\nstatus", "name: elsewhere\nstatus", 1)},
 	} {
-		mcp := &fakeMCPClient{kustomizationsByName: map[string][]byte{"flux-system/cluster-base": []byte(snapshot)}}
+		mcp := &fakeMCPClient{data: []byte(selfRemovalChild), kustomizationsByName: map[string][]byte{"flux-system/cluster-base": []byte(tc.snapshot)}}
 		proc := New(&config.Config{ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 5 * time.Millisecond},
 			mcp, readiness.NewChecker(mcp), nil, &fakeCommenter{}, nil, nil, slog.Default())
-		if proc.parentDroppedChild(context.Background(), "cluster-base", "flux-system", "legacy-crds", "flux-system", "child-uid") {
-			t.Errorf("%s: a snapshot without the child was accepted", name)
+		if got := proc.parentDroppedChild(context.Background(), attributed, "cluster-base", "flux-system", "legacy-crds", "flux-system", "child-uid"); got != tc.want {
+			t.Errorf("%s: parentDroppedChild = %v, want %v", name, got, tc.want)
 		}
+	}
+}
+
+// A parent that switches its build between the PR file scan and the
+// inventory poll renders another build: its dropping the child doesn't prove
+// this PR removed it, so the normal report stays.
+func TestProcess_SelfRemoval_ParentSwitchedBuildDuringCheck(t *testing.T) {
+	parentListing := selfRemovalParent + selfRemovalChildEntry // still lists the child
+	switched := strings.Replace(selfRemovalParent, "path: ./clusters/base", "path: ./clusters/other", 1)
+	commenter := &fakeCommenter{
+		prNumber:  42,
+		prBaseSHA: "base-sha",
+		prFiles:   []bridgegithub.PRFile{selfRemovalCRDFile, {Path: "clusters/base/legacy-crds-ks.yaml", BlobSHA: "ks-blob", Status: "removed"}},
+		blobs:     map[string][]byte{"crd-blob": []byte(selfRemovalCRD), "ks-blob": []byte(selfRemovalCR)},
+	}
+	mcp := &fakeMCPClient{
+		data: []byte(selfRemovalChild),
+		kustomizationsByNameQueue: map[string][][]byte{
+			"flux-system/cluster-base": {[]byte(parentListing), []byte(parentListing), []byte(switched)},
+		},
+		resources: selfRemovalSources,
+	}
+	cfg := &config.Config{
+		LLMProvider: "none", PRLabelEnabled: true, CommentOnSuccess: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 50 * time.Millisecond,
+	}
+	proc := New(cfg, mcp, readiness.NewChecker(mcp), nil, commenter, nil, nil, slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "legacy-crds", Namespace: "flux-system"},
+		Severity:       eventv1.EventSeverityError,
+		Reason:         "ArtifactFailed",
+		Message:        "kustomization path not found: stat /tmp/kustomization-1/apps/legacy/crds: no such file or directory",
+	}
+	if err := proc.Process(context.Background(), event, "sha-teardown"); err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+	if strings.Contains(commenter.prCommentBody, "is being removed by this PR") {
+		t.Errorf("a parent that switched builds mid-check confirmed the removal:\n%s", commenter.prCommentBody)
 	}
 }
 
@@ -645,32 +698,49 @@ func TestTeardownFailure(t *testing.T) {
 	}
 }
 
-// A child that's already gone (MCP "No resources found") counts as deleted; a
-// live one without a deletionTimestamp doesn't, and neither does a read error.
+// A child that's already gone counts as deleted: a 404, or MCP's ambiguous
+// "No resources found" backed by a served Kustomization list without it. A
+// live one without a deletionTimestamp doesn't, nor does a read error, a
+// replacement under the same name, or an Event list that can't be read.
 func TestChildDeleting(t *testing.T) {
 	finalizerEvent := []byte("items:\n  - involvedObject:\n      kind: Kustomization\n      name: legacy-crds\n    type: Warning\n    reason: ArtifactFailed\n    message: pruning for deleted resource failed\n")
+	notFound := errors.New(`kustomizations.kustomize.toolkit.fluxcd.io "legacy-crds" not found`)
+	noResources := errors.New("No resources found in flux-system namespace.")
+	siblingOnly := []byte("items:\n- metadata:\n    name: cluster-base\n")
 	for name, tc := range map[string]struct {
-		data   string
-		err    error
-		events []byte
-		want   bool
+		data      string
+		err       error
+		listed    []byte // the namespace's Kustomization list
+		events    []byte
+		eventsErr error
+		want      bool
 	}{
 		"terminating, finalizer failed": {data: selfRemovalChild, events: finalizerEvent},
-		"gone, reported as not found":   {err: errors.New(`kustomizations.kustomize.toolkit.fluxcd.io "legacy-crds" not found`), want: true},
-		"gone, cleanup failure of an earlier object with the same name": {err: errors.New("No resources found in flux-system namespace."),
-			events: []byte(strings.Replace(string(finalizerEvent), "name: legacy-crds\n", "name: legacy-crds\n      uid: old-uid\n", 1)), want: true},
-		"gone after a retried cleanup failure recovered": {err: errors.New("No resources found in flux-system namespace."),
+		"gone, reported as not found":   {err: notFound, want: true},
+		// The UID filter alone decides: a non-retryable failure counts even
+		// once the child is gone, unless it was an earlier object's.
+		"gone, cleanup failure of an earlier object with the same name": {err: notFound,
+			events: []byte(strings.Replace(strings.Replace(string(finalizerEvent), "name: legacy-crds\n", "name: legacy-crds\n      uid: old-uid\n", 1),
+				"pruning for deleted resource failed", "unable to prune objects", 1)), want: true},
+		"gone after a retried cleanup failure recovered": {err: noResources, listed: siblingOnly,
 			events: finalizerEvent, want: true},
-		"gone after a cleanup failure": {err: errors.New("No resources found in flux-system namespace."),
+		"gone after a cleanup failure": {err: noResources, listed: siblingOnly,
 			events: []byte(strings.Replace(string(finalizerEvent), "pruning for deleted resource failed", "unable to prune objects", 1))},
 		"terminating, Ready=False for another reason": {data: strings.Replace(selfRemovalChild,
 			"kustomization path not found: stat /tmp/kustomization-1/apps/legacy/crds: no such file or directory", "health check failed", 1)},
-		"gone":        {err: errors.New("No resources found in flux-system namespace."), want: true},
-		"terminating": {data: selfRemovalChild, want: true},
-		"live":        {data: strings.Replace(selfRemovalChild, "  deletionTimestamp: \"2026-10-27T08:02:45Z\"\n", "", 1)},
-		"read error":  {err: errors.New("connection refused")},
+		"gone":                                  {err: noResources, listed: siblingOnly, want: true},
+		"No resources found, list still has it": {err: noResources, listed: []byte("items:\n- metadata:\n    name: cluster-base\n- metadata:\n    name: legacy-crds\n")},
+		"No resources found, no list":           {err: noResources},
+		"terminating":                           {data: selfRemovalChild, want: true},
+		"terminating replacement with another uid": {data: strings.Replace(selfRemovalChild, "  name: legacy-crds\n", "  name: legacy-crds\n  uid: new-uid\n", 1)},
+		"terminating, events unreadable":           {data: selfRemovalChild, eventsErr: noResources},
+		"live":                                     {data: strings.Replace(selfRemovalChild, "  deletionTimestamp: \"2026-10-27T08:02:45Z\"\n", "", 1)},
+		"read error":                               {err: errors.New("connection refused")},
 	} {
-		mcp := &fakeMCPClient{data: []byte(tc.data), kustomizationErr: tc.err, lists: map[string][]byte{"v1|Event|flux-system": tc.events}}
+		mcp := &fakeMCPClient{data: []byte(tc.data), kustomizationErr: tc.err, eventsErr: tc.eventsErr, lists: map[string][]byte{
+			"v1|Event|flux-system": tc.events,
+			"kustomize.toolkit.fluxcd.io/v1|Kustomization|flux-system": tc.listed,
+		}}
 		proc := New(&config.Config{}, mcp, readiness.NewChecker(mcp), nil, &fakeCommenter{}, nil, nil, slog.Default())
 		if got := proc.childDeleting(context.Background(), "legacy-crds", "flux-system", "child-uid"); got != tc.want {
 			t.Errorf("%s: childDeleting = %v, want %v", name, got, tc.want)
@@ -908,7 +978,7 @@ func TestProcess_SelfRemoval_RetiresScopeFromLabelRoster(t *testing.T) {
 	proc := New(cfg, mcp, readiness.NewChecker(mcp), nil, commenter, nil, cache, slog.Default())
 	ctx := context.Background()
 	// A sibling Kustomization of the same PR fails on head h1.
-	proc.reconcileLabels(ctx, "owner", "repo", "flux-system/other", "h1", 42, bridgegithub.OutcomeFailure)
+	_ = proc.reconcileLabels(ctx, "owner", "repo", "flux-system/other", "h1", 42, bridgegithub.OutcomeFailure)
 	event := eventv1.Event{
 		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "legacy-crds", Namespace: "flux-system"},
 		Severity:       eventv1.EventSeverityError,
@@ -921,7 +991,7 @@ func TestProcess_SelfRemoval_RetiresScopeFromLabelRoster(t *testing.T) {
 		t.Errorf("removed child still in the label roster: %v", cache.PRScopes("owner", "repo", 42))
 	}
 	// A new head fixes the sibling; the removed child never reports again.
-	proc.reconcileLabels(ctx, "owner", "repo", "flux-system/other", "h2", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "owner", "repo", "flux-system/other", "h2", 42, bridgegithub.OutcomeSuccess)
 	if label, _ := lastLabel(commenter.labelCalls, 42); label != bridgegithub.OutcomeSuccess {
 		t.Errorf("label on the new head = %q, want success (the removed child mustn't hold it)", label)
 	}

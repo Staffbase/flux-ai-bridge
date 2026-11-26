@@ -367,6 +367,44 @@ func TestProcess_AttributesInPlaceResourceRemoval(t *testing.T) {
 	}
 }
 
+// A head the parser couldn't read completely (the policy now wrapped in a
+// List's items) still declares it, as far as anyone can tell: absence from the
+// parsed part is no removal, so the base diff must not attribute the PR.
+func TestProcess_InPlaceRemovalNotClaimedFromIncompleteHead(t *testing.T) {
+	const policyPath = "apps/kyverno/base/policies/require-team-label.yaml"
+	basePolicy := []byte("apiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: require-team-label\n")
+	wrapped := []byte("apiVersion: v1\nkind: List\nitems:\n- apiVersion: kyverno.io/v1\n  kind: ClusterPolicy\n  metadata:\n    name: require-team-label\n")
+	mcpMock := &fakeMCPClient{
+		data: []byte(emptyInventoryKustomization),
+		lists: map[string][]byte{
+			"v1|Event|flux-system": eventsListYAML("kyverno", "ClusterPolicy/require-team-label deleted"),
+		},
+	}
+	commenterMock := &fakeCommenter{
+		prNumber:  77,
+		prBaseSHA: "base-sha",
+		prFiles:   []bridgegithub.PRFile{{Path: policyPath, BlobSHA: "pol-head", Status: "modified"}},
+		blobs:     map[string][]byte{"pol-head": wrapped},
+		baseFiles: map[string][]byte{policyPath: basePolicy},
+	}
+	cfg := &config.Config{
+		GitHubRepo: "owner/repo", LLMProvider: "none",
+		PRLabelEnabled: true, PRAttributePrunes: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
+	}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "kyverno", Namespace: "flux-system"},
+		Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
+	}
+	if err := proc.Process(context.Background(), event, "sha-inplace"); err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+	if _, ok := lastLabel(commenterMock.labelCalls, 77); ok {
+		t.Errorf("a removal was claimed from an incompletely parsed head; labelCalls=%v", commenterMock.labelCalls)
+	}
+}
+
 // Gating: an in-place removal with NO prune event in the window is NOT attributed
 // (the removed resource isn't confirmed gone), so no label is set — mirrors the
 // removed-file gating, proving the base-diff fallback still requires prune
@@ -476,6 +514,60 @@ metadata:
 	}
 	if got != bridgegithub.OutcomeWarning {
 		t.Errorf("mixed PR with a finalizer-stuck in-place removal label = %q, want warning", got)
+	}
+}
+
+// A multi-doc file that keeps one resource and drops another: the kept one
+// attributes the PR, but the dropped one was pruned and is finalizer-stuck.
+// With prune candidates in this reconcile the file is diffed anyway, so the
+// stuck teardown keeps the verdict ⚠️ instead of a premature ✅.
+func TestProcess_MultiDocPartialRemovalStuckIsWarning(t *testing.T) {
+	const inventoryWithKeptCM = `
+spec:
+  sourceRef:
+    name: flux-system
+    kind: GitRepository
+status:
+  inventory:
+    entries:
+      - id: "batch-jobs_kept-cm__ConfigMap"
+`
+	keptCM := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kept-cm\n  namespace: batch-jobs\n"
+	stuckLive := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: stuck-cm\n  namespace: batch-jobs\n" +
+		"  deletionTimestamp: \"2026-06-15T10:00:00Z\"\n  finalizers:\n    - example.com/protect\n")
+	const path = "apps/batch-jobs/base/configmaps.yaml"
+	mcpMock := &fakeMCPClient{
+		data: []byte(inventoryWithKeptCM),
+		lists: map[string][]byte{
+			"v1|Event|flux-system": eventsListYAML("batch-jobs", "ConfigMap/batch-jobs/stuck-cm deleted"),
+		},
+		resources: map[string][]byte{
+			"v1|ConfigMap|kept-cm|batch-jobs":  []byte(keptCM),
+			"v1|ConfigMap|stuck-cm|batch-jobs": stuckLive,
+		},
+	}
+	commenterMock := &fakeCommenter{
+		prNumber:  89,
+		prBaseSHA: "base-sha",
+		prFiles:   []bridgegithub.PRFile{{Path: path, BlobSHA: "cms-head", Status: "modified"}},
+		blobs:     map[string][]byte{"cms-head": []byte(keptCM)},
+		baseFiles: map[string][]byte{path: []byte(keptCM + "---\n" + stuckConfigMapBlob)},
+	}
+	cfg := &config.Config{
+		GitHubRepo: "owner/repo", LLMProvider: "none",
+		PRLabelEnabled: true, PRAttributePrunes: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
+	}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "batch-jobs", Namespace: "flux-system"},
+		Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
+	}
+	if err := proc.Process(context.Background(), event, "sha-multidoc"); err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+	if got, ok := lastLabel(commenterMock.labelCalls, 89); !ok || got != bridgegithub.OutcomeWarning {
+		t.Errorf("multi-doc partial removal with a stuck teardown: label = %q (set=%v), want warning", got, ok)
 	}
 }
 

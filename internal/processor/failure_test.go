@@ -94,6 +94,74 @@ func TestFetchFailureContext_SkipsWhenHealthy(t *testing.T) {
 	}
 }
 
+// A StatefulSet whose pod creation was rejected before another workload's
+// failing pod was created keeps its FailedCreate event in the prompt: the
+// other pod's age says nothing about the StatefulSet.
+func TestFetchFailureContext_KeepsFailedCreateOlderThanOtherWorkloadsPod(t *testing.T) {
+	mcp := &fakeMCPClient{lists: map[string][]byte{
+		"v1|Pod|apps": []byte(`items:
+- metadata:
+    name: web-abc
+    namespace: apps
+    creationTimestamp: "2026-01-01T12:00:00Z"
+  status:
+    phase: Running
+    containerStatuses:
+    - name: web
+      restartCount: 3
+      state:
+        waiting:
+          reason: CrashLoopBackOff
+`),
+		"v1|Event|apps": []byte(`items:
+- type: Warning
+  reason: FailedCreate
+  lastTimestamp: "2026-01-01T11:50:00Z"
+  message: 'create Pod db-0 in StatefulSet db failed error: admission webhook "validate.example.com" denied the request'
+  source:
+    component: statefulset-controller
+  involvedObject:
+    kind: StatefulSet
+    name: db
+`),
+	}}
+	proc := New(&config.Config{FailureFetchEvents: true}, mcp, readiness.NewChecker(mcp), &fakeAnalyzer{}, &fakeCommenter{}, nil, nil, slog.Default())
+	statuses := []readiness.ResourceStatus{
+		{Kind: "Deployment", Namespace: "apps", Name: "web", Status: "InProgress"},
+		{Kind: "StatefulSet", Namespace: "apps", Name: "db", Status: "InProgress"},
+	}
+	out, _ := proc.fetchFailureContext(context.Background(), eventv1.Event{Severity: eventv1.EventSeverityInfo}, statuses, nil)
+	if !strings.Contains(out, "reason: FailedCreate") {
+		t.Errorf("the StatefulSet's FailedCreate was dropped by another workload's pod cutoff:\n%s", out)
+	}
+}
+
+// A third-party controller that reuses a built-in reason isn't a core
+// Kubernetes emitter: its FailedCreate is no hard-failure evidence. The reason
+// safety net is only for events whose emitter fields are both blank.
+func TestFetchFailureContext_NamedThirdPartyFailedCreateNotCore(t *testing.T) {
+	events := func(component string) []byte {
+		return []byte(`items:
+- type: Warning
+  reason: FailedCreate
+  message: could not create the backing volume
+  source:
+    component: ` + component + `
+  involvedObject:
+    kind: StatefulSet
+    name: db
+`)
+	}
+	statuses := []readiness.ResourceStatus{{Kind: "StatefulSet", Namespace: "apps", Name: "db", Status: "InProgress"}}
+	for component, want := range map[string]bool{`""`: true, "example-operator": false} {
+		mcp := &fakeMCPClient{lists: map[string][]byte{"v1|Event|apps": events(component)}}
+		proc := New(&config.Config{FailureFetchEvents: true}, mcp, readiness.NewChecker(mcp), &fakeAnalyzer{}, &fakeCommenter{}, nil, nil, slog.Default())
+		if _, hard := proc.fetchFailureContext(context.Background(), eventv1.Event{Severity: eventv1.EventSeverityInfo}, statuses, nil); hard != want {
+			t.Errorf("emitter %s: hardFailure = %v, want %v", component, hard, want)
+		}
+	}
+}
+
 // TestFetchFailureContext_TriggersOnNonCurrentEvenWithInfoEvent: the
 // "ReconciliationSucceeded" event lies (or arrives before Flux has noticed
 // the failure), but kstatus says a resource is InProgress. The bridge must
@@ -648,11 +716,8 @@ func TestIsFailingPod(t *testing.T) {
 			wantReason: "OOMKilled", wantFail: true,
 		},
 		{
-			name: "phase=Failed",
-			pod: podInfo{Status: struct {
-				Phase             string            `yaml:"phase"`
-				ContainerStatuses []containerStatus `yaml:"containerStatuses"`
-			}{Phase: "Failed"}},
+			name:       "phase=Failed",
+			pod:        podInfo{Status: podStatus{Phase: "Failed"}},
 			wantReason: "Failed", wantFail: true,
 		},
 		{
@@ -686,11 +751,8 @@ func TestIsFailingPod(t *testing.T) {
 			wantFail: false,
 		},
 		{
-			name: "Running pod with no bad container state is healthy",
-			pod: podInfo{Status: struct {
-				Phase             string            `yaml:"phase"`
-				ContainerStatuses []containerStatus `yaml:"containerStatuses"`
-			}{Phase: "Running"}},
+			name:     "Running pod with no bad container state is healthy",
+			pod:      podInfo{Status: podStatus{Phase: "Running"}},
 			wantFail: false,
 		},
 		// CrashLoopBackOff cycle caught mid-Running: state.waiting is nil
@@ -792,7 +854,7 @@ func TestFilterAndRenderEvents_DropsStaleEvents(t *testing.T) {
 		"lastTimestamp: " + fresh + "\ncount: 2\n" +
 		"involvedObject:\n  kind: Pod\n  name: podinfo-NEW\n"
 
-	out := filterAndRenderEvents([]byte(yamlStream), podBorn)
+	out := filterAndRenderEvents([]byte(yamlStream), podBorn, nil)
 	if strings.Contains(out, "OldBackOff") || strings.Contains(out, "podinfo-OLD") {
 		t.Errorf("stale event leaked through filter: %s", out)
 	}
@@ -810,7 +872,7 @@ func TestFilterAndRenderEvents_NoCutoffKeepsAll(t *testing.T) {
 		"lastTimestamp: 2026-01-01T00:00:00Z\ncount: 1\n" +
 		"involvedObject:\n  kind: Pod\n  name: somepod\n"
 
-	out := filterAndRenderEvents([]byte(yamlStream), time.Time{})
+	out := filterAndRenderEvents([]byte(yamlStream), time.Time{}, nil)
 	if !strings.Contains(out, "Anything") {
 		t.Errorf("event must survive when cutoff is zero: %s", out)
 	}
@@ -842,7 +904,7 @@ func TestFilterAndRenderEvents_SegregatesNonCore(t *testing.T) {
 		"reportingComponent: kyverno-scan\n" +
 		"involvedObject:\n  kind: Pod\n  name: podinfo-OTHER\n"
 
-	out := filterAndRenderEvents([]byte(yamlStream), time.Time{})
+	out := filterAndRenderEvents([]byte(yamlStream), time.Time{}, nil)
 
 	// The real signal is present...
 	if !strings.Contains(out, "BackOff") {
@@ -877,7 +939,7 @@ func TestFilterAndRenderEvents_CoreSourceUnknownReasonIsGenuine(t *testing.T) {
 		"reportingComponent: kubelet\n" +
 		"involvedObject:\n  kind: Pod\n  name: app-0\n"
 
-	out := filterAndRenderEvents([]byte(yamlStream), time.Time{})
+	out := filterAndRenderEvents([]byte(yamlStream), time.Time{}, nil)
 	if strings.Contains(out, "additional non-core events") {
 		t.Errorf("a kubelet-sourced event must be treated as core regardless of reason:\n%s", out)
 	}
@@ -901,7 +963,7 @@ func TestFilterAndRenderEvents_UnknownThirdPartyIsSegregated(t *testing.T) {
 		"message: my-operator noticed an issue\nreportingComponent: my-custom-operator\n" +
 		"involvedObject:\n  kind: Pod\n  name: app-NEW\n"
 
-	out := filterAndRenderEvents([]byte(yamlStream), time.Time{})
+	out := filterAndRenderEvents([]byte(yamlStream), time.Time{}, nil)
 	if !strings.Contains(out, "additional non-core events") || !strings.Contains(out, "SomethingFlagged") {
 		t.Errorf("unknown third-party event must be segregated as non-core:\n%s", out)
 	}
@@ -923,7 +985,7 @@ func TestFilterAndRenderEvents_AdmissionDenialIsGenuine(t *testing.T) {
 		"lastTimestamp: 2026-06-07T14:41:00Z\ncount: 9\n" +
 		"involvedObject:\n  kind: ReplicaSet\n  name: podinfo-abc\n"
 
-	out := filterAndRenderEvents([]byte(yamlStream), time.Time{})
+	out := filterAndRenderEvents([]byte(yamlStream), time.Time{}, nil)
 	if !strings.Contains(out, "FailedCreate") {
 		t.Fatalf("admission-denial blocking event was dropped: %s", out)
 	}
@@ -1244,6 +1306,72 @@ func quietFixture(t *testing.T, mcp MCPClient, quietPeriod time.Duration) *Proce
 	return New(cfg, mcp, readiness.NewChecker(mcp), &fakeAnalyzer{}, &fakeCommenter{}, nil, nil, slog.Default())
 }
 
+// slowPodMCP serves a fixed pod list after delay, or, with block set, waits
+// for the caller's context to end.
+type slowPodMCP struct {
+	*fakeMCPClient
+	body  string
+	delay time.Duration
+	block bool
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *slowPodMCP) ListKubernetesResources(ctx context.Context, apiVersion, kind, namespace string) ([]byte, error) {
+	if kind != "Pod" {
+		return f.fakeMCPClient.ListKubernetesResources(ctx, apiVersion, kind, namespace)
+	}
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if f.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	time.Sleep(f.delay)
+	return []byte(f.body), nil
+}
+
+// The quiet window must have passed when the confirming scan STARTED: rows
+// listed by a scan that crossed the boundary can't show a pod created while
+// it ran, so a second scan has to confirm.
+func TestWaitPodsSettled_QuietWindowCountsFromScanStart(t *testing.T) {
+	mcp := &slowPodMCP{fakeMCPClient: &fakeMCPClient{}, delay: 150 * time.Millisecond,
+		body: podsListYAML(podSpec{name: "old", ready: true, created: time.Now().Add(-time.Hour)})}
+	proc := quietFixture(t, mcp, 100*time.Millisecond)
+
+	_, _, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
+	if !settled {
+		t.Fatal("expected settled")
+	}
+	if mcp.calls < 2 {
+		t.Errorf("settled on the scan that crossed the quiet boundary (%d scan); want a confirming scan", mcp.calls)
+	}
+}
+
+// A pod scan that hangs is bounded by the readiness budget, not by the
+// pipeline deadline: it must not consume the time reserved for analysis.
+func TestWaitPodsSettled_ScanBoundedByBudget(t *testing.T) {
+	mcp := &slowPodMCP{fakeMCPClient: &fakeMCPClient{}, block: true}
+	proc := quietFixture(t, mcp, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	done := make(chan bool, 1)
+	go func() {
+		_, _, settled := proc.waitPodsSettled(ctx, []string{"default"}, time.Millisecond, 10*time.Millisecond, time.Now())
+		done <- settled
+	}()
+	select {
+	case settled := <-done:
+		if settled {
+			t.Error("a scan cut short by the budget must leave the wait unsettled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a hung pod scan ran past the readiness budget")
+	}
+}
+
 // TestWaitPodsSettled_QuietPeriodWaitsOutLatePod: an operator creates its
 // workload pods only after Flux applied the custom resource, so the first
 // scans see only the old, ready pods. The quiet period must keep scanning
@@ -1554,10 +1682,14 @@ items:
 func TestWaitPodsSettled_SleepStopsAtBudget(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{podsListYAML(podSpec{name: "api", ready: true, created: time.Now()})}}
 	proc := quietFixture(t, mcp, time.Hour)
+	// Cancelled at cleanup, so a regression to a full-interval sleep doesn't
+	// leave the worker sleeping for an hour after the test failed.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	done := make(chan bool, 1)
 	go func() {
-		_, _, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Hour, 50*time.Millisecond, time.Now())
+		_, _, settled := proc.waitPodsSettled(ctx, []string{"default"}, time.Hour, 50*time.Millisecond, time.Now())
 		done <- settled
 	}()
 	select {
@@ -1721,7 +1853,8 @@ func TestDropSupersededJobPods(t *testing.T) {
 		// Deployment pod: untouched.
 		row("Deployment/api", "api-1234", "Current", "a"),
 	}
-	got := dropSupersededJobPods(pods)
+	cron := map[string]bool{"judge-29686125": true, "judge-29686335": true}
+	got := dropSupersededJobPods(pods, cron)
 	names := make([]string, 0, len(got))
 	for _, r := range got {
 		names = append(names, r.Namespace+"/"+r.Name)
@@ -1737,7 +1870,7 @@ func TestDropSupersededJobPods(t *testing.T) {
 		row("Job/judge-29686125", "judge-29686125-x", "Current", "a"),
 		row("Job/judge-29686335", "judge-29686335-y", "Failed", "a"),
 	}
-	got = dropSupersededJobPods(pods)
+	got = dropSupersededJobPods(pods, cron)
 	if len(got) != 1 || got[0].Status != "Failed" || got[0].Name != "judge-29686335-y" {
 		t.Fatalf("latest failing run must survive the filter, got %+v", got)
 	}
@@ -1751,7 +1884,8 @@ func TestDropSupersededJobPods_SlotZero(t *testing.T) {
 		{Kind: "Pod", Namespace: "a", Name: "j-00000-x", Status: "Failed", Controller: "Job/j-00000"},
 		{Kind: "Pod", Namespace: "a", Name: "j-00001-y", Status: "Current", Controller: "Job/j-00001"},
 	}
-	got := dropSupersededJobPods(pods)
+	cron := map[string]bool{"j-00000": true, "j-00001": true}
+	got := dropSupersededJobPods(pods, cron)
 	if len(got) != 1 || got[0].Name != "j-00001-y" {
 		t.Fatalf("slot 0 must be superseded by slot 1, got %+v", got)
 	}
@@ -1759,7 +1893,7 @@ func TestDropSupersededJobPods_SlotZero(t *testing.T) {
 	solo := []readiness.ResourceStatus{
 		{Kind: "Pod", Namespace: "a", Name: "j-00000-x", Status: "Failed", Controller: "Job/j-00000"},
 	}
-	if got := dropSupersededJobPods(solo); len(got) != 1 {
+	if got := dropSupersededJobPods(solo, cron); len(got) != 1 {
 		t.Fatalf("slot-0-only family must be kept, got %+v", got)
 	}
 }
@@ -1775,6 +1909,10 @@ func TestCronRunFallbackRows(t *testing.T) {
   metadata:
     name: judge-29686125
     namespace: default
+    ownerReferences:
+    - kind: CronJob
+      name: judge
+      controller: true
   status:
     conditions:
     - type: Failed
@@ -1786,6 +1924,10 @@ func TestCronRunFallbackRows(t *testing.T) {
   metadata:
     name: judge-29686335
     namespace: default
+    ownerReferences:
+    - kind: CronJob
+      name: judge
+      controller: true
   status:
     conditions:
     - type: Failed
@@ -1796,6 +1938,30 @@ func TestCronRunFallbackRows(t *testing.T) {
   kind: Job
   metadata:
     name: greenjob-29686335
+    namespace: default
+    ownerReferences:
+    - kind: CronJob
+      name: greenjob
+      controller: true
+  status:
+    conditions:
+    - type: Complete
+      status: "True"
+- apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: active-29686335
+    namespace: default
+    ownerReferences:
+    - kind: CronJob
+      name: active
+      controller: true
+  status:
+    active: 1
+- apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: migrate-20260101
     namespace: default
   status:
     conditions:
@@ -1813,17 +1979,24 @@ func TestCronRunFallbackRows(t *testing.T) {
 
 	// No pods visible at all: the newest failed run surfaces as a Failed row
 	// (one per family, oldest run ignored); the completed family reads
-	// Current; the one-shot Job contributes nothing.
-	rows := proc.cronRunFallbackRows(context.Background(), "default", nil)
-	if len(rows) != 2 {
-		t.Fatalf("want 2 fallback rows (one per CronJob family), got %+v", rows)
+	// Current; a run without completion evidence reads InProgress; the
+	// standalone and one-shot Jobs contribute nothing.
+	rows, cronRuns := proc.cronRunFallbackRows(context.Background(), "default", nil)
+	if len(rows) != 3 {
+		t.Fatalf("want 3 fallback rows (one per CronJob family), got %+v", rows)
 	}
-	if rows[0].Name != "greenjob-29686335" || rows[0].Status != "Current" {
-		t.Errorf("completed family must read Current, got %+v", rows[0])
+	if rows[0].Name != "active-29686335" || rows[0].Status != "InProgress" {
+		t.Errorf("unfinished run must not read Current, got %+v", rows[0])
 	}
-	if rows[1].Name != "judge-29686335" || rows[1].Status != "Failed" ||
-		!strings.Contains(rows[1].Message, "backoff limit") || rows[1].Controller != "CronJob/judge" {
-		t.Errorf("newest failed run must read Failed with the Job condition message, got %+v", rows[1])
+	if rows[1].Name != "greenjob-29686335" || rows[1].Status != "Current" {
+		t.Errorf("completed family must read Current, got %+v", rows[1])
+	}
+	if rows[2].Name != "judge-29686335" || rows[2].Status != "Failed" ||
+		!strings.Contains(rows[2].Message, "backoff limit") || rows[2].Controller != "CronJob/judge" {
+		t.Errorf("newest failed run must read Failed with the Job condition message, got %+v", rows[2])
+	}
+	if cronRuns["migrate-20260101"] || cronRuns["migrate-db"] || !cronRuns["judge-29686125"] {
+		t.Errorf("cron runs = %v, want only CronJob-owned Jobs", cronRuns)
 	}
 
 	// The newest run's pods ARE visible: the pod rows carry the verdict, no
@@ -1831,15 +2004,68 @@ func TestCronRunFallbackRows(t *testing.T) {
 	podRows := []readiness.ResourceStatus{
 		{Kind: "Pod", Namespace: "default", Name: "judge-29686335-x", Status: "Failed", Controller: "Job/judge-29686335"},
 	}
-	rows = proc.cronRunFallbackRows(context.Background(), "default", podRows)
-	if len(rows) != 1 || rows[0].Name != "greenjob-29686335" {
+	rows, _ = proc.cronRunFallbackRows(context.Background(), "default", podRows)
+	if len(rows) != 2 || rows[0].Name != "active-29686335" || rows[1].Name != "greenjob-29686335" {
 		t.Fatalf("family with visible newest-run pods must be skipped, got %+v", rows)
 	}
 
-	// Job list unavailable → fail-open, no rows.
-	broken := New(&config.Config{ReadinessIncludePods: true}, &fakeMCPClient{}, nil, nil, &fakeCommenter{}, nil, nil, slog.Default())
-	if rows := broken.cronRunFallbackRows(context.Background(), "default", nil); rows != nil {
-		t.Fatalf("list failure must yield no rows, got %+v", rows)
+	// Job list unavailable → no rows, and no run is known to be superseded.
+	broken := New(&config.Config{ReadinessIncludePods: true}, &fakeMCPClient{err: fmt.Errorf("mcp unavailable")}, nil, nil, &fakeCommenter{}, nil, nil, slog.Default())
+	if rows, runs := broken.cronRunFallbackRows(context.Background(), "default", nil); rows != nil || len(runs) != 0 {
+		t.Fatalf("list failure must yield no rows and no runs, got %+v, %v", rows, runs)
+	}
+}
+
+// cronProcessVerdict runs Process over a one-ConfigMap inventory with the
+// given pods and Jobs in the scanned namespace and returns the delivered
+// comment.
+func cronProcessVerdict(t *testing.T, pods, jobs string) string {
+	t.Helper()
+	mcpMock := &fakeMCPClient{
+		data:      []byte("spec:\n  targetNamespace: default\nstatus:\n  inventory:\n    entries:\n      - id: \"default_any__ConfigMap\"\n"),
+		resources: map[string][]byte{"v1|ConfigMap|any|default": []byte(healthyConfigMapYAML)},
+		lists:     map[string][]byte{"v1|Pod|default": []byte(pods), "batch/v1|Job|default": []byte(jobs)},
+	}
+	commenterMock := &fakeCommenter{prNumber: 42, prState: "open", prHeadSHA: "h1"}
+	cfg := &config.Config{
+		GitHubRepo: "owner/repo", LLMProvider: "none", CommentOnSuccess: true, ReadinessIncludePods: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 50 * time.Millisecond,
+	}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default())
+	event := eventv1.Event{InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "apps", Namespace: "default"}}
+	if err := proc.Process(context.Background(), event, "srcrev"); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	return commenterMock.prCommentBody
+}
+
+// jobPod renders a pod list entry owned by the given Job.
+func jobPod(name, job, phase string) string {
+	return "- metadata:\n    name: " + name + "\n    namespace: default\n    ownerReferences:\n    - kind: Job\n      name: " + job +
+		"\n      controller: true\n  status:\n    phase: " + phase + "\n"
+}
+
+// Standalone Jobs that merely end in digits aren't runs of one CronJob: a
+// newer one's healthy pod must not hide an older one's failure.
+func TestProcess_StandaloneNumberedJobsNotGroupedAsCronRuns(t *testing.T) {
+	pods := "items:\n" + jobPod("migrate-20260101-x", "migrate-20260101", "Failed") + jobPod("migrate-20260102-y", "migrate-20260102", "Succeeded")
+	jobs := "items:\n- metadata:\n    name: migrate-20260101\n    namespace: default\n- metadata:\n    name: migrate-20260102\n    namespace: default\n"
+	if body := cronProcessVerdict(t, pods, jobs); !strings.Contains(body, "# "+statusEmojiFailure+" Flux Status") {
+		t.Errorf("the older standalone Job's failure was hidden:\n%s", body)
+	}
+}
+
+// A CronJob run that started after the pod scan (no pods seen, no completion
+// condition yet) must not read green, nor hide the previous run's failure
+// behind a Current row.
+func TestProcess_UnobservedCronRunNotGreen(t *testing.T) {
+	pods := "items:\n" + jobPod("judge-29686125-x", "judge-29686125", "Failed")
+	owned := "    ownerReferences:\n    - kind: CronJob\n      name: judge\n      controller: true\n"
+	jobs := "items:\n- metadata:\n    name: judge-29686125\n    namespace: default\n" + owned +
+		"  status:\n    conditions:\n    - type: Failed\n      status: \"True\"\n" +
+		"- metadata:\n    name: judge-29686335\n    namespace: default\n" + owned + "  status:\n    active: 1\n"
+	if body := cronProcessVerdict(t, pods, jobs); strings.Contains(body, "# "+statusEmojiHealthy+" Flux Status") {
+		t.Errorf("an unobserved CronJob run read green:\n%s", body)
 	}
 }
 
@@ -1909,7 +2135,7 @@ func TestDropOlderCronRunPods(t *testing.T) {
 		{Kind: "Pod", Name: "web-abc", Controller: "Deployment/web", Status: "Current"},
 	}
 	fallback := []readiness.ResourceStatus{{Kind: "Job", Name: "backup-29000060", Controller: "CronJob/backup", Status: "Current"}}
-	got := dropOlderCronRunPods(pods, fallback)
+	got := dropOlderCronRunPods(pods, fallback, map[string]bool{"backup-29000000": true, "report-29000000": true})
 	if len(got) != 2 || got[0].Name != "report-29000000-y" || got[1].Name != "web-abc" {
 		t.Fatalf("pods = %+v, want the older backup run dropped and the rest kept", got)
 	}

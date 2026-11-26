@@ -15,8 +15,11 @@
 package processor
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -133,7 +136,7 @@ func (p *Processor) selfRemovalExpected(ctx context.Context, owner, repo string,
 	if len(removing) == 0 {
 		return "", nil, nil
 	}
-	if !p.parentDroppedChild(ctx, parentName, parentNS, event.InvolvedObject.Name, event.InvolvedObject.Namespace, kspec.Metadata.UID) {
+	if !p.parentDroppedChild(ctx, pspec, parentName, parentNS, event.InvolvedObject.Name, event.InvolvedObject.Namespace, kspec.Metadata.UID) {
 		p.logger.Info("self-removal check: parent still lists this Kustomization, or it isn't being deleted; keeping the normal report",
 			"name", event.InvolvedObject.Name, "parent", parent)
 		return "", nil, nil
@@ -151,8 +154,11 @@ func (p *Processor) selfRemovalExpected(ctx context.Context, owner, repo string,
 // nameSuffix, postBuild substitution, namespace rewrites). The parent usually
 // reconciles the same push within seconds of the child failing; if it still
 // lists the child when the budget runs out (or its inventory can't be read, or
-// is empty while the parent isn't Ready), the answer is "no".
-func (p *Processor) parentDroppedChild(ctx context.Context, parentName, parentNS, childName, childNS, childUID string) bool {
+// is empty while the parent isn't Ready), the answer is "no". attributed is
+// the parent snapshot the PR's files were judged against: a parent recreated,
+// or switched to another source or path since, renders another build, whose
+// dropping the child says nothing about this PR.
+func (p *Processor) parentDroppedChild(ctx context.Context, attributed kustomizationSpec, parentName, parentNS, childName, childNS, childUID string) bool {
 	childID := childNS + "_" + childName + "_" + fluxKustomizationGroupKind
 	deadline := time.Now().Add(settleBudget(ctx, p.cfg.ReadinessPollTimeout))
 	for {
@@ -161,7 +167,7 @@ func (p *Processor) parentDroppedChild(ctx context.Context, parentName, parentNS
 			// turned Ready=False (e.g. PruneFailed), stopped pruning or got
 			// suspended while we waited proves nothing by dropping the child.
 			var pspec kustomizationSpec
-			if yaml.Unmarshal(data, &pspec) != nil || !parentCanPrune(pspec) {
+			if yaml.Unmarshal(data, &pspec) != nil || !parentCanPrune(pspec) || !sameParentBuild(attributed, pspec) {
 				return false
 			}
 			// An empty inventory counts only from a Ready parent: pruning its
@@ -180,6 +186,16 @@ func (p *Processor) parentDroppedChild(ctx context.Context, parentName, parentNS
 		case <-time.After(p.cfg.ReadinessPollInterval):
 		}
 	}
+}
+
+// sameParentBuild reports whether two snapshots of a parent Kustomization are
+// the same object (uid, when both carry one) building the same source and path.
+func sameParentBuild(a, b kustomizationSpec) bool {
+	if a.Metadata.UID != "" && b.Metadata.UID != "" && a.Metadata.UID != b.Metadata.UID {
+		return false
+	}
+	return a.Spec.SourceRef == b.Spec.SourceRef &&
+		bridgesource.CleanPath(a.Spec.Path) == bridgesource.CleanPath(b.Spec.Path)
 }
 
 // parentBuildPath returns the repo path the Kustomization's Flux parent builds
@@ -358,20 +374,36 @@ const retryableFinalizerFailure = "pruning for deleted resource failed"
 // reason other than the teardown itself (see teardownFailure), and — gone or
 // terminating — it must have no finalizer failure event (v1.8.4 drops the
 // finalizer even after "unable to prune objects", leaving resources behind).
-// A read error other than "not found" (either MCP phrasing) is no evidence.
-// uid (from the first snapshot) skips events of an earlier object with the
-// same name; events or a uid that don't carry one still count.
+// A read error other than "not found" is no evidence. MCP's "No resources
+// found" is ambiguous — a degraded server (cold discovery cache) says the same
+// about an object that exists — so it counts as gone only when a list of the
+// namespace's Kustomizations succeeds and lacks the child; for the Event list
+// it proves nothing either, so the check fails closed.
+// uid (from the first snapshot) is the object the PR was attributed against:
+// a live object with another uid is a replacement under the same name, whose
+// deletion says nothing about it; events of an earlier object are skipped.
+// Events or a uid that don't carry one still count.
 func (p *Processor) childDeleting(ctx context.Context, name, namespace, uid string) bool {
 	data, err := p.mcp.GetKustomizationStatus(ctx, name, namespace)
 	gone := err != nil
 	switch {
 	case gone:
-		if msg := strings.ToLower(err.Error()); !strings.Contains(msg, "not found") && !strings.Contains(msg, "no resources found") {
+		msg := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(msg, "not found"):
+		case strings.Contains(msg, "no resources found"):
+			if !p.kustomizationListedAbsent(ctx, name, namespace) {
+				return false
+			}
+		default:
 			return false
 		}
 	default:
 		var k kustomizationSpec
 		if yaml.Unmarshal(data, &k) != nil || k.Metadata.DeletionTimestamp == "" {
+			return false
+		}
+		if uid != "" && k.Metadata.UID != "" && k.Metadata.UID != uid {
 			return false
 		}
 		if failed, waiting := reconcileFailureMessage(eventv1.Event{}, k, ""); (failed != "" || waiting != "") && !teardownFailure(failed, waiting) {
@@ -380,7 +412,7 @@ func (p *Processor) childDeleting(ctx context.Context, name, namespace, uid stri
 	}
 	body, err := p.mcp.ListKubernetesResources(ctx, "v1", "Event", namespace)
 	if err != nil {
-		return isNoResourcesFound(err)
+		return false
 	}
 	for _, e := range parseEventList(body) {
 		if e.InvolvedObject.Name != name || (e.InvolvedObject.Kind != "" && e.InvolvedObject.Kind != "Kustomization") ||
@@ -391,6 +423,49 @@ func (p *Processor) childDeleting(ctx context.Context, name, namespace, uid stri
 			if strings.Contains(e.Message, m) && (!gone || m != retryableFinalizerFailure) {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+// kustomizationListedAbsent reports whether a list of the namespace's
+// Kustomizations succeeds, holds at least one, and doesn't hold name — a
+// served answer that the named object is gone. An empty or failed list proves
+// nothing.
+func (p *Processor) kustomizationListedAbsent(ctx context.Context, name, namespace string) bool {
+	body, err := p.mcp.ListKubernetesResources(ctx, "kustomize.toolkit.fluxcd.io/v1", "Kustomization", namespace)
+	if err != nil {
+		return false
+	}
+	type object struct {
+		Metadata struct {
+			Name string `yaml:"name"`
+		} `yaml:"metadata"`
+	}
+	// A `kind: List` wrapper or a bare multi-doc stream, like the other lists.
+	var list struct {
+		Items []object `yaml:"items"`
+	}
+	if yaml.Unmarshal(body, &list) != nil || len(list.Items) == 0 {
+		list.Items = nil
+		dec := yaml.NewDecoder(bytes.NewReader(body))
+		for {
+			var o object
+			if err := dec.Decode(&o); err != nil {
+				if !errors.Is(err, io.EOF) {
+					return false
+				}
+				break
+			}
+			list.Items = append(list.Items, o)
+		}
+	}
+	if len(list.Items) == 0 {
+		return false
+	}
+	for _, it := range list.Items {
+		if it.Metadata.Name == name || it.Metadata.Name == "" {
+			return false
 		}
 	}
 	return true
@@ -518,7 +593,7 @@ func buildSelfRemovalBody(name, parent, reconcileFailedMsg, reconcileWaitingMsg 
 	fmt.Fprintf(&b, "This is expected. The PR deletes this Kustomization's definition from its parent Kustomization `%s`, "+
 		"which prunes, so the parent deletes this Kustomization. ", parent)
 	if deletesResources {
-		b.WriteString("Its deletion also deletes the resources it manages. ")
+		b.WriteString("Its deletion also prunes the resources it manages, except those excluded from pruning. ")
 	} else {
 		b.WriteString("The resources it manages stay on the cluster (its `spec.prune`, `spec.deletionPolicy` or `spec.suspend` keeps them). ")
 	}

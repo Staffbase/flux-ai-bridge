@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -818,6 +819,45 @@ func TestProcess_PRLabel_FailureIsNonFatal(t *testing.T) {
 	}
 }
 
+// A label write that fails after the comment landed must stay retryable: with
+// re-eval off, a kept admission mark would skip every later event for this
+// head, leaving the label wrong until a new commit. The next event retries the
+// label without reposting the (current) comment.
+func TestProcess_PRLabel_FailureRetriedOnNextEvent(t *testing.T) {
+	mcpMock := &fakeMCPClient{
+		data:      []byte(kustomizationOneInventoryEntry),
+		resources: map[string][]byte{"v1|ConfigMap|any|default": []byte(healthyConfigMapYAML)},
+	}
+	commenterMock := &fakeCommenter{
+		prNumber: 42, prState: "open", prHeadSHA: "h1",
+		labelErr:      errors.New("simulated label API error"),
+		stabilityKeys: map[int]string{},
+	}
+	cfg := &config.Config{
+		GitHubRepo: "owner/repo", LLMProvider: "none", PRLabelEnabled: true, CommentOnSuccess: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
+	}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, dedupe.NewNoExpiry(16), slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "apps", Namespace: "default"},
+		Severity:       eventv1.EventSeverityInfo,
+		Reason:         "ReconciliationSucceeded",
+	}
+	if err := proc.Process(context.Background(), event, "abc1234"); err != nil {
+		t.Fatalf("first Process: %v", err)
+	}
+	commenterMock.labelErr = nil // GitHub recovered
+	if err := proc.Process(context.Background(), event, "abc1234"); err != nil {
+		t.Fatalf("second Process: %v", err)
+	}
+	if n := len(commenterMock.labelCalls); n != 2 || commenterMock.labelCalls[1].Outcome != bridgegithub.OutcomeSuccess {
+		t.Fatalf("the failed label must be retried on the next event; got %+v", commenterMock.labelCalls)
+	}
+	if len(commenterMock.posts) != 1 {
+		t.Errorf("the current comment must not be reposted for the label retry; got %d posts", len(commenterMock.posts))
+	}
+}
+
 // TestProcess_TablesPrecedeLLMNarrative pins the design contract: the
 // bridge stamps the kstatus tables on TOP of the comment (matching the
 // no-LLM body), and the LLM's narrative is appended BELOW them. Tables on
@@ -1119,17 +1159,17 @@ func TestReconcileLabels_AggregatesAcrossKustomizations(t *testing.T) {
 	}
 
 	// k1 fails on PR 42 (head h1) → flux-failed.
-	proc.reconcileLabels(ctx, "o", "r", "ns/k1", "h1", 42, bridgegithub.OutcomeFailure)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/k1", "h1", 42, bridgegithub.OutcomeFailure)
 	if lastLabel() != bridgegithub.OutcomeFailure {
 		t.Fatalf("after k1 fails, label = %s, want failure", lastLabel())
 	}
 	// k2 succeeds on the same PR → must STAY flux-failed (k1 still red).
-	proc.reconcileLabels(ctx, "o", "r", "ns/k2", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/k2", "h1", 42, bridgegithub.OutcomeSuccess)
 	if lastLabel() != bridgegithub.OutcomeFailure {
 		t.Fatalf("k2 success must not override k1 failure; label = %s, want failure", lastLabel())
 	}
 	// k1 recovers → every Kustomization green → flux-success.
-	proc.reconcileLabels(ctx, "o", "r", "ns/k1", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/k1", "h1", 42, bridgegithub.OutcomeSuccess)
 	if lastLabel() != bridgegithub.OutcomeSuccess {
 		t.Fatalf("after k1 recovers, all-green label = %s, want success", lastLabel())
 	}
@@ -1147,21 +1187,75 @@ func TestReconcileLabels_HoldsSuccessUntilRosterComplete(t *testing.T) {
 	ctx := context.Background()
 
 	// Head h1: both Kustomizations report → roster learns {fast, slow}.
-	proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess)
-	proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h1", 42, bridgegithub.OutcomeSuccess)
 	base := len(commenterMock.labelCalls)
 
 	// Head h2 (a new push): the fast scope reports success FIRST. The roster still
-	// expects `slow`, so success must be HELD — no new label call (no flap).
-	proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h2", 42, bridgegithub.OutcomeSuccess)
-	if len(commenterMock.labelCalls) != base {
-		t.Fatalf("flux-success written from a partial roster on the new head (flap); extra %+v", commenterMock.labelCalls[base:])
+	// expects `slow`, so success must be HELD — and h1's flux-success must not
+	// stay on h2, which nothing verified yet: the head reads flux-warning.
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h2", 42, bridgegithub.OutcomeSuccess)
+	if extra := commenterMock.labelCalls[base:]; len(extra) != 1 || extra[0].Outcome != bridgegithub.OutcomeWarning {
+		t.Fatalf("partial roster on the new head must write flux-warning, not keep or write flux-success; got %+v", extra)
 	}
 
 	// The slow scope then reports a failure → flux-failed written immediately.
-	proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h2", 42, bridgegithub.OutcomeFailure)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h2", 42, bridgegithub.OutcomeFailure)
 	if got := commenterMock.labelCalls[len(commenterMock.labelCalls)-1].Outcome; got != bridgegithub.OutcomeFailure {
 		t.Fatalf("expected flux-failed written immediately on the new head; got %s", got)
+	}
+}
+
+// blockingLabelCommenter parks the first SetPRLabels call until released, so a
+// test can interleave two label writers.
+type blockingLabelCommenter struct {
+	*fakeCommenter
+	mu      sync.Mutex
+	started bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingLabelCommenter) SetPRLabels(ctx context.Context, owner, repo string, prNumber int, headSHA string, outcome bridgegithub.Outcome) error {
+	b.mu.Lock()
+	first := !b.started
+	b.started = true
+	b.mu.Unlock()
+	if first {
+		close(b.entered)
+		<-b.release
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fakeCommenter.SetPRLabels(ctx, owner, repo, prNumber, headSHA, outcome)
+}
+
+// Two scopes of one PR head report at once. A worker that read an all-green
+// aggregate must not write flux-success after another worker recorded and
+// wrote flux-failed: the aggregate is read and written under one per-PR lock.
+func TestReconcileLabels_StaleSuccessCannotOverwriteNewerFailure(t *testing.T) {
+	commenterMock := &blockingLabelCommenter{fakeCommenter: &fakeCommenter{}, entered: make(chan struct{}), release: make(chan struct{})}
+	proc := New(&config.Config{PRLabelEnabled: true}, nil, nil, nil, commenterMock, nil, dedupe.NewNoExpiry(16), slog.Default())
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // scope a: success, computed and parked inside the label write
+		defer wg.Done()
+		_ = proc.reconcileLabels(ctx, "o", "r", "ns/a", "h1", 42, bridgegithub.OutcomeSuccess)
+	}()
+	<-commenterMock.entered
+	go func() { // scope b: failure, recorded while a's write is in flight
+		defer wg.Done()
+		_ = proc.reconcileLabels(ctx, "o", "r", "ns/b", "h1", 42, bridgegithub.OutcomeFailure)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(commenterMock.release)
+	wg.Wait()
+
+	calls := commenterMock.labelCalls
+	if len(calls) == 0 || calls[len(calls)-1].Outcome != bridgegithub.OutcomeFailure {
+		t.Fatalf("a stale flux-success overwrote the newer flux-failed; label calls %+v", calls)
 	}
 }
 
@@ -1173,11 +1267,11 @@ func TestReconcileLabels_WritesSuccessWhenRosterComplete(t *testing.T) {
 	proc := New(cfg, nil, nil, nil, commenterMock, nil, dedupe.NewNoExpiry(16), slog.Default())
 	ctx := context.Background()
 
-	proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess)
-	proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h1", 42, bridgegithub.OutcomeSuccess)
 	// New head h2: fast first (held), then slow → now complete → success written.
-	proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h2", 42, bridgegithub.OutcomeSuccess)
-	proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h2", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h2", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h2", 42, bridgegithub.OutcomeSuccess)
 	if got := commenterMock.labelCalls[len(commenterMock.labelCalls)-1].Outcome; got != bridgegithub.OutcomeSuccess {
 		t.Fatalf("expected flux-success once all rostered scopes reported for h2; got %s", got)
 	}
@@ -1194,16 +1288,16 @@ func TestReconcileLabels_DeScopeReleasesHeldSuccess(t *testing.T) {
 	ctx := context.Background()
 
 	// Roster learns {fast, slow}; on head h2 only `fast` reports success → held.
-	proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess)
-	proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h1", 42, bridgegithub.OutcomeSuccess)
-	proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h2", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/slow", "h1", 42, bridgegithub.OutcomeSuccess)
+	_ = proc.reconcileLabels(ctx, "o", "r", "ns/fast", "h2", 42, bridgegithub.OutcomeSuccess)
 	base := len(commenterMock.labelCalls)
 
 	// `slow` is de-scoped (PR no longer touches it): roster shrinks to {fast},
 	// which is now covered → the held success releases.
 	dd.RemoveScopeOutcome("o", "r", 42, "h2", "ns/slow")
 	dd.RemovePRScope("o", "r", 42, "ns/slow")
-	proc.applyPRLabel(ctx, "o", "r", 42, "h2", bridgegithub.OutcomeNone)
+	_ = proc.applyPRLabel(ctx, "o", "r", 42, "h2", bridgegithub.OutcomeNone)
 	if got := commenterMock.labelCalls[len(commenterMock.labelCalls)-1].Outcome; got != bridgegithub.OutcomeSuccess || len(commenterMock.labelCalls) == base {
 		t.Fatalf("expected held flux-success to release after de-scope; calls=%+v", commenterMock.labelCalls)
 	}
@@ -1327,7 +1421,7 @@ func TestProcess_DeScope_DoesNotClearLabelsWhileRosterPending(t *testing.T) {
 	// When the LAST scope de-scopes too, the clear must go through — the PR
 	// genuinely has nothing left to say.
 	dd.RemovePRScope(owner, repo, pr, "flux-system/flux-system")
-	proc.applyPRLabel(context.Background(), owner, repo, pr, head, bridgegithub.OutcomeNone)
+	_ = proc.applyPRLabel(context.Background(), owner, repo, pr, head, bridgegithub.OutcomeNone)
 	if n := len(commenterMock.labelCalls); n != 1 || commenterMock.labelCalls[0].Outcome != bridgegithub.OutcomeNone {
 		t.Fatalf("expected exactly one OutcomeNone write once the roster is empty; got %+v", commenterMock.labelCalls)
 	}
@@ -1481,6 +1575,10 @@ type fakeMCPClient struct {
 	kustomizationCalls int
 	err                error
 	resources          map[string][]byte // GetKubernetesResource: "<apiVersion>|<Kind>|<name>|<namespace>" → YAML
+	// resourceCalls counts GetKubernetesResource calls; resourceErrs, when it
+	// has the key, fails that many calls for it before serving resources.
+	resourceCalls int
+	resourceErrs  map[string]int
 	// kustomizationsByName: GetKustomizationStatus "<namespace>/<name>" → YAML,
 	// checked before data/dataQueue (e.g. a parent Kustomization's spec).
 	kustomizationsByName map[string][]byte
@@ -1541,10 +1639,15 @@ func (f *fakeMCPClient) GetKubernetesMetrics(_ context.Context, namespace string
 }
 
 func (f *fakeMCPClient) GetKubernetesResource(_ context.Context, apiVersion, kind, name, namespace string) ([]byte, error) {
+	f.resourceCalls++
 	if f.err != nil {
 		return nil, f.err
 	}
 	key := apiVersion + "|" + kind + "|" + name + "|" + namespace
+	if f.resourceErrs[key] > 0 {
+		f.resourceErrs[key]--
+		return nil, fmt.Errorf("transient failure: %s", key)
+	}
 	if body, ok := f.resources[key]; ok {
 		return body, nil
 	}
@@ -2029,6 +2132,75 @@ func TestProcess_DeScope_DeferredOnEmptyInventory(t *testing.T) {
 	}
 	if outcomes := dd.ScopeOutcomes(owner, repo, pr, head); outcomes["default/apps"] != string(bridgegithub.OutcomeFailure) {
 		t.Fatalf("failure outcome must survive the empty-inventory event; got %+v", outcomes)
+	}
+}
+
+// An info event can arrive while the revision is still failing (Ready=False):
+// the inventory is then the last good one, which may lack the resource the PR
+// adds, so its no-match must not erase the failure comment either.
+func TestProcess_DeScope_DeferredOnReadyFalseInfoEvent(t *testing.T) {
+	dd := dedupe.NewNoExpiry(16)
+	owner, repo, pr, head := "owner", "repo", 42, "h1"
+	dd.AddPRScope(owner, repo, pr, "default/apps", time.Hour)
+	dd.PutScopeOutcome(owner, repo, pr, head, "default/apps", string(bridgegithub.OutcomeFailure), time.Hour)
+
+	mcpMock := &fakeMCPClient{data: []byte(kustomizationFailingReady)}
+	commenterMock := &fakeCommenter{
+		prNumber: pr, prState: "open", prHeadSHA: head,
+		prFiles: []bridgegithub.PRFile{{Path: "x.yaml", BlobSHA: "b1", Status: "modified"}},
+		blobs:   map[string][]byte{"b1": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nope\n  namespace: default\n")},
+	}
+	cfg := &config.Config{GitHubRepo: owner + "/" + repo, LLMProvider: "none", PRLabelEnabled: true, ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, dd, slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "apps", Namespace: "default"},
+		Severity:       eventv1.EventSeverityInfo,
+	}
+
+	if err := proc.Process(context.Background(), event, "srcrev"); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(commenterMock.removeCalls) != 0 {
+		t.Fatalf("Ready=False no-match must not remove the comment; got %+v", commenterMock.removeCalls)
+	}
+	if outcomes := dd.ScopeOutcomes(owner, repo, pr, head); outcomes["default/apps"] != string(bridgegithub.OutcomeFailure) {
+		t.Fatalf("failure outcome must survive the Ready=False info event; got %+v", outcomes)
+	}
+}
+
+// A changed file the parser couldn't read completely (here: resources wrapped
+// in a List's items) proves nothing by not matching: it may declare the very
+// resource in the inventory. Its no-match must not erase the PR's verdict.
+func TestProcess_DeScope_DeferredOnIncompleteParse(t *testing.T) {
+	dd := dedupe.NewNoExpiry(16)
+	owner, repo, pr, head := "owner", "repo", 42, "h1"
+	dd.AddPRScope(owner, repo, pr, "default/apps", time.Hour)
+	dd.PutScopeOutcome(owner, repo, pr, head, "default/apps", string(bridgegithub.OutcomeFailure), time.Hour)
+
+	mcpMock := &fakeMCPClient{data: []byte(kustomizationOneInventoryEntry)}
+	commenterMock := &fakeCommenter{
+		prNumber: pr, prState: "open", prHeadSHA: head,
+		// A base ref, so the no-base-ref rule for empty heads doesn't decide.
+		prBaseSHA: "base-sha",
+		prFiles:   []bridgegithub.PRFile{{Path: "x.yaml", BlobSHA: "b1", Status: "modified"}},
+		blobs: map[string][]byte{"b1": []byte("apiVersion: v1\nkind: List\nitems:\n" +
+			"- apiVersion: v1\n  kind: ConfigMap\n  metadata:\n    name: any\n    namespace: default\n")},
+	}
+	cfg := &config.Config{GitHubRepo: owner + "/" + repo, LLMProvider: "none", PRLabelEnabled: true, ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, dd, slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "apps", Namespace: "default"},
+		Severity:       eventv1.EventSeverityInfo,
+	}
+
+	if err := proc.Process(context.Background(), event, "srcrev"); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(commenterMock.removeCalls) != 0 {
+		t.Fatalf("an incompletely parsed file's no-match must not remove the comment; got %+v", commenterMock.removeCalls)
+	}
+	if outcomes := dd.ScopeOutcomes(owner, repo, pr, head); outcomes["default/apps"] != string(bridgegithub.OutcomeFailure) {
+		t.Fatalf("failure outcome must survive; got %+v", outcomes)
 	}
 }
 
@@ -2675,8 +2847,10 @@ func TestRolloutInProgress(t *testing.T) {
 			statuses: rows(readiness.ResourceStatus{Kind: "Deployment", Namespace: "other", Name: "api", Status: "InProgress"})},
 		{name: "custom resource kind outside the scanned namespace", outcome: warning,
 			statuses: rows(readiness.ResourceStatus{Kind: "Database", Namespace: "other", Name: "db", Status: "InProgress"})},
+		// A cluster-scoped custom resource's operator may run its pods in any
+		// namespace, none of which was scanned.
 		{name: "cluster-scoped row", outcome: warning,
-			statuses: rows(readiness.ResourceStatus{Kind: "ClusterRole", Name: "reader", Status: "InProgress"}), want: true},
+			statuses: rows(readiness.ResourceStatus{Kind: "ClusterDatabase", Name: "db", Status: "InProgress"})},
 		{name: "success is not a rollout", outcome: bridgegithub.OutcomeSuccess, statuses: rows(current)},
 		{name: "failure is not a rollout", outcome: bridgegithub.OutcomeFailure, statuses: rows(inProgress)},
 		{name: "dependency wait", outcome: warning, statuses: rows(current), waiting: true},
@@ -2883,6 +3057,10 @@ func TestProcess_CronJobGapSample_StaysFailed(t *testing.T) {
   metadata:
     name: judge-29686335
     namespace: default
+    ownerReferences:
+    - kind: CronJob
+      name: judge
+      controller: true
   status:
     conditions:
     - type: Failed
@@ -2934,6 +3112,10 @@ func TestProcess_CronJobFallback_SkippedWhenPodScanInconclusive(t *testing.T) {
   metadata:
     name: judge-29686335
     namespace: default
+    ownerReferences:
+    - kind: CronJob
+      name: judge
+      controller: true
   status:
     conditions:
     - type: Failed

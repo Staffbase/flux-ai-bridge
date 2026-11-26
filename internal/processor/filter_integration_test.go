@@ -17,6 +17,7 @@ package processor
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -391,5 +392,46 @@ func TestProcess_KustomizationCR_AttributedToTargetViaSelfMatch(t *testing.T) {
 	}
 	if commenterMock.prCommentKustomization != "flux-system/child" {
 		t.Errorf("CR change not self-attributed to target; scope=%q want flux-system/child", commenterMock.prCommentKustomization)
+	}
+}
+
+// The same follow-to-target self-match with the build-scope gate on: the
+// child's CR lives in its PARENT's build, never in the child's own (spec.path
+// ./apps/web), so the gate must not reject the file before the self-match runs.
+// An unrelated workload file outside the build still doesn't attribute (see
+// TestProcess_ScopeGate_ExcludesFileNotInBuild).
+func TestProcess_KustomizationCR_SelfMatchOutsideItsBuild(t *testing.T) {
+	for name, tc := range map[string]struct {
+		blob string
+		want string
+	}{
+		"own CR":     {blob: childKustomizationCR, want: "flux-system/child"},
+		"foreign CR": {blob: strings.Replace(childKustomizationCR, "name: child", "name: sibling", 1)},
+		// Declares a resource in the child's inventory, but from outside its
+		// build: still not attributed.
+		"workload": {blob: "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: app\n  namespace: app\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mcpMock := &fakeMCPClient{data: []byte(childOwnInventory)}
+			commenterMock := &fakeCommenter{
+				prNumber: 42,
+				prFiles:  []bridgegithub.PRFile{{Path: "clusters/dev/child-kustomization.yaml", BlobSHA: "blob-cr", Status: "modified"}},
+				blobs:    map[string][]byte{"blob-cr": []byte(tc.blob)},
+			}
+			cfg := &config.Config{GitHubRepo: "owner/repo", LLMProvider: "none", CommentOnSuccess: true, ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+			proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default()).
+				WithScopeResolver(fakeScope{files: map[string]struct{}{"apps/web/release.yaml": {}}})
+			event := eventv1.Event{
+				InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "child", Namespace: "flux-system"},
+				Severity:       eventv1.EventSeverityInfo,
+				Reason:         "ReconciliationSucceeded",
+			}
+			if err := proc.Process(context.Background(), event, "abc1234"); err != nil {
+				t.Fatalf("Process() error: %v", err)
+			}
+			if commenterMock.prCommentKustomization != tc.want {
+				t.Errorf("scope=%q, want %q", commenterMock.prCommentKustomization, tc.want)
+			}
+		})
 	}
 }

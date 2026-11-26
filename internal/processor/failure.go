@@ -323,8 +323,9 @@ func (p *Processor) fetchFailureContext(ctx context.Context, event eventv1.Event
 					"namespace", ns, "tool", "get_kubernetes_resources", "kind", "Event", "error", err.Error())
 				continue
 			}
-			failedCreate = failedCreate || hasFailedCreateEvent(body, cutoffs[ns], notCurrentObjects(statuses, ns))
-			rendered := filterAndRenderEvents(body, cutoffs[ns])
+			objects := notCurrentObjects(statuses, ns)
+			failedCreate = failedCreate || hasFailedCreateEvent(body, cutoffs[ns], objects)
+			rendered := filterAndRenderEvents(body, cutoffs[ns], objects)
 			if rendered != "" {
 				sections = append(sections, fmt.Sprintf("## Events — %s\n\n%s", ns, promptFence("yaml", rendered)))
 			}
@@ -370,12 +371,18 @@ func hasFailedCreateEvent(yamlStream []byte, cutoff time.Time, objects map[strin
 		if !cutoff.IsZero() && e.freshest().Before(cutoff) {
 			continue
 		}
-		if e.Type == "Warning" && e.Reason == "FailedCreate" && e.isCoreKubernetesEvent() &&
-			objects[e.InvolvedObject.Kind+"/"+e.InvolvedObject.Name] {
+		if failedCreateFor(e, objects) {
 			return true
 		}
 	}
 	return false
+}
+
+// failedCreateFor reports whether e is a core Warning FailedCreate for one of
+// the given objects ("Kind/name").
+func failedCreateFor(e eventRecord, objects map[string]bool) bool {
+	return e.Type == "Warning" && e.Reason == "FailedCreate" && e.isCoreKubernetesEvent() &&
+		objects[e.InvolvedObject.Kind+"/"+e.InvolvedObject.Name]
 }
 
 // notCurrentObjects returns the "Kind/name" keys of the non-Current rows in
@@ -574,7 +581,9 @@ func (e eventRecord) isCoreKubernetesEvent() bool {
 	if strings.Contains(msg, "denied the request") || strings.Contains(msg, "admission webhook") {
 		return true
 	}
-	return coreEventReasons[e.Reason]
+	// The reason safety net is for emitters that left both fields blank only:
+	// a named third-party controller reusing a built-in reason is not core.
+	return e.ReportingComponent == "" && e.Source.Component == "" && coreEventReasons[e.Reason]
 }
 
 // filterAndRenderEvents parses an events YAML stream and re-emits the survivors
@@ -583,7 +592,10 @@ func (e eventRecord) isCoreKubernetesEvent() bool {
 //
 //  1. Stale filter: drop events whose freshest timestamp predates `cutoff` (the
 //     earliest failing pod's creation in the namespace) — they describe a previous,
-//     replaced pod. Zero cutoff keeps every event.
+//     replaced pod. Zero cutoff keeps every event. A FailedCreate of one of
+//     the notCurrent objects ("Kind/name") is exempt: it is about the
+//     workload, not a pod, and another workload's failing pod being newer
+//     says nothing about it.
 //  2. Classification by emitter, not by guessing vendors: genuine core
 //     Kubernetes events (kubelet / scheduler / built-in controllers — see
 //     isCoreKubernetesEvent) vs. everything else (third-party tools, most often
@@ -594,11 +606,11 @@ func (e eventRecord) isCoreKubernetesEvent() bool {
 //  4. Non-core events are kept but segregated under a labelled comment, deduped
 //     by message (policy engines repeat per pod per rule) and capped at
 //     maxNonCoreEvents — reported as context, never mistaken for the cause.
-func filterAndRenderEvents(yamlStream []byte, cutoff time.Time) string {
+func filterAndRenderEvents(yamlStream []byte, cutoff time.Time, notCurrent map[string]bool) string {
 	events := parseEventList(yamlStream)
 	var warnings, normals, nonCore []eventRecord
 	for _, e := range events {
-		if !cutoff.IsZero() && e.freshest().Before(cutoff) {
+		if !cutoff.IsZero() && e.freshest().Before(cutoff) && !failedCreateFor(e, notCurrent) {
 			continue
 		}
 		switch {
@@ -945,7 +957,15 @@ type podMetadata struct {
 
 type podStatus struct {
 	Phase             string            `yaml:"phase"`
+	Conditions        []podCondition    `yaml:"conditions"`
 	ContainerStatuses []containerStatus `yaml:"containerStatuses"`
+}
+
+// podCondition is one entry of a pod's status.conditions[]. Only the Ready
+// condition is read (see podKstatus).
+type podCondition struct {
+	Type   string `yaml:"type"`
+	Status string `yaml:"status"`
 }
 
 // ownerReference is the minimal projection of metadata.ownerReferences[] we
@@ -1136,13 +1156,8 @@ func (p *Processor) scanPodStatuses(ctx context.Context, namespaces []string, rs
 			out = append(out, rs)
 		}
 	}
-	// CronJob hygiene: judge each CronJob by its MOST RECENT run only. Failed
-	// Jobs (and their pods) linger via failedJobsHistoryLimit, so without this
-	// a CronJob that failed once and has been green since would flag the
-	// namespace ❌ forever — and the CronJob object itself can't counter it
-	// (kstatus has no CronJob rules → always Current, and spawned Jobs are
-	// never Flux inventory entries).
-	out = dropSupersededJobPods(out)
+	// Superseded CronJob runs are dropped later, once the Job list tells which
+	// Jobs a CronJob owns (see dropSupersededJobPods).
 	// Sort by (namespace, controller, name) so pods owned by the same
 	// workload cluster together in the rendered table. Empty controller
 	// (naked pods) sorts first within a namespace by string compare.
@@ -1176,14 +1191,16 @@ var cronJobSlotPattern = regexp.MustCompile(`^(.+)-(\d{5,})$`)
 // from a fixed run kept the comment red). Conversely a latest-run failure
 // still reads Failed, with the noise of its predecessors' pods removed.
 //
-// Grouping is by the naming contract above, scoped per namespace; pods whose
-// controller isn't a Job, or whose Job name has no slot suffix (one-shot
-// Jobs), pass through untouched. Filters in place — the caller owns the
-// slice.
-func dropSupersededJobPods(pods []readiness.ResourceStatus) []readiness.ResourceStatus {
+// Only Jobs a CronJob owns (cronRuns, from cronRunFallbackRows) are grouped,
+// by the naming contract above and per namespace: standalone Jobs that merely
+// carry a numeric suffix (e.g. `migrate-20260101`) are separate workloads, and
+// a newer one's healthy pod must not hide an older one's failure. Pods whose
+// controller isn't such a Job pass through untouched. Filters in place — the
+// caller owns the slice.
+func dropSupersededJobPods(pods []readiness.ResourceStatus, cronRuns map[string]bool) []readiness.ResourceStatus {
 	slotOf := func(r readiness.ResourceStatus) (family string, slot int64, ok bool) {
 		jobName, isJob := strings.CutPrefix(r.Controller, "Job/")
-		if !isJob {
+		if !isJob || !cronRuns[jobName] {
 			return "", 0, false
 		}
 		m := cronJobSlotPattern.FindStringSubmatch(jobName)
@@ -1223,8 +1240,9 @@ func dropSupersededJobPods(pods []readiness.ResourceStatus) []readiness.Resource
 // jobInfo is the slice of a batch/v1 Job the cron-run fallback needs.
 type jobInfo struct {
 	Metadata struct {
-		Name      string `yaml:"name"`
-		Namespace string `yaml:"namespace"`
+		Name            string           `yaml:"name"`
+		Namespace       string           `yaml:"namespace"`
+		OwnerReferences []ownerReference `yaml:"ownerReferences"`
 	} `yaml:"metadata"`
 	Status struct {
 		Conditions []struct {
@@ -1271,14 +1289,18 @@ func parseJobList(yamlStream []byte) ([]jobInfo, error) {
 // real deploy). The Job OBJECTS outlive their pods, so for each CronJob family
 // whose NEWEST run has no pod in the scan, this emits one synthetic row
 // judged from that Job's own conditions: Failed=True → Failed (stable across
-// pod cleanup), otherwise Current (completed, or still running — its pods
-// speak once visible). Families whose newest run HAS visible pods are
+// pod cleanup), Complete=True → Current, otherwise InProgress — a run still
+// active, or one created after the pod scan, has proven nothing yet, so it
+// can't read green. Families whose newest run HAS visible pods are
 // skipped: the pod rows already carry the verdict with container-level
-// detail. One MCP list per analysis; errors are fail-open (no rows — the pod
-// scan's view stands, which is today's behavior).
-func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows []readiness.ResourceStatus) []readiness.ResourceStatus {
+// detail. A CronJob run is a Job a CronJob owns and named after it
+// (`<cronjob>-<slot>`); the second return value holds their names for
+// dropSupersededJobPods. One MCP list per analysis; errors yield no rows and
+// no runs — no superseded run is dropped, so an old run's failure stays
+// visible rather than being hidden on a guess.
+func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows []readiness.ResourceStatus) ([]readiness.ResourceStatus, map[string]bool) {
 	if !p.cfg.ReadinessIncludePods || ns == "" {
-		return nil
+		return nil, nil
 	}
 	body, err := p.mcp.ListKubernetesResources(ctx, "batch/v1", "Job", ns)
 	if err != nil {
@@ -1286,34 +1308,39 @@ func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows 
 			p.logger.Debug("cron-run fallback: job list failed; relying on pod scan alone",
 				"namespace", ns, "error", err.Error())
 		}
-		return nil
+		return nil, nil
 	}
 	jobs, err := parseJobList(body)
 	if err != nil {
 		p.logger.Debug("cron-run fallback: job list unparseable; relying on pod scan alone",
 			"namespace", ns, "error", err.Error())
-		return nil
+		return nil, nil
 	}
 	type run struct {
 		slot int64
 		job  jobInfo
 	}
 	newest := make(map[string]run)
+	cronRuns := map[string]bool{}
 	for _, j := range jobs {
 		m := cronJobSlotPattern.FindStringSubmatch(j.Metadata.Name)
 		if m == nil {
 			continue // one-shot Job, not a CronJob run
 		}
+		if owner := primaryOwnerRef(j.Metadata.OwnerReferences); owner == nil || owner.Kind != "CronJob" || owner.Name != m[1] {
+			continue // a standalone Job that merely ends in digits
+		}
 		slot, perr := strconv.ParseInt(m[2], 10, 64)
 		if perr != nil {
 			continue
 		}
+		cronRuns[j.Metadata.Name] = true
 		if cur, seen := newest[m[1]]; !seen || slot > cur.slot {
 			newest[m[1]] = run{slot: slot, job: j}
 		}
 	}
 	if len(newest) == 0 {
-		return nil
+		return nil, cronRuns
 	}
 	// Families whose newest run already shows pods are judged by those rows.
 	covered := make(map[string]bool, len(podRows))
@@ -1330,7 +1357,7 @@ func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows 
 		row := readiness.ResourceStatus{
 			Kind: "Job", Name: r.job.Metadata.Name, Namespace: ns,
 			Controller: "CronJob/" + fam,
-			Status:     "Current", Message: "run completed or in progress",
+			Status:     "InProgress", Message: "run not finished; its pods weren't seen",
 		}
 		for _, c := range r.job.Status.Conditions {
 			if c.Type == "Failed" && c.Status == "True" {
@@ -1345,19 +1372,23 @@ func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows 
 				row.Message = msg + " (run's pods already removed)"
 				break
 			}
+			if c.Type == "Complete" && c.Status == "True" {
+				row.Status = "Current"
+				row.Message = "run completed"
+			}
 		}
 		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	return out, cronRuns
 }
 
 // dropOlderCronRunPods removes the pod rows of CronJob runs older than a run
 // cronRunFallbackRows reported (one whose own pods are already gone). Each
 // CronJob is judged by its newest run; without this, an older run's failed
 // pod — still around under failedJobsHistoryLimit — read ❌ next to a newer
-// run that succeeded.
-func dropOlderCronRunPods(pods, fallback []readiness.ResourceStatus) []readiness.ResourceStatus {
+// run that succeeded. Only pods of CronJob runs (cronRuns) are dropped.
+func dropOlderCronRunPods(pods, fallback []readiness.ResourceStatus, cronRuns map[string]bool) []readiness.ResourceStatus {
 	newest := make(map[string]int64, len(fallback))
 	for _, f := range fallback {
 		if fam, slot, ok := cronRunSlot(f.Name); ok {
@@ -1369,7 +1400,7 @@ func dropOlderCronRunPods(pods, fallback []readiness.ResourceStatus) []readiness
 	}
 	return slices.DeleteFunc(pods, func(r readiness.ResourceStatus) bool {
 		job, isJob := strings.CutPrefix(r.Controller, "Job/")
-		if !isJob {
+		if !isJob || !cronRuns[job] {
 			return false
 		}
 		fam, slot, ok := cronRunSlot(job)
@@ -1418,9 +1449,10 @@ func cronRunSlot(jobName string) (family string, slot int64, ok bool) {
 // anyWorkloadPodFailed). A window the budget cuts short is NOT settled
 // (fail closed): the namespace was still changing.
 //
-// The budget is the remainder of the shared readiness deadline. A non-positive
-// budget (the inventory poll already consumed it) still yields exactly one
-// snapshot. Pods disabled (or no namespaces to scan) is vacuously settled —
+// The budget is the remainder of the shared readiness deadline, and it bounds
+// each scan's MCP reads as well as the sleeps. A non-positive budget (the
+// inventory poll already consumed it) still yields exactly one snapshot,
+// bounded by minPodScan. Pods disabled (or no namespaces to scan) is vacuously settled —
 // pods simply aren't part of the verdict. A FAILED scan (MCP fetch/parse
 // error → scanned=false) is NOT settled: it's retried on the interval like an
 // unsettled pod, and if it never recovers within the budget the result is
@@ -1439,15 +1471,24 @@ func (p *Processor) waitPodsSettled(ctx context.Context, namespaces []string, in
 	changes := podChanges{}
 	for {
 		var shuttingDown bool
-		pods, scanned, shuttingDown = p.scanPodStatuses(ctx, namespaces, rsCache)
+		// The scan's MCP reads (pod list, ReplicaSet lookups) are bounded by
+		// the budget too, so a slow read can't eat into the time reserved for
+		// analysis; a scan cut short fails and leaves the wait unsettled.
+		scanStart := time.Now()
+		scanCtx, cancelScan := context.WithDeadline(ctx, laterOf(deadline, scanStart.Add(minPodScan)))
+		pods, scanned, shuttingDown = p.scanPodStatuses(scanCtx, namespaces, rsCache)
+		cancelScan()
 		if scanned {
 			now := time.Now()
 			windowStart := quietFrom
 			if last := changes.observe(pods, shuttingDown, now); last.After(windowStart) {
 				windowStart = last
 			}
+			// The rows were listed during the scan, so the window must have
+			// been quiet long enough when the scan STARTED: a pod created
+			// while a slow scan ran is in none of its rows.
 			if readiness.AllSettled(pods) &&
-				(anyWorkloadPodFailed(pods) || now.Sub(windowStart) >= quietPeriod) {
+				(anyWorkloadPodFailed(pods) || scanStart.Sub(windowStart) >= quietPeriod) {
 				return pods, scanned, true
 			}
 		}
@@ -1463,6 +1504,18 @@ func (p *Processor) waitPodsSettled(ctx context.Context, namespaces []string, in
 		case <-time.After(min(interval, time.Until(deadline))):
 		}
 	}
+}
+
+// minPodScan is the least time one pod scan gets, even when the readiness
+// budget is already spent, so the wait still takes its one snapshot.
+const minPodScan = time.Second
+
+// laterOf returns the later of two times.
+func laterOf(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // anyWorkloadPodFailed reports whether a pod not owned by a Job is Failed. Such
@@ -1579,7 +1632,8 @@ func isNoResourcesFound(err error) bool {
 // rsCache (keyed by "<namespace>/<rs-name>") dedupes the RS fetch across
 // pods of the same Deployment. On MCP fetch failure we fall back to the
 // direct owner ("ReplicaSet/<name>") rather than aborting — partial data
-// is better than no controller info at all.
+// is better than no controller info at all. Only successful lookups are
+// cached, so a failed one is retried on the next scan.
 func (p *Processor) resolvePodController(ctx context.Context, pod podInfo, rsCache map[string]string) string {
 	primary := primaryOwnerRef(pod.Metadata.OwnerReferences)
 	if primary == nil {
@@ -1597,9 +1651,10 @@ func (p *Processor) resolvePodController(ctx context.Context, pod podInfo, rsCac
 	rsYAML, err := p.mcp.GetKubernetesResource(ctx, "apps/v1", "ReplicaSet", primary.Name, pod.Metadata.Namespace)
 	fallback := "ReplicaSet/" + primary.Name
 	if err != nil {
+		// Not cached: a transient read failure must not pin the fallback for
+		// the whole settle wait — the next scan retries the lookup.
 		p.logger.Debug("pod controller: ReplicaSet fetch failed; falling back to RS identifier",
 			"replicaset", cacheKey, "error", err.Error())
-		rsCache[cacheKey] = fallback
 		return fallback
 	}
 	parentKind, parentName := replicaSetController(rsYAML)
@@ -1686,7 +1741,8 @@ func replicaSetControllerFromNode(n *yaml.Node) (kind, name string) {
 // as failing. The non-failing leg is straight Phase + Ready logic that
 // mirrors what sigs.k8s.io/cli-utils/pkg/kstatus emits for Pod resources.
 //
-//   - Phase=Running + all containers Ready  → Current
+//   - Phase=Running + all containers Ready  → Current, unless the pod's own
+//     Ready condition isn't True (a pending readiness gate) → InProgress
 //   - Phase=Succeeded                       → Current (completed Job pods)
 //   - Phase=Pending                         → InProgress
 //   - anything else                         → Unknown (with Phase as Message)
@@ -1714,12 +1770,19 @@ func podKstatus(pod podInfo, now time.Time) readiness.ResourceStatus {
 				break
 			}
 		}
-		if ready {
-			rs.Status = "Current"
-			rs.Message = "all containers ready"
-		} else {
+		switch {
+		case !ready:
 			rs.Status = "InProgress"
 			rs.Message = "containers not all ready"
+		case !podReadyConditionOK(pod):
+			// Ready containers aren't a ready pod: a readiness gate (e.g. a
+			// load balancer's target health) keeps the pod's own Ready
+			// condition False until it passes.
+			rs.Status = "InProgress"
+			rs.Message = "pod not ready"
+		default:
+			rs.Status = "Current"
+			rs.Message = "all containers ready"
 		}
 	case "Succeeded":
 		rs.Status = "Current"
@@ -1732,6 +1795,18 @@ func podKstatus(pod podInfo, now time.Time) readiness.ResourceStatus {
 		rs.Message = pod.Status.Phase
 	}
 	return rs
+}
+
+// podReadyConditionOK reports whether the pod's Ready condition, when the pod
+// reports one, is True. A Running pod always carries it; a snapshot without
+// conditions at all falls back to the container readiness alone.
+func podReadyConditionOK(pod podInfo) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == "Ready" {
+			return c.Status == "True"
+		}
+	}
+	return true
 }
 
 // maxTerminationMessageRunes caps the termination message quoted in a
