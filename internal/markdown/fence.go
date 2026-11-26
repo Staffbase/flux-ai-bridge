@@ -36,7 +36,9 @@ func (f Fence) String() string {
 // spaces) and closes with a run of the same character at least as long and
 // nothing after it. A backtick or tilde line that doesn't close the open
 // block is part of its content. A fence may also open right after a list
-// marker (`- ~~~`); its closer is then indented to the item's content.
+// marker (`- ~~~`); its closer is then indented to the item's content, and
+// the block also ends with the item: at the first non-blank line indented
+// less than the item's content (an outdented paragraph or a sibling item).
 type Tracker struct {
 	open   Fence
 	inside bool
@@ -46,6 +48,10 @@ type Tracker struct {
 // Line feeds the next line and reports whether it belongs to a fenced block,
 // counting the opening and closing delimiter lines as part of it.
 func (t *Tracker) Line(line string) bool {
+	if t.inside && t.indent > 0 && strings.TrimSpace(line) != "" &&
+		len(line)-len(strings.TrimLeft(line, " ")) < t.indent {
+		t.inside = false // the list item, and with it the block, ended
+	}
 	if t.inside {
 		f, rest, ok := delimiter(dedent(line, t.indent))
 		if ok && f.Char == t.open.Char && f.Len >= t.open.Len && strings.TrimSpace(rest) == "" {
@@ -107,14 +113,16 @@ func (t *Tracker) Open() (Fence, bool) {
 
 // CloseOpenFence appends a closing delimiter matching the fenced block s
 // leaves open, if any — e.g. for text cut off at a length limit, where the
-// open block would otherwise swallow everything appended after it.
+// open block would otherwise swallow everything appended after it. A block
+// inside a list item is closed at the item's content indent, so the closer
+// stays inside the item.
 func CloseOpenFence(s string) string {
 	var t Tracker
 	for _, line := range strings.Split(s, "\n") {
 		t.Line(line)
 	}
 	if f, open := t.Open(); open {
-		return s + "\n" + f.String()
+		return s + "\n" + strings.Repeat(" ", t.indent) + f.String()
 	}
 	return s
 }

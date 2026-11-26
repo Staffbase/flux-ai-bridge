@@ -32,6 +32,8 @@ func TestCloseOpenFence(t *testing.T) {
 		"inline backticks":    {"use ```x``` inline", "use ```x``` inline"},
 		"backtick info":       {"``` a`b\nx", "``` a`b\nx"},
 		"closer with text":    {"```\nx\n``` not a close", "```\nx\n``` not a close\n```"},
+		"open in list item":   {"- ~~~\n  code", "- ~~~\n  code\n  ~~~"},
+		"open in ordered":     {"10. ```\n    code", "10. ```\n    code\n    ```"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := CloseOpenFence(tc.in); got != tc.want {
@@ -55,6 +57,12 @@ func TestTrackerListItemFences(t *testing.T) {
 		"ordered wide":   {"10. ~~~\n    code\n    ~~~\nprose", []bool{true, true, true, false}},
 		"list no fence":  {"- item\n  ~~~\n  code\n  ~~~\nprose", []bool{false, true, true, true, false}},
 		"thematic break": {"---\nprose", []bool{false, false}},
+		// An unclosed fence ends with its list item: an outdented line leaves
+		// the item, and is read again outside the fence.
+		"item ends":       {"- ~~~\n  code\n\nOutside: ping @ops", []bool{true, true, true, false}},
+		"sibling item":    {"- ~~~\n  code\n- ping @ops", []bool{true, true, false}},
+		"sibling fence":   {"- ~~~\n  code\n- ```\n  more\n  ```\nprose", []bool{true, true, true, true, true, false}},
+		"top level stays": {"~~~\ncode\n\nstill code", []bool{true, true, true, true}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var tr Tracker
