@@ -47,8 +47,11 @@ jobs:
 
       # A push made with the GITHUB_TOKEN doesn't trigger workflows, so start
       # the ci workflow (dev image build) explicitly when dev moved. A manual
-      # rerun always dispatches, to recover from a failed dispatch.
+      # rerun always dispatches, to recover from a failed dispatch. Also runs
+      # when the Autodev step failed: it pushes dev before it sets the PR
+      # labels, so dev may have moved anyway (the job still fails).
       - name: Build the dev image
+        if: ${{ !cancelled() && steps.before.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BEFORE: ${{ steps.before.outputs.sha }}

@@ -97,16 +97,17 @@ spec:
     {{- end }}
     {{- /*
     External dedupe backend (the bundled Valkey is covered by the
-    release-namespace rule): the configured data ports, plus the Sentinel
-    ports in Sentinel mode (networkPolicy.egress.redis), plus any port
-    written in the URL or the Sentinel addresses — the bridge dials exactly
-    those. The master's data port is whatever Sentinel hands out, so it can
-    only come from the configured list.
+    release-namespace rule, but an explicit persistence.url overrides it in
+    the Deployment, so it gets these rules too): the configured data ports,
+    plus the Sentinel ports in Sentinel mode (networkPolicy.egress.redis),
+    plus any port written in the URL or the Sentinel addresses — the bridge
+    dials exactly those. The master's data port is whatever Sentinel hands
+    out, so it can only come from the configured list.
     */}}
     {{- $persistence := .Values.config.dedupe.persistence | default dict }}
     {{- $sentinel := $persistence.sentinel | default dict }}
     {{- $redis := .Values.networkPolicy.egress.redis | default dict }}
-    {{- if and $persistence.enabled (not .Values.valkey.enabled) }}
+    {{- if and $persistence.enabled (or (not .Values.valkey.enabled) $persistence.url) }}
     {{- $ports := list }}
     {{- range $redis.ports }}{{ $ports = append $ports (toString .) }}{{ end }}
     {{- if $sentinel.enabled }}

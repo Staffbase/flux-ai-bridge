@@ -73,7 +73,7 @@ jobs:
 
 - With `labels: true`, autodev marks each pull request `successful` or `failed` for its **merge** into `dev`. The bridge's `flux-*` labels report the **deployment**; the two sets are independent.
 - Don't protect the `dev` branch against force-pushes: autodev rebuilds it on every run.
-- Pull requests from forks get a read-only `GITHUB_TOKEN`, so autodev can't merge them. Push the branch to the repository instead.
+- autodev merges each pull request's branch from this repository (`origin/<branch>`), so it can't merge pull requests from forks; their label events also get a read-only `GITHUB_TOKEN`. Push the branch to the repository instead.
 - A push made with the `GITHUB_TOKEN` doesn't start other workflows. Flux pulls `dev` itself, so this doesn't matter for deployments. If a workflow must run on `dev` (an image build, for example), start it from the autodev job with `gh workflow run <workflow> --ref dev` (needs `actions: write`); see this repository's own [autodev workflow](../.github/workflows/autodev.yml).
 
 ## 2. Point the dev cluster at the dev branch

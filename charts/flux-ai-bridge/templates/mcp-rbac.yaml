@@ -5,6 +5,9 @@ values.yaml). The bridge only calls read tools, but it polls every object in
 a Kustomization's inventory — which can be any kind, CRDs included — so the
 role grants get/list/watch on everything (subresources such as pods/log
 included). The MCP server masks Secret values in its responses by default.
+The wildcard also grants `get` on nodes/proxy, which the kubelet accepts for
+exec over WebSocket: RBAC can't exclude it without listing API groups. Set
+mcpRbac.create=false to bind a narrower role.
 */ -}}
 {{- $mcp := index .Values "flux-operator-mcp" | default dict }}
 {{- if and $mcp.enabled .Values.mcpRbac.create }}

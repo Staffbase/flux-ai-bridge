@@ -37,8 +37,9 @@ OLLAMA_MODEL ?= qwen2.5-coder:1.5b
 #
 # OLLAMA_CHART resolves to a single path or empty (firstword handles the
 # rare case where stale tarballs from prior dep-update runs linger).
-# The e2e-up recipe sanity-checks emptiness and points the user at
-# `make chart-deps` when the archives are missing.
+# The e2e-up recipe checks for emptiness before it builds or creates
+# anything, and points the user at `make chart-deps` when the archives
+# are missing.
 OLLAMA_CHART     := $(firstword $(wildcard $(REPO_ROOT)/charts/flux-ai-bridge/charts/ollama-*.tgz))
 OLLAMA_VERSION   := $(if $(OLLAMA_CHART),$(shell tar -xzOf $(OLLAMA_CHART) ollama/Chart.yaml 2>/dev/null | awk '/^appVersion:/ {print $$2}'))
 OLLAMA_IMAGE     ?= ollama/ollama:$(OLLAMA_VERSION)
@@ -249,6 +250,132 @@ test-all: ## Full pre-PR check: vet, unit tests, golangci-lint, helm lint + a fu
 	@echo ""
 	@echo "==> test-all PASS (cluster left running — \`make e2e-down\` to clean up)"
 
+# Renders e2e/manifests/03-flux-ai-bridge.yaml.tpl for the current mode
+# (E2E_REAL_GITHUB, E2E_LLM, E2E_DEDUPE_PERSISTENCE) and applies it. Shared
+# by e2e-up and e2e-update, so a new mode or template variable is added once.
+define E2E_RENDER_BRIDGE
+@set -e; \
+if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
+  if [ -z "$$GITHUB_APP_ID" ] || [ -z "$$GITHUB_APP_INSTALLATION_ID" ] || [ -z "$$GITHUB_APP_PRIVATE_KEY" ]; then \
+    echo "ERROR: real-GitHub mode requires all of GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY (App auth only — PAT support was removed)." >&2; \
+    exit 1; \
+  fi; \
+  if [ -z "$$GITHUB_REPO" ] && [ -n "$$GITHUB_USER" ] && [ -n "$$GH_REPO" ]; then \
+    GITHUB_REPO="$$GITHUB_USER/$$GH_REPO"; \
+  fi; \
+  E2E_GITHUB_REPO="$$GITHUB_REPO"; \
+  E2E_GITHUB_API_URL=""; \
+  E2E_PODINFO_GIT_URL="https://github.com/$$GITHUB_REPO.git"; \
+  E2E_PODINFO_GIT_REF="$${E2E_PODINFO_GIT_REF:-main}"; \
+  E2E_PODINFO_GIT_PROVIDER="github"; \
+  E2E_PODINFO_PATH="$${E2E_PODINFO_PATH:-./e2e/podinfo-kustomize}"; \
+else \
+  E2E_GITHUB_REPO="test-owner/test-repo"; \
+  E2E_GITHUB_API_URL="http://mock-github.mock.svc.cluster.local/"; \
+  E2E_PODINFO_GIT_URL="http://git-server.git-server.svc.cluster.local/flux-ai-bridge.git"; \
+  E2E_PODINFO_GIT_REF="main"; \
+  E2E_PODINFO_GIT_PROVIDER="generic"; \
+  E2E_PODINFO_PATH="./e2e/podinfo-kustomize"; \
+fi; \
+case "$$E2E_LLM" in \
+  ollama) \
+    E2E_LLM_PROVIDER="openai-compatible"; \
+    E2E_LLM_MODEL="$${E2E_LLM_MODEL:-$(OLLAMA_MODEL)}"; \
+    E2E_ANTHROPIC_API_KEY="unused-with-ollama"; \
+    E2E_ANTHROPIC_BASE_URL=""; \
+    E2E_OPENAI_BASE_URL=""; \
+    E2E_OPENAI_API_KEY="unused-with-ollama"; \
+    E2E_OLLAMA_ENABLED="true" ;; \
+  azure) \
+    E2E_LLM_PROVIDER="openai-compatible"; \
+    E2E_LLM_MODEL="$${E2E_LLM_MODEL:-gpt-4o-mini}"; \
+    E2E_ANTHROPIC_API_KEY="unused-with-azure"; \
+    E2E_ANTHROPIC_BASE_URL=""; \
+    E2E_OPENAI_BASE_URL="$${OPENAI_BASE_URL:-$${E2E_OPENAI_BASE_URL:-}}"; \
+    E2E_OPENAI_API_KEY="$$OPENAI_API_KEY"; \
+    E2E_OLLAMA_ENABLED="false" ;; \
+  none) \
+    E2E_LLM_PROVIDER="none"; \
+    E2E_LLM_MODEL=""; \
+    E2E_ANTHROPIC_API_KEY=""; \
+    E2E_ANTHROPIC_BASE_URL=""; \
+    E2E_OPENAI_BASE_URL=""; \
+    E2E_OPENAI_API_KEY=""; \
+    E2E_OLLAMA_ENABLED="false" ;; \
+  *) \
+    E2E_LLM_PROVIDER="claude"; \
+    E2E_LLM_MODEL=""; \
+    E2E_ANTHROPIC_API_KEY="e2e-fake-anthropic-key"; \
+    E2E_ANTHROPIC_BASE_URL="http://mock-llm.mock.svc.cluster.local"; \
+    E2E_OPENAI_BASE_URL=""; \
+    E2E_OPENAI_API_KEY=""; \
+    E2E_OLLAMA_ENABLED="false" ;; \
+esac; \
+E2E_LOG_LEVEL="$${E2E_LOG_LEVEL:-info}"; \
+E2E_KEEP_COMMENT_HISTORY="$${E2E_KEEP_COMMENT_HISTORY:-false}"; \
+if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
+  E2E_GITHUB_APP_ID="$$GITHUB_APP_ID"; \
+  E2E_GITHUB_APP_INSTALLATION_ID="$$GITHUB_APP_INSTALLATION_ID"; \
+  E2E_GITHUB_APP_PRIVATE_KEY_INDENTED=$$(printf '%s\n' "$$GITHUB_APP_PRIVATE_KEY" | sed 's/^/    /'); \
+else \
+  if [ ! -f "$(REPO_ROOT)/e2e/fixtures/mock-app-key.pem" ]; then \
+    echo "==> Generating throwaway mock-github App key (e2e/fixtures/mock-app-key.pem)"; \
+    mkdir -p "$(REPO_ROOT)/e2e/fixtures"; \
+    openssl genrsa -out "$(REPO_ROOT)/e2e/fixtures/mock-app-key.pem" 2048 2>/dev/null; \
+  fi; \
+  E2E_GITHUB_APP_ID="1"; \
+  E2E_GITHUB_APP_INSTALLATION_ID="1"; \
+  E2E_GITHUB_APP_PRIVATE_KEY_INDENTED=$$(sed 's/^/    /' "$(REPO_ROOT)/e2e/fixtures/mock-app-key.pem"); \
+fi; \
+if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
+  E2E_PODINFO_GIT_AUTH_SECRET=$$(printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: flux-ai-bridge-e2e-podinfo-git-creds\n  namespace: flux-system\ntype: Opaque\nstringData:\n  githubAppID: "%s"\n  githubAppInstallationID: "%s"\n  githubAppPrivateKey: |\n%s\n---' "$$E2E_GITHUB_APP_ID" "$$E2E_GITHUB_APP_INSTALLATION_ID" "$$E2E_GITHUB_APP_PRIVATE_KEY_INDENTED"); \
+  E2E_PODINFO_GIT_SECRETREF=$$(printf '  secretRef:\n    name: flux-ai-bridge-e2e-podinfo-git-creds'); \
+else \
+  E2E_PODINFO_GIT_AUTH_SECRET=""; \
+  E2E_PODINFO_GIT_SECRETREF=""; \
+fi; \
+if [ "$$E2E_DEDUPE_PERSISTENCE" = "1" ]; then \
+  E2E_VALKEY_ENABLED="false"; \
+  E2E_DEDUPE_PERSISTENCE_ENABLED="true"; \
+  E2E_DEDUPE_SENTINEL_ENABLED="true"; \
+  E2E_DEDUPE_SENTINEL_ADDRS="valkey-node-0.valkey-headless.valkey.svc.cluster.local:26379,valkey-node-1.valkey-headless.valkey.svc.cluster.local:26379,valkey-node-2.valkey-headless.valkey.svc.cluster.local:26379"; \
+  E2E_DEDUPE_SENTINEL_MASTER_NAME="myprimary"; \
+  E2E_DEDUPE_PERSISTENCE_USER="bridge"; \
+  E2E_DEDUPE_SENTINEL_USER="bridge"; \
+  E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET="flux-ai-bridge-dedupe"; \
+  E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY="bridge-password"; \
+  E2E_DEDUPE_SENTINEL_PASSWORD_KEY="bridge-password"; \
+  E2E_WEBHOOK_MAX_CONCURRENT=""; \
+else \
+  E2E_VALKEY_ENABLED="false"; \
+  E2E_DEDUPE_PERSISTENCE_ENABLED="false"; \
+  E2E_DEDUPE_SENTINEL_ENABLED="false"; \
+  E2E_DEDUPE_SENTINEL_ADDRS=""; \
+  E2E_DEDUPE_SENTINEL_MASTER_NAME=""; \
+  E2E_DEDUPE_PERSISTENCE_USER=""; \
+  E2E_DEDUPE_SENTINEL_USER=""; \
+  E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET=""; \
+  E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY=""; \
+  E2E_DEDUPE_SENTINEL_PASSWORD_KEY=""; \
+  E2E_WEBHOOK_MAX_CONCURRENT=""; \
+fi; \
+export E2E_GITHUB_REPO E2E_GITHUB_API_URL \
+       E2E_LLM_PROVIDER E2E_LLM_MODEL E2E_ANTHROPIC_API_KEY \
+       E2E_ANTHROPIC_BASE_URL E2E_OPENAI_BASE_URL E2E_OPENAI_API_KEY \
+       E2E_OLLAMA_ENABLED E2E_LOG_LEVEL E2E_KEEP_COMMENT_HISTORY \
+       E2E_VALKEY_ENABLED E2E_DEDUPE_PERSISTENCE_ENABLED \
+       E2E_DEDUPE_SENTINEL_ENABLED E2E_DEDUPE_SENTINEL_ADDRS \
+       E2E_DEDUPE_SENTINEL_MASTER_NAME \
+       E2E_DEDUPE_PERSISTENCE_USER E2E_DEDUPE_SENTINEL_USER \
+       E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY \
+       E2E_DEDUPE_SENTINEL_PASSWORD_KEY E2E_WEBHOOK_MAX_CONCURRENT \
+       E2E_GITHUB_APP_ID E2E_GITHUB_APP_INSTALLATION_ID E2E_GITHUB_APP_PRIVATE_KEY_INDENTED \
+       E2E_PODINFO_GIT_URL E2E_PODINFO_GIT_REF E2E_PODINFO_GIT_PROVIDER E2E_PODINFO_PATH \
+       E2E_PODINFO_GIT_AUTH_SECRET E2E_PODINFO_GIT_SECRETREF; \
+envsubst < $(MANIFESTS)/03-flux-ai-bridge.yaml.tpl \
+  | kubectl --context $(CONTEXT) apply -f -
+endef
+
 .PHONY: e2e-up
 e2e-up: ## Provision the kind e2e cluster and install the bridge + dependencies
 	@for cmd in kind kubectl helm docker git envsubst jq; do \
@@ -282,6 +409,11 @@ e2e-up: ## Provision the kind e2e cluster and install the bridge + dependencies
 	fi
 	@case "$$E2E_LLM" in \
 	  ollama) \
+	    if [ -z "$(OLLAMA_VERSION)" ]; then \
+	      echo "ERROR: could not resolve Ollama image tag from $(REPO_ROOT)/charts/flux-ai-bridge/charts/ollama-*.tgz" >&2; \
+	      echo "       Run 'make chart-deps' to fetch the sub-charts pinned in Chart.yaml, then retry." >&2; \
+	      exit 1; \
+	    fi; \
 	    echo "==> Real LLM mode: ollama serving $(OLLAMA_MODEL)" ;; \
 	  azure) \
 	    : "$${OPENAI_API_KEY:?required when E2E_LLM=azure — see docs/e2e-real-llm.md}"; \
@@ -322,11 +454,6 @@ e2e-up: ## Provision the kind e2e cluster and install the bridge + dependencies
 	@#   3. docker save | kind load image-archive lands the flattened image
 	@#      in containerd's k8s.io namespace; kubelet then finds it locally.
 	@if [ "$$E2E_LLM" = "ollama" ]; then \
-	  if [ -z "$(OLLAMA_VERSION)" ]; then \
-	    echo "ERROR: could not resolve Ollama image tag from $(REPO_ROOT)/charts/flux-ai-bridge/charts/ollama-*.tgz" >&2; \
-	    echo "       Run 'make chart-deps' to fetch the sub-charts pinned in Chart.yaml, then retry." >&2; \
-	    exit 1; \
-	  fi; \
 	  platform="linux/$$(docker version --format '{{.Server.Arch}}')"; \
 	  echo "==> Pre-loading Ollama image into kind node: $(OLLAMA_IMAGE) ($$platform)"; \
 	  docker pull --platform "$$platform" $(OLLAMA_IMAGE); \
@@ -334,7 +461,7 @@ e2e-up: ## Provision the kind e2e cluster and install the bridge + dependencies
 	  cid=$$(docker create --platform "$$platform" $(OLLAMA_IMAGE)); \
 	  docker commit "$$cid" $(OLLAMA_IMAGE) >/dev/null; \
 	  docker rm "$$cid" >/dev/null; \
-	  tmp=$$(mktemp --suffix=.tar); \
+	  tmp=$$(mktemp "$${TMPDIR:-/tmp}/ollama-image.XXXXXX"); \
 	  trap 'rm -f "$$tmp"' EXIT; \
 	  docker save $(OLLAMA_IMAGE) -o "$$tmp"; \
 	  kind load image-archive "$$tmp" --name $(CLUSTER_NAME); \
@@ -408,117 +535,7 @@ e2e-up: ## Provision the kind e2e cluster and install the bridge + dependencies
 	@# independently. GitHub auth is App-only (PAT support was removed);
 	@# real mode reads the operator's shell GITHUB_APP_* vars, mock mode
 	@# uses a generated throwaway PEM under e2e/fixtures.
-	@set -e; \
-	if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
-	  if [ -z "$$GITHUB_REPO" ] && [ -n "$$GITHUB_USER" ] && [ -n "$$GH_REPO" ]; then \
-	    GITHUB_REPO="$$GITHUB_USER/$$GH_REPO"; \
-	  fi; \
-	  E2E_GITHUB_REPO="$$GITHUB_REPO"; \
-	  E2E_GITHUB_API_URL=""; \
-	  E2E_PODINFO_GIT_URL="https://github.com/$$GITHUB_REPO.git"; \
-	  E2E_PODINFO_GIT_REF="$${E2E_PODINFO_GIT_REF:-main}"; \
-	  E2E_PODINFO_GIT_PROVIDER="github"; \
-	  E2E_PODINFO_PATH="$${E2E_PODINFO_PATH:-./e2e/podinfo-kustomize}"; \
-	else \
-	  E2E_GITHUB_REPO="test-owner/test-repo"; \
-	  E2E_GITHUB_API_URL="http://mock-github.mock.svc.cluster.local/"; \
-	  E2E_PODINFO_GIT_URL="http://git-server.git-server.svc.cluster.local/flux-ai-bridge.git"; \
-	  E2E_PODINFO_GIT_REF="main"; \
-	  E2E_PODINFO_GIT_PROVIDER="generic"; \
-	  E2E_PODINFO_PATH="./e2e/podinfo-kustomize"; \
-	fi; \
-	case "$$E2E_LLM" in \
-	  ollama) \
-	    E2E_LLM_PROVIDER="openai-compatible"; \
-	    E2E_LLM_MODEL="$${E2E_LLM_MODEL:-$(OLLAMA_MODEL)}"; \
-	    E2E_ANTHROPIC_API_KEY="unused-with-ollama"; \
-	    E2E_ANTHROPIC_BASE_URL=""; \
-	    E2E_OPENAI_BASE_URL=""; \
-	    E2E_OPENAI_API_KEY="unused-with-ollama"; \
-	    E2E_OLLAMA_ENABLED="true" ;; \
-	  azure) \
-	    E2E_LLM_PROVIDER="openai-compatible"; \
-	    E2E_LLM_MODEL="$${E2E_LLM_MODEL:-gpt-4o-mini}"; \
-	    E2E_ANTHROPIC_API_KEY="unused-with-azure"; \
-	    E2E_ANTHROPIC_BASE_URL=""; \
-	    E2E_OPENAI_BASE_URL="$${OPENAI_BASE_URL:-$${E2E_OPENAI_BASE_URL:-}}"; \
-	    E2E_OPENAI_API_KEY="$$OPENAI_API_KEY"; \
-	    E2E_OLLAMA_ENABLED="false" ;; \
-	  none) \
-	    E2E_LLM_PROVIDER="none"; \
-	    E2E_LLM_MODEL=""; \
-	    E2E_ANTHROPIC_API_KEY=""; \
-	    E2E_ANTHROPIC_BASE_URL=""; \
-	    E2E_OPENAI_BASE_URL=""; \
-	    E2E_OPENAI_API_KEY=""; \
-	    E2E_OLLAMA_ENABLED="false" ;; \
-	  *) \
-	    E2E_LLM_PROVIDER="claude"; \
-	    E2E_LLM_MODEL=""; \
-	    E2E_ANTHROPIC_API_KEY="e2e-fake-anthropic-key"; \
-	    E2E_ANTHROPIC_BASE_URL="http://mock-llm.mock.svc.cluster.local"; \
-	    E2E_OPENAI_BASE_URL=""; \
-	    E2E_OPENAI_API_KEY=""; \
-	    E2E_OLLAMA_ENABLED="false" ;; \
-	esac; \
-	E2E_LOG_LEVEL="$${E2E_LOG_LEVEL:-info}"; \
-	E2E_KEEP_COMMENT_HISTORY="$${E2E_KEEP_COMMENT_HISTORY:-false}"; \
-	if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
-	  E2E_GITHUB_APP_ID="$$GITHUB_APP_ID"; \
-	  E2E_GITHUB_APP_INSTALLATION_ID="$$GITHUB_APP_INSTALLATION_ID"; \
-	  E2E_GITHUB_APP_PRIVATE_KEY_INDENTED=$$(printf '%s\n' "$$GITHUB_APP_PRIVATE_KEY" | sed 's/^/    /'); \
-	else \
-	  E2E_GITHUB_APP_ID="1"; \
-	  E2E_GITHUB_APP_INSTALLATION_ID="1"; \
-	  E2E_GITHUB_APP_PRIVATE_KEY_INDENTED=$$(sed 's/^/    /' "$(REPO_ROOT)/e2e/fixtures/mock-app-key.pem"); \
-	fi; \
-	if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
-	  E2E_PODINFO_GIT_AUTH_SECRET=$$(printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: flux-ai-bridge-e2e-podinfo-git-creds\n  namespace: flux-system\ntype: Opaque\nstringData:\n  githubAppID: "%s"\n  githubAppInstallationID: "%s"\n  githubAppPrivateKey: |\n%s\n---' "$$E2E_GITHUB_APP_ID" "$$E2E_GITHUB_APP_INSTALLATION_ID" "$$E2E_GITHUB_APP_PRIVATE_KEY_INDENTED"); \
-	  E2E_PODINFO_GIT_SECRETREF=$$(printf '  secretRef:\n    name: flux-ai-bridge-e2e-podinfo-git-creds'); \
-	else \
-	  E2E_PODINFO_GIT_AUTH_SECRET=""; \
-	  E2E_PODINFO_GIT_SECRETREF=""; \
-	fi; \
-	if [ "$$E2E_DEDUPE_PERSISTENCE" = "1" ]; then \
-	  E2E_VALKEY_ENABLED="false"; \
-	  E2E_DEDUPE_PERSISTENCE_ENABLED="true"; \
-	  E2E_DEDUPE_SENTINEL_ENABLED="true"; \
-	  E2E_DEDUPE_SENTINEL_ADDRS="valkey-node-0.valkey-headless.valkey.svc.cluster.local:26379,valkey-node-1.valkey-headless.valkey.svc.cluster.local:26379,valkey-node-2.valkey-headless.valkey.svc.cluster.local:26379"; \
-	  E2E_DEDUPE_SENTINEL_MASTER_NAME="myprimary"; \
-	  E2E_DEDUPE_PERSISTENCE_USER="bridge"; \
-	  E2E_DEDUPE_SENTINEL_USER="bridge"; \
-	  E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET="flux-ai-bridge-dedupe"; \
-	  E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY="bridge-password"; \
-	  E2E_DEDUPE_SENTINEL_PASSWORD_KEY="bridge-password"; \
-	  E2E_WEBHOOK_MAX_CONCURRENT=""; \
-	else \
-	  E2E_VALKEY_ENABLED="false"; \
-	  E2E_DEDUPE_PERSISTENCE_ENABLED="false"; \
-	  E2E_DEDUPE_SENTINEL_ENABLED="false"; \
-	  E2E_DEDUPE_SENTINEL_ADDRS=""; \
-	  E2E_DEDUPE_SENTINEL_MASTER_NAME=""; \
-	  E2E_DEDUPE_PERSISTENCE_USER=""; \
-	  E2E_DEDUPE_SENTINEL_USER=""; \
-	  E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET=""; \
-	  E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY=""; \
-	  E2E_DEDUPE_SENTINEL_PASSWORD_KEY=""; \
-	  E2E_WEBHOOK_MAX_CONCURRENT=""; \
-	fi; \
-	export E2E_GITHUB_REPO E2E_GITHUB_API_URL \
-	       E2E_LLM_PROVIDER E2E_LLM_MODEL E2E_ANTHROPIC_API_KEY \
-	       E2E_ANTHROPIC_BASE_URL E2E_OPENAI_BASE_URL E2E_OPENAI_API_KEY \
-	       E2E_OLLAMA_ENABLED E2E_LOG_LEVEL E2E_KEEP_COMMENT_HISTORY \
-	       E2E_VALKEY_ENABLED E2E_DEDUPE_PERSISTENCE_ENABLED \
-	       E2E_DEDUPE_SENTINEL_ENABLED E2E_DEDUPE_SENTINEL_ADDRS \
-	       E2E_DEDUPE_SENTINEL_MASTER_NAME \
-	       E2E_DEDUPE_PERSISTENCE_USER E2E_DEDUPE_SENTINEL_USER \
-	       E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY \
-	       E2E_DEDUPE_SENTINEL_PASSWORD_KEY E2E_WEBHOOK_MAX_CONCURRENT \
-	       E2E_GITHUB_APP_ID E2E_GITHUB_APP_INSTALLATION_ID E2E_GITHUB_APP_PRIVATE_KEY_INDENTED \
-	       E2E_PODINFO_GIT_URL E2E_PODINFO_GIT_REF E2E_PODINFO_GIT_PROVIDER E2E_PODINFO_PATH \
-	       E2E_PODINFO_GIT_AUTH_SECRET E2E_PODINFO_GIT_SECRETREF; \
-	envsubst < $(MANIFESTS)/03-flux-ai-bridge.yaml.tpl \
-	  | kubectl --context $(CONTEXT) apply -f -
+	$(E2E_RENDER_BRIDGE)
 	@echo "==> Waiting for git-server"
 	kubectl --context $(CONTEXT) -n git-server wait \
 	  --for=condition=Available deployment/git-server \
@@ -597,16 +614,27 @@ e2e: ## Run the e2e test suite against the running cluster
 	@# cluster HelmRelease, this unsuspends + force-reconciles so
 	@# kustomize-controller drift-corrects the HelmRelease back to source.
 	@# Idempotent — when nothing is broken, the patch + annotate are
-	@# no-ops and the wait returns immediately.
+	@# no-ops and the waits return quickly. A failure stops here, so the
+	@# healthy assertions never run against broken pods. The Kustomization
+	@# keeps a stale Ready=True while suspended, so wait for it to handle
+	@# this reconcile request first, then for the podinfo HelmRelease (the
+	@# Kustomization doesn't wait for it) and its Deployment.
 	@echo "==> Ensuring podinfo Kustomization is unsuspended"
 	@kubectl --context $(CONTEXT) -n flux-system patch kustomization/podinfo \
-	  --type=merge -p '{"spec":{"suspend":false}}' >/dev/null 2>&1 || true
+	  --type=merge -p '{"spec":{"suspend":false}}' >/dev/null
 	@echo "==> Forcing reconcile to restore source state"
-	@kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
-	  kustomization/podinfo reconcile.fluxcd.io/requestedAt=$$(date +%s) >/dev/null 2>&1 || true
-	@echo "==> Waiting for podinfo Kustomization to be Ready (max 2m)"
-	@kubectl --context $(CONTEXT) -n flux-system wait kustomization/podinfo \
-	  --for=condition=Ready --timeout=2m 2>/dev/null || true
+	@set -e; ts=$$(date +%s); \
+	kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
+	  kustomization/podinfo reconcile.fluxcd.io/requestedAt=$$ts >/dev/null; \
+	echo "==> Waiting for podinfo Kustomization to reconcile and be Ready (max 2m each)"; \
+	kubectl --context $(CONTEXT) -n flux-system wait kustomization/podinfo \
+	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=2m; \
+	kubectl --context $(CONTEXT) -n flux-system wait kustomization/podinfo \
+	  --for=condition=Ready --timeout=2m
+	@echo "==> Waiting for the podinfo HelmRelease and Deployment (max 5m + 2m)"
+	@kubectl --context $(CONTEXT) -n podinfo wait helmrelease/podinfo \
+	  --for=condition=Ready --timeout=5m
+	@kubectl --context $(CONTEXT) -n podinfo rollout status deployment/podinfo --timeout=2m
 	@# -count=1 disables Go's test result cache, otherwise repeated `make e2e`
 	@# returns "(cached)" without sending any traffic to the live cluster.
 	go test -tags e2e -count=1 -timeout 5m ./e2e/...
@@ -641,7 +669,7 @@ e2e-broken: ## Drive podinfo into a failed state (suspend + patch) to exercise t
 	kubectl --context $(CONTEXT) -n podinfo annotate --overwrite \
 	  helmrelease/podinfo reconcile.fluxcd.io/requestedAt=$$(date +%s)
 	@echo "==> Waiting for podinfo pods to enter CrashLoopBackOff (max 90s)"
-	@deadline=$$(( $$(date +%s) + 90 )); \
+	@deadline=$$(( $$(date +%s) + 90 )); broken=""; \
 	while [ $$(date +%s) -lt $$deadline ]; do \
 	  reasons=$$(kubectl --context $(CONTEXT) -n podinfo get pods \
 	    -l app.kubernetes.io/name=podinfo \
@@ -649,10 +677,17 @@ e2e-broken: ## Drive podinfo into a failed state (suspend + patch) to exercise t
 	  case "$$reasons" in \
 	    *CrashLoopBackOff*|*Error*) \
 	      echo "    Podinfo pods unhealthy ($$reasons) — broken state achieved."; \
+	      broken=1; \
 	      break ;; \
 	  esac; \
 	  sleep 5; \
-	done
+	done; \
+	if [ -z "$$broken" ]; then \
+	  echo "ERROR: no podinfo pod reached CrashLoopBackOff or Error within 90s" >&2; \
+	  kubectl --context $(CONTEXT) -n podinfo get pods -l app.kubernetes.io/name=podinfo -o wide >&2 || true; \
+	  kubectl --context $(CONTEXT) -n podinfo describe helmrelease/podinfo >&2 || true; \
+	  exit 1; \
+	fi
 	@echo "==> Running e2e tests against broken cluster state (comments must report ❌)"
 	E2E_EXPECT_BROKEN=1 go test -tags e2e -count=1 -timeout 15m ./e2e/...
 	@echo ""
@@ -672,9 +707,10 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	@#   3. Restart the git-server pod. Its init container re-tars the
 	@#      bind-mounted repo into a fresh git history, so any chart edits
 	@#      become visible to Flux source-controller.
-	@#   4. Annotate GitRepository + HelmRelease with a reconcile timestamp
-	@#      so source-controller and helm-controller act immediately
-	@#      instead of waiting for their poll intervals (30s / 1m).
+	@#   4. Annotate GitRepository, HelmChart and HelmRelease with a reconcile
+	@#      timestamp, one after the other, and wait until each has handled
+	@#      it, so the release runs the new chart before step 5 restarts it
+	@#      (instead of waiting for their poll intervals, 30s / 1m).
 	@#   5. Force a deployment rollout. The image tag is unchanged and the
 	@#      chart sets pullPolicy=Never, so the kubelet has no signal that
 	@#      anything changed unless we tell it to recreate the pods.
@@ -696,131 +732,27 @@ e2e-update: ## Rebuild the bridge image and rollout-restart it in the e2e cluste
 	  $(MAKE) e2e-valkey-setup; \
 	fi
 	@echo "==> Re-rendering + re-applying bridge HelmRelease + podinfo source/Kustomization"
-	@set -e; \
-	if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
-	  if [ -z "$$GITHUB_APP_ID" ] || [ -z "$$GITHUB_APP_INSTALLATION_ID" ] || [ -z "$$GITHUB_APP_PRIVATE_KEY" ]; then \
-	    echo "ERROR: real-GitHub mode requires all of GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY (App auth only — PAT support was removed)." >&2; \
-	    exit 1; \
-	  fi; \
-	  if [ -z "$$GITHUB_REPO" ] && [ -n "$$GITHUB_USER" ] && [ -n "$$GH_REPO" ]; then \
-	    GITHUB_REPO="$$GITHUB_USER/$$GH_REPO"; \
-	  fi; \
-	  E2E_GITHUB_REPO="$$GITHUB_REPO"; \
-	  E2E_GITHUB_API_URL=""; \
-	  E2E_PODINFO_GIT_URL="https://github.com/$$GITHUB_REPO.git"; \
-	  E2E_PODINFO_GIT_REF="$${E2E_PODINFO_GIT_REF:-main}"; \
-	  E2E_PODINFO_GIT_PROVIDER="github"; \
-	  E2E_PODINFO_PATH="$${E2E_PODINFO_PATH:-./e2e/podinfo-kustomize}"; \
-	else \
-	  E2E_GITHUB_REPO="test-owner/test-repo"; \
-	  E2E_GITHUB_API_URL="http://mock-github.mock.svc.cluster.local/"; \
-	  E2E_PODINFO_GIT_URL="http://git-server.git-server.svc.cluster.local/flux-ai-bridge.git"; \
-	  E2E_PODINFO_GIT_REF="main"; \
-	  E2E_PODINFO_GIT_PROVIDER="generic"; \
-	  E2E_PODINFO_PATH="./e2e/podinfo-kustomize"; \
-	fi; \
-	case "$$E2E_LLM" in \
-	  ollama) \
-	    E2E_LLM_PROVIDER="openai-compatible"; \
-	    E2E_LLM_MODEL="$${E2E_LLM_MODEL:-$(OLLAMA_MODEL)}"; \
-	    E2E_ANTHROPIC_API_KEY="unused-with-ollama"; \
-	    E2E_ANTHROPIC_BASE_URL=""; \
-	    E2E_OPENAI_BASE_URL=""; \
-	    E2E_OPENAI_API_KEY="unused-with-ollama"; \
-	    E2E_OLLAMA_ENABLED="true" ;; \
-	  azure) \
-	    E2E_LLM_PROVIDER="openai-compatible"; \
-	    E2E_LLM_MODEL="$${E2E_LLM_MODEL:-gpt-4o-mini}"; \
-	    E2E_ANTHROPIC_API_KEY="unused-with-azure"; \
-	    E2E_ANTHROPIC_BASE_URL=""; \
-	    E2E_OPENAI_BASE_URL="$${OPENAI_BASE_URL:-$${E2E_OPENAI_BASE_URL:-}}"; \
-	    E2E_OPENAI_API_KEY="$$OPENAI_API_KEY"; \
-	    E2E_OLLAMA_ENABLED="false" ;; \
-	  none) \
-	    E2E_LLM_PROVIDER="none"; \
-	    E2E_LLM_MODEL=""; \
-	    E2E_ANTHROPIC_API_KEY=""; \
-	    E2E_ANTHROPIC_BASE_URL=""; \
-	    E2E_OPENAI_BASE_URL=""; \
-	    E2E_OPENAI_API_KEY=""; \
-	    E2E_OLLAMA_ENABLED="false" ;; \
-	  *) \
-	    E2E_LLM_PROVIDER="claude"; \
-	    E2E_LLM_MODEL=""; \
-	    E2E_ANTHROPIC_API_KEY="e2e-fake-anthropic-key"; \
-	    E2E_ANTHROPIC_BASE_URL="http://mock-llm.mock.svc.cluster.local"; \
-	    E2E_OPENAI_BASE_URL=""; \
-	    E2E_OPENAI_API_KEY=""; \
-	    E2E_OLLAMA_ENABLED="false" ;; \
-	esac; \
-	E2E_LOG_LEVEL="$${E2E_LOG_LEVEL:-info}"; \
-	E2E_KEEP_COMMENT_HISTORY="$${E2E_KEEP_COMMENT_HISTORY:-false}"; \
-	if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
-	  E2E_GITHUB_APP_ID="$$GITHUB_APP_ID"; \
-	  E2E_GITHUB_APP_INSTALLATION_ID="$$GITHUB_APP_INSTALLATION_ID"; \
-	  E2E_GITHUB_APP_PRIVATE_KEY_INDENTED=$$(printf '%s\n' "$$GITHUB_APP_PRIVATE_KEY" | sed 's/^/    /'); \
-	else \
-	  if [ ! -f "$(REPO_ROOT)/e2e/fixtures/mock-app-key.pem" ]; then \
-	    echo "==> Generating throwaway mock-github App key (e2e/fixtures/mock-app-key.pem)"; \
-	    mkdir -p "$(REPO_ROOT)/e2e/fixtures"; \
-	    openssl genrsa -out "$(REPO_ROOT)/e2e/fixtures/mock-app-key.pem" 2048 2>/dev/null; \
-	  fi; \
-	  E2E_GITHUB_APP_ID="1"; \
-	  E2E_GITHUB_APP_INSTALLATION_ID="1"; \
-	  E2E_GITHUB_APP_PRIVATE_KEY_INDENTED=$$(sed 's/^/    /' "$(REPO_ROOT)/e2e/fixtures/mock-app-key.pem"); \
-	fi; \
-	if [ "$$E2E_REAL_GITHUB" = "1" ]; then \
-	  E2E_PODINFO_GIT_AUTH_SECRET=$$(printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: flux-ai-bridge-e2e-podinfo-git-creds\n  namespace: flux-system\ntype: Opaque\nstringData:\n  githubAppID: "%s"\n  githubAppInstallationID: "%s"\n  githubAppPrivateKey: |\n%s\n---' "$$E2E_GITHUB_APP_ID" "$$E2E_GITHUB_APP_INSTALLATION_ID" "$$E2E_GITHUB_APP_PRIVATE_KEY_INDENTED"); \
-	  E2E_PODINFO_GIT_SECRETREF=$$(printf '  secretRef:\n    name: flux-ai-bridge-e2e-podinfo-git-creds'); \
-	else \
-	  E2E_PODINFO_GIT_AUTH_SECRET=""; \
-	  E2E_PODINFO_GIT_SECRETREF=""; \
-	fi; \
-	if [ "$$E2E_DEDUPE_PERSISTENCE" = "1" ]; then \
-	  E2E_VALKEY_ENABLED="false"; \
-	  E2E_DEDUPE_PERSISTENCE_ENABLED="true"; \
-	  E2E_DEDUPE_SENTINEL_ENABLED="true"; \
-	  E2E_DEDUPE_SENTINEL_ADDRS="valkey-node-0.valkey-headless.valkey.svc.cluster.local:26379,valkey-node-1.valkey-headless.valkey.svc.cluster.local:26379,valkey-node-2.valkey-headless.valkey.svc.cluster.local:26379"; \
-	  E2E_DEDUPE_SENTINEL_MASTER_NAME="myprimary"; \
-	  E2E_DEDUPE_PERSISTENCE_USER="bridge"; \
-	  E2E_DEDUPE_SENTINEL_USER="bridge"; \
-	  E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET="flux-ai-bridge-dedupe"; \
-	  E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY="bridge-password"; \
-	  E2E_DEDUPE_SENTINEL_PASSWORD_KEY="bridge-password"; \
-	  E2E_WEBHOOK_MAX_CONCURRENT=""; \
-	else \
-	  E2E_VALKEY_ENABLED="false"; \
-	  E2E_DEDUPE_PERSISTENCE_ENABLED="false"; \
-	  E2E_DEDUPE_SENTINEL_ENABLED="false"; \
-	  E2E_DEDUPE_SENTINEL_ADDRS=""; \
-	  E2E_DEDUPE_SENTINEL_MASTER_NAME=""; \
-	  E2E_DEDUPE_PERSISTENCE_USER=""; \
-	  E2E_DEDUPE_SENTINEL_USER=""; \
-	  E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET=""; \
-	  E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY=""; \
-	  E2E_DEDUPE_SENTINEL_PASSWORD_KEY=""; \
-	  E2E_WEBHOOK_MAX_CONCURRENT=""; \
-	fi; \
-	export E2E_GITHUB_REPO E2E_GITHUB_API_URL \
-	       E2E_LLM_PROVIDER E2E_LLM_MODEL E2E_ANTHROPIC_API_KEY \
-	       E2E_ANTHROPIC_BASE_URL E2E_OPENAI_BASE_URL E2E_OPENAI_API_KEY \
-	       E2E_OLLAMA_ENABLED E2E_LOG_LEVEL E2E_KEEP_COMMENT_HISTORY \
-	       E2E_VALKEY_ENABLED E2E_DEDUPE_PERSISTENCE_ENABLED \
-	       E2E_DEDUPE_SENTINEL_ENABLED E2E_DEDUPE_SENTINEL_ADDRS \
-	       E2E_DEDUPE_SENTINEL_MASTER_NAME \
-	       E2E_DEDUPE_PERSISTENCE_USER E2E_DEDUPE_SENTINEL_USER \
-	       E2E_DEDUPE_PERSISTENCE_EXISTING_SECRET E2E_DEDUPE_PERSISTENCE_PASSWORD_KEY \
-	       E2E_DEDUPE_SENTINEL_PASSWORD_KEY E2E_WEBHOOK_MAX_CONCURRENT \
-	       E2E_GITHUB_APP_ID E2E_GITHUB_APP_INSTALLATION_ID E2E_GITHUB_APP_PRIVATE_KEY_INDENTED \
-	       E2E_PODINFO_GIT_URL E2E_PODINFO_GIT_REF E2E_PODINFO_GIT_PROVIDER E2E_PODINFO_PATH \
-	       E2E_PODINFO_GIT_AUTH_SECRET E2E_PODINFO_GIT_SECRETREF; \
-	envsubst < $(MANIFESTS)/03-flux-ai-bridge.yaml.tpl \
-	  | kubectl --context $(CONTEXT) apply -f -
-	@echo "==> Nudging Flux source + helm + kustomize controllers to reconcile now"
+	$(E2E_RENDER_BRIDGE)
+	@# Reconcile source → chart → release in order and wait for each to
+	@# handle the request, so the restart below runs against the Deployment
+	@# from the new chart and values, not the one before Flux applied them.
+	@echo "==> Reconciling the chart source, the HelmChart and the bridge HelmRelease"
+	@set -e; ts=$$(date +%s); \
 	kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
-	  gitrepository/flux-ai-bridge-chart reconcile.fluxcd.io/requestedAt=$$(date +%s)
+	  gitrepository/flux-ai-bridge-chart reconcile.fluxcd.io/requestedAt=$$ts; \
+	kubectl --context $(CONTEXT) -n flux-system wait gitrepository/flux-ai-bridge-chart \
+	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=2m; \
+	chart=$$(kubectl --context $(CONTEXT) -n flux-system get helmrelease/flux-ai-bridge \
+	  -o jsonpath='{.status.helmChart}'); \
+	chart="$${chart:-flux-system/flux-system-flux-ai-bridge}"; \
+	kubectl --context $(CONTEXT) -n "$${chart%%/*}" annotate --overwrite \
+	  helmchart/"$${chart#*/}" reconcile.fluxcd.io/requestedAt=$$ts; \
+	kubectl --context $(CONTEXT) -n "$${chart%%/*}" wait helmchart/"$${chart#*/}" \
+	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=2m; \
 	kubectl --context $(CONTEXT) -n flux-system annotate --overwrite \
-	  helmrelease/flux-ai-bridge reconcile.fluxcd.io/requestedAt=$$(date +%s)
+	  helmrelease/flux-ai-bridge reconcile.fluxcd.io/requestedAt=$$ts; \
+	kubectl --context $(CONTEXT) -n flux-system wait helmrelease/flux-ai-bridge \
+	  --for=jsonpath='{.status.lastHandledReconcileAt}'=$$ts --timeout=10m
 	@# Also re-reconcile the test workload Kustomization so edits under
 	@# e2e/podinfo-kustomize/ land immediately (and a fresh Flux event
 	@# fires at the bridge for downstream test flows that watch for one).

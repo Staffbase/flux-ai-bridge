@@ -25,9 +25,9 @@ config:
     #
     # Disabled by default → dedupe lives in-memory only. Bridge restarts
     # wipe it, and the first event after restart for any already-handled
-    # SHA will re-run the pipeline and post a fresh comment (with the same
-    # content if nothing changed). Enable to survive restarts and avoid
-    # the redundant post.
+    # SHA re-runs the pipeline (including an LLM call). The comment itself
+    # is only rewritten if the state changed: its embedded stability key
+    # still matches. Enable to survive restarts and skip the redundant run.
     persistence:
       # ─── HA: multi-replica via persistent dedupe (active-active) ─────────────────
       #
@@ -714,9 +714,10 @@ networkPolicy:
     extra: []
   egress:
     # External Redis/Valkey dedupe backend (config.dedupe.persistence enabled,
-    # bundled valkey disabled). NetworkPolicy can't select hosts outside the
-    # cluster, so these ports are opened to any destination. Ports written in
-    # persistence.url or sentinel.addrs are opened as well.
+    # and bundled valkey disabled or overridden by persistence.url).
+    # NetworkPolicy can't select hosts outside the cluster, so these ports are
+    # opened to any destination. Ports written in persistence.url or
+    # sentinel.addrs are opened as well.
     redis:
       # Data ports: the single-node server, or in Sentinel mode the master
       # Sentinel hands out (not known up front, so it must be listed here).

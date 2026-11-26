@@ -390,9 +390,10 @@ func assertCommentBody(t *testing.T, body string) {
 //
 // Repeat-run caveat: the bridge's in-memory dedupe persists across `make
 // e2e` invocations against the same long-running cluster, so a reconcile of
-// an already-analyzed SHA is skipped. Run `make e2e-update` (or
-// `make e2e-up`) between repeat invocations to rollout-restart the bridge
-// and clear the cache. Mock-mode coverage of the synthetic webhook path is
+// an already-analyzed SHA is skipped. Between repeat invocations, run
+// `make e2e-update` (or `make e2e-up`) to rollout-restart the bridge and clear
+// the cache, and delete the bridge's comment on the PR (or push a new commit):
+// an unchanged state doesn't rewrite an existing comment. Mock-mode coverage of the synthetic webhook path is
 // retained in TestPipelineProducesGitHubComment.
 func TestPipelineProducesRealGitHubComment(t *testing.T) {
 	if !realGitHub {
@@ -426,7 +427,7 @@ func TestPipelineProducesRealGitHubComment(t *testing.T) {
 	if found == nil {
 		t.Fatalf("no bridge comment with marker on PR #%d in repo %s within %s — "+
 			"if the cluster is long-running and the PR head SHA was already analyzed, "+
-			"rollout-restart the bridge (`make e2e-update`) to clear in-memory dedupe and re-run",
+			"rollout-restart the bridge (`make e2e-update`) to clear in-memory dedupe, and delete its PR comment (an unchanged state isn't re-posted)",
 			cfg.prNumber, cfg.repo, pipelineDeadline())
 	}
 

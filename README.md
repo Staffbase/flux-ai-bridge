@@ -103,8 +103,12 @@ kubectl patch secret flux-ai-bridge -n flux-system \
 helm upgrade flux-ai-bridge oci://ghcr.io/staffbase/charts/flux-ai-bridge \
   --namespace flux-system \
   --reset-then-reuse-values \
-  --set config.llm.provider=openai-compatible
+  --set config.llm.provider=openai-compatible \
+  --set config.llm.openaiBaseUrl=<endpoint> \
+  --set config.llm.model=<model>
 ```
+
+Set `openaiBaseUrl` to your endpoint, e.g. `https://api.openai.com/v1` for OpenAI proper. Left empty, the bridge uses GitHub Models (`https://models.inference.ai.azure.com`) and sends the key there, unless the bundled Ollama (`ollama.enabled=true`) wires it up.
 
 The chart creates the Flux `Provider` and `Alert` resources by default (`flux.notification.enabled=true`) so the Notification Controller starts forwarding events immediately. Set `--set flux.notification.enabled=false` to skip them — useful when installing into a cluster without Flux (chart-testing / `helm lint`).
 

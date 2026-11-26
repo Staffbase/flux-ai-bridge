@@ -65,10 +65,13 @@ data:
     A failure signal always wins over a success signal: an event reason of
     `ReconciliationSucceeded` doesn't cancel a failed row, and an all-Current
     count doesn't cancel a failed reconcile. When the reconcile failed or is
-    waiting on a dependency, the new revision never reached the cluster
-    (`status.lastAppliedRevision` still names the old one). The readiness
-    rows then describe the PREVIOUS revision, so a green count says nothing
-    about the change under review.
+    waiting on a dependency, `status.lastAppliedRevision` still names the old
+    revision: Flux sets it only after apply, prune and health checks all
+    pass. With reason `HealthCheckFailed` or `PruneFailed` the new revision
+    WAS applied, and the readiness rows describe it. With any other failure
+    reason or a dependency wait, the new revision did not reach the cluster,
+    or only in part, so the rows can describe the PREVIOUS revision and a
+    green count says nothing about the change under review.
 
     Not healthy doesn't always mean failed: when the payload has a
     `## Rollout In Progress` section, nothing has failed yet — see
@@ -183,7 +186,9 @@ data:
     Deployment can report `Available: True` with ZERO ready pods (when
     maxUnavailable >= replicas), so never infer from that condition that
     "older replicas likely remain ready". If `ready` is 0, the workload has
-    no running pods — say exactly that. A missing figure is unknown.
+    no ready pods — say exactly that. A pod can run and still fail its
+    readiness probe, so claim that no pods are running only when the pod
+    rows show it. A missing figure is unknown.
 
     1. **Prefer Pod Logs over events.** Logs are the application's own
        stderr. Use events when logs don't pinpoint the cause or the failure
@@ -229,7 +234,8 @@ data:
       the new one, and short-lived `FailedScheduling`. They are expected
       during a rollout. They are NOT a root cause, and NOT a reason to change
       probes, ports, volumes, or affinity.
-    - `metadata.generation` ahead of `status.observedGeneration`, or a
+    - `metadata.generation` ahead of `status.observedGeneration` (or of the
+      `Ready` condition's `observedGeneration`), or a
       HelmRelease message like `Running 'upgrade' action`, means the
       controller is still working on the new revision, not that it is stuck.
     - In `## Kustomization Status`, say the rollout is in progress and name

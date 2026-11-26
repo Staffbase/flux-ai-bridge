@@ -82,10 +82,16 @@ gh pr create --base main --head bump-podinfo-cpu \
   --body "Test PR for flux-ai-bridge e2e."
 ```
 
-Note: source-controller pulls from the PR's **base branch** (`main` by
-default). Merge the PR into `main` (or override `E2E_PODINFO_GIT_REF` to
-target a different long-lived branch like `dev`) for Flux to see the
-changes.
+Note: source-controller pulls `E2E_PODINFO_GIT_REF`, which defaults to
+`main`. Don't merge the PR: merging closes it, and the test needs it open.
+Point Flux at the PR branch instead, so it deploys the PR's head commit:
+
+```bash
+export E2E_PODINFO_GIT_REF=bump-podinfo-cpu
+```
+
+(A branch that merges the PR branch with a merge commit, like an autodev
+`dev` branch, works too.)
 
 ### 4. Keep the PR open
 
@@ -127,6 +133,8 @@ The Makefile uses the same App credentials for both the bridge AND source-contro
 ```bash
 export E2E_REAL_GITHUB=1
 export GITHUB_REPO=${GITHUB_USER}/${GH_REPO}
+# Flux deploys the open PR's branch (see step 3).
+export E2E_PODINFO_GIT_REF=bump-podinfo-cpu
 
 # Required (App-only auth):
 export GITHUB_APP_ID=<...>
@@ -173,9 +181,9 @@ comment.
 
 ## Cleaning up
 
-The bridge's comment marker is idempotent: a subsequent reconcile **updates** the existing comment rather than spamming the PR (delete-and-recreate on each post, keyed on the per-Kustomization marker).
+The bridge's comment marker is idempotent: a later analysis with the same cluster state leaves the existing comment alone, and a changed state replaces it (create the new comment, then delete the old one, keyed on the per-Kustomization marker), so the PR never collects duplicates.
 
-**Repeat-run caveat:** the bridge's in-memory dedupe persists across `make e2e` invocations against the same long-running cluster. The PR head SHA doesn't change between runs, so the bridge skips reprocessing on the second `make e2e` and the test would see only the comment from the first run. To force a fresh post:
+**Repeat-run caveat:** the bridge's in-memory dedupe persists across `make e2e` invocations against the same long-running cluster. The PR head SHA doesn't change between runs, so the bridge skips reprocessing on the second `make e2e` and the test would see only the comment from the first run. A restart clears the dedupe, but with an unchanged state the bridge still keeps the old comment, and the test passes against it. To force a fresh post, delete the bridge's comment on the PR first (or push a new commit to the PR branch), then:
 
 ```bash
 make e2e-update  # rebuilds + rollout-restarts the bridge → clears in-memory dedupe

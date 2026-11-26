@@ -124,7 +124,8 @@ spec:
             - name: MCP_POOL_SIZE
               value: {{ .Values.config.mcp.poolSize | quote }}
             {{- end }}
-            {{- if .Values.config.dedupe.ttl }}
+            {{- /* Presence check, not truthiness: a numeric 0 (--set config.dedupe.ttl=0) disables dedupe. */}}
+            {{- if and (hasKey .Values.config.dedupe "ttl") (ne (toString .Values.config.dedupe.ttl) "") }}
             - name: DEDUPE_TTL
               value: {{ .Values.config.dedupe.ttl | quote }}
             {{- end }}

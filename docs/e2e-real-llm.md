@@ -58,6 +58,7 @@ proportionally more RAM but produce noticeably better diagnostic output. With
 ### Running
 
 ```bash
+make chart-deps                                     # once per checkout: the Ollama image tag comes from its sub-chart
 make e2e-down                                       # fresh cluster
 E2E_LLM=ollama make e2e-up                     # default qwen2.5-coder:1.5b
 # or pick a bigger model:
@@ -207,10 +208,15 @@ The two toggles are independent. To run the bridge against a real GitHub PR
 ```bash
 export E2E_REAL_GITHUB=1
 export GITHUB_REPO=<owner/repo>
+# Flux deploys the open test PR's branch (see docs/e2e-real-github.md):
+export E2E_PODINFO_GIT_REF=<pr-branch>
 # GitHub App credentials (see docs/e2e-real-github.md and docs/github-app.md):
 export GITHUB_APP_ID=<...>
 export GITHUB_APP_INSTALLATION_ID=<...>
 export GITHUB_APP_PRIVATE_KEY="$(cat ~/Downloads/flux-ai-bridge.*.pem)"
+# Read by `make e2e` to fetch the posted comment (any token that can read the
+# repo's PRs), e.g. export GITHUB_TOKEN=$(gh auth token)
+export GITHUB_TOKEN=<token>
 
 # Pick one LLM mode:
 export OPENAI_API_KEY=<azure-key>

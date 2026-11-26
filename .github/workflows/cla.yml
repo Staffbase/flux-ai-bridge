@@ -25,11 +25,12 @@ jobs:
     if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     # Signatures are commits to one branch: one CLA job at a time, so
-    # concurrent signings can't race. GitHub keeps one job waiting and
-    # cancels an older waiting one; that contributor comments `recheck`.
+    # concurrent signings can't race. `queue: max` keeps every waiting job
+    # (up to 100) instead of cancelling an older one, so a signing comment
+    # isn't dropped when another PR event queues behind it.
     concurrency:
       group: cla-signatures
-      cancel-in-progress: false
+      queue: max
     steps:
       # The action stores signatures on the signatures branch but doesn't
       # create it. Create it from the default branch when it's missing.
@@ -49,8 +50,10 @@ jobs:
       - name: "CLA Assistant"
         uses: iainmcgin/cla-github-action@0d27e5a16278d4adb6b0c4b92f08ad27b0a21dc8 # v3.2.0
         env:
+          # Signatures live in this repository, so the GITHUB_TOKEN is enough;
+          # the action reads a PERSONAL_ACCESS_TOKEN only for a remote
+          # signatures repository.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PERSONAL_ACCESS_TOKEN: ${{ secrets.OSS_CONTRIBUTOR_LICENSE_AGREEMENT }}
         with:
           path-to-signatures: 'signatures/version1/cla.json'
           path-to-document: 'https://github.com/Staffbase/flux-ai-bridge/blob/main/CLA.md'

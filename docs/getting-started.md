@@ -18,7 +18,7 @@ This guide walks you through deploying `flux-ai-bridge` to your Kubernetes clust
 
 ## 1. Create the Secret
 
-The bridge authenticates to GitHub as a **GitHub App** — see [docs/github-app.md](github-app.md) for how to create one and capture the App ID, installation ID, and private key. With the chart's default `config.llm.provider=none`, the GitHub App credentials are the only Secret keys required. Create the Secret before installing the chart, then reference it with `existingSecret`.
+The bridge authenticates to GitHub as a **GitHub App** — see [docs/github-app.md](github-app.md) for how to create one and capture the App ID, installation ID, and private key. With the chart's default `config.llm.provider=none`, the GitHub App credentials are the only Secret keys required. Create the Secret before installing the chart, then reference it with `existingSecret`. The commands below use `flux-system`, Flux's default namespace. To install into a namespace that doesn't exist yet, create it first (`kubectl create namespace <namespace>`).
 
 ```bash
 kubectl create secret generic flux-ai-bridge \
@@ -71,10 +71,12 @@ helm install flux-ai-bridge ./charts/flux-ai-bridge \
   --namespace flux-system \
   --create-namespace \
   --set existingSecret=flux-ai-bridge \
-  --set config.llm.provider=openai-compatible
+  --set config.llm.provider=openai-compatible \
+  --set config.llm.openaiBaseUrl=<endpoint> \
+  --set config.llm.model=<model>
 ```
 
-Requires `OPENAI_API_KEY` in the Secret (omit for local Ollama).
+Requires `OPENAI_API_KEY` in the Secret (omit for local Ollama). Set `openaiBaseUrl` to your endpoint, e.g. `https://api.openai.com/v1` for OpenAI proper. Left empty, the bridge uses GitHub Models (`https://models.inference.ai.azure.com`) and sends the key there, unless the bundled Ollama (`ollama.enabled=true`) wires it up.
 
 > The chart creates the Flux `Provider` and `Alert` for you by default (`flux.notification.enabled=true`). Pass `--set flux.notification.enabled=false` to skip them.
 
@@ -160,7 +162,7 @@ spec:
 ## 5. End-to-End Workflow Test
 
 1. Open a PR on your infra repository that changes a Kustomization.
-2. Add the `dev` label — [autodev](autodev.md) merges it into your `dev` branch.
+2. Add the `dev` label — [autodev](autodev.md) merges it into your `dev` branch. This needs the autodev workflow set up in that repository and the cluster's Flux source tracking `dev`. Without autodev, point the Flux source at a branch that holds the PR's commits while the PR stays open, such as the PR branch itself.
 3. Flux reconciles the dev cluster.
 4. The Notification Controller sends a webhook to the bridge.
 5. The bridge queries `flux-operator-mcp`, evaluates kstatus on every inventory resource (and, when enabled, on pods + HelmRelease child resources), and posts a comment on the PR. The LLM is called only when something needs analysis — see `LLM_SKIP_ON_HEALTHY` in [configuration.md](configuration.md).
