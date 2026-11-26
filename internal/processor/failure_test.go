@@ -348,6 +348,26 @@ func TestFetchFailureContext_OwnedScopeExcludesUnrelatedPodLogs(t *testing.T) {
 	}
 }
 
+// The owned scope judges a failing pod by its own ownerReferences. The pod
+// scan's row of the same name may describe an earlier pod that name belonged
+// to (here one of the inventory's Deployment); trusting it would send the
+// replacement's logs, owned by another app, to the LLM.
+func TestFetchFailureContext_OwnedScopeIgnoresStaleScanController(t *testing.T) {
+	proc, mcp, statuses := sharedNamespaceFixture(config.LogsScopeOwned)
+	podStatuses := []readiness.ResourceStatus{
+		{Kind: "Pod", Namespace: "apps", Name: "other-abc", Status: "Failed", Controller: "Deployment/web"},
+	}
+	out, _ := proc.fetchFailureContext(context.Background(), eventv1.Event{Severity: eventv1.EventSeverityError}, statuses, podStatuses)
+	for _, call := range mcp.logsCalled {
+		if strings.HasPrefix(call, "apps/other-abc/") {
+			t.Fatalf("logs of a pod another app owns were fetched on a stale scan row: %v", mcp.logsCalled)
+		}
+	}
+	if strings.Contains(out, "other-abc (container") {
+		t.Errorf("an unowned pod's logs reached the prompt:\n%s", out)
+	}
+}
+
 // FAILURE_FETCH_LOGS_SCOPE=namespace keeps the old behaviour: the first
 // failing pods in the namespace get their logs fetched, whoever owns them.
 func TestFetchFailureContext_NamespaceScopeFetchesAnyFailingPodLogs(t *testing.T) {
@@ -2197,8 +2217,29 @@ func TestProcess_UnobservedCronRunNotGreen(t *testing.T) {
 	jobs := "items:\n- metadata:\n    name: judge-29686125\n    namespace: default\n" + owned +
 		"  status:\n    conditions:\n    - type: Failed\n      status: \"True\"\n" +
 		"- metadata:\n    name: judge-29686335\n    namespace: default\n" + owned + "  status:\n    active: 1\n"
-	if body := cronProcessVerdict(t, pods, jobs); strings.Contains(body, "# "+statusEmojiHealthy+" Flux Status") {
-		t.Errorf("an unobserved CronJob run read green:\n%s", body)
+	body := cronProcessVerdict(t, pods, jobs)
+	if !strings.HasPrefix(body, "# "+statusEmojiWarning+" Flux Status") {
+		t.Errorf("an unobserved CronJob run must yield a warning comment:\n%s", body)
+	}
+	if !strings.Contains(body, "| CronJob/judge | Job judge-29686335 | ⏳ InProgress |") {
+		t.Errorf("the active run must carry the verdict as an InProgress row:\n%s", body)
+	}
+}
+
+// A CronJob run with several completions can fail (deadline exceeded, its
+// running pods deleted) after one pod succeeded. That succeeded pod alone must
+// not read green: the Job's Failed=True condition still decides the run.
+func TestProcess_FailedCronRunWithSucceededPodNotGreen(t *testing.T) {
+	pods := "items:\n" + jobPod("judge-29686335-x", "judge-29686335", "Succeeded")
+	jobs := "items:\n- metadata:\n    name: judge-29686335\n    namespace: default\n" +
+		"    ownerReferences:\n    - kind: CronJob\n      name: judge\n      controller: true\n" +
+		"  status:\n    conditions:\n    - type: Failed\n      status: \"True\"\n      reason: DeadlineExceeded\n"
+	body := cronProcessVerdict(t, pods, jobs)
+	if !strings.HasPrefix(body, "# "+statusEmojiFailure+" Flux Status") {
+		t.Errorf("a failed CronJob run read non-failed off its one succeeded pod:\n%s", body)
+	}
+	if !strings.Contains(body, "Job judge-29686335 | ❌ Failed | DeadlineExceeded (no failed pod of the run left)") {
+		t.Errorf("missing the run's Failed row:\n%s", body)
 	}
 }
 

@@ -631,6 +631,9 @@ func TestParentDroppedChild_RechecksParentGates(t *testing.T) {
 		"parent suspended":      {snapshot: strings.Replace(selfRemovalParent, "prune: true", "prune: true\n  suspend: true", 1)},
 		"path switched":         {snapshot: strings.Replace(selfRemovalParent, "path: ./clusters/base", "path: ./clusters/other", 1)},
 		"source switched":       {snapshot: strings.Replace(selfRemovalParent, "name: cluster-base\nstatus", "name: elsewhere\nstatus", 1)},
+		"components changed":    {snapshot: strings.Replace(selfRemovalParent, "prune: true", "prune: true\n  components:\n    - ../components/extra", 1)},
+		"missing components ignored": {snapshot: strings.Replace(selfRemovalParent, "prune: true",
+			"prune: true\n  ignoreMissingComponents: true", 1)},
 	} {
 		mcp := &fakeMCPClient{data: []byte(selfRemovalChild), kustomizationsByName: map[string][]byte{"flux-system/cluster-base": []byte(tc.snapshot)}}
 		proc := New(&config.Config{ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 5 * time.Millisecond},

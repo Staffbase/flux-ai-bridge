@@ -438,6 +438,10 @@ func TestLLMMissingFailureSections(t *testing.T) {
 		"```\n## Root Cause\n## Next steps to fix\n```":                       true,
 		"## Kustomization Status\n~~~md\n## Root Cause\n~~~\n## Next steps\n": true,
 		"    ## Root Cause\n    ## Next steps to fix":                         true,
+		// The phrase must end at a word boundary.
+		"## Root Causesomething\nx\n## Next steps to fix\n1. y": true,
+		"## Root Cause\nx\n## Next Stepstones\n1. y":            true,
+		"## Root causes:\nx\n## Next steps — fix\n1. y":         false,
 	} {
 		if got := llmMissingFailureSections(reply); got != want {
 			t.Errorf("llmMissingFailureSections(%q) = %v, want %v", reply, got, want)

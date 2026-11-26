@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -315,7 +317,9 @@ func TestProcess_HealthyLLMFallbackIsReEvaluated(t *testing.T) {
 // A roster that can't be read is not an empty roster. Taking "no known scopes"
 // as "every scope reported" would label a head flux-success from one scope's
 // green outcome while other Kustomizations of the PR haven't reported. The
-// success is held and the head labelled flux-warning instead.
+// success is held and the head labelled flux-warning instead, and an error is
+// returned so deliver releases the admission mark: kept, it would skip the
+// head on later events, and the held success would never be written.
 func TestReconcileLabels_UnreadableRosterHoldsSuccess(t *testing.T) {
 	cache, mr := newRedisDedupe(t)
 	// A roster key of the wrong type makes HGETALL fail (WRONGTYPE) while the
@@ -326,11 +330,122 @@ func TestReconcileLabels_UnreadableRosterHoldsSuccess(t *testing.T) {
 	commenterMock := &fakeCommenter{}
 	proc := New(&config.Config{PRLabelEnabled: true}, nil, nil, nil, commenterMock, nil, cache, slog.Default())
 
-	if err := proc.reconcileLabels(context.Background(), "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess); err != nil {
-		t.Fatalf("reconcileLabels: %v", err)
+	if err := proc.reconcileLabels(context.Background(), "o", "r", "ns/fast", "h1", 42, bridgegithub.OutcomeSuccess); err == nil {
+		t.Fatal("reconcileLabels must return the roster error so a later event retries the label")
 	}
 	calls := commenterMock.labelCalls
 	if len(calls) != 1 || calls[0].Outcome != bridgegithub.OutcomeWarning {
 		t.Fatalf("an unreadable roster must hold flux-success and label the head flux-warning; got %+v", calls)
+	}
+}
+
+// perPRErrCommenter fails label, comment and comment-removal writes per PR
+// number.
+type perPRErrCommenter struct {
+	*fakeCommenter
+	labelErrs, postErrs, removeErrs map[int]error
+}
+
+func (c *perPRErrCommenter) SetPRLabels(ctx context.Context, owner, repo string, prNumber int, headSHA string, outcome bridgegithub.Outcome) error {
+	if err := c.labelErrs[prNumber]; err != nil {
+		return err
+	}
+	return c.fakeCommenter.SetPRLabels(ctx, owner, repo, prNumber, headSHA, outcome)
+}
+
+func (c *perPRErrCommenter) PostOrUpdateCommentKeyed(ctx context.Context, owner, repo, ns, name string, prNumber int, body, stabilityKey string) error {
+	if err := c.postErrs[prNumber]; err != nil {
+		return err
+	}
+	return c.fakeCommenter.PostOrUpdateCommentKeyed(ctx, owner, repo, ns, name, prNumber, body, stabilityKey)
+}
+
+func (c *perPRErrCommenter) RemoveComment(ctx context.Context, owner, repo, ns, name string, prNumber int) error {
+	if err := c.removeErrs[prNumber]; err != nil {
+		return err
+	}
+	return c.fakeCommenter.RemoveComment(ctx, owner, repo, ns, name, prNumber)
+}
+
+// A rate-limited label write on one PR keeps its cooldown when a later PR's
+// comment write (post, or removal when suppressed) then fails for another
+// reason: returning only that error's zero cooldown would release the first
+// PR's mark, and the next event would hit GitHub again before the limit
+// resets.
+func TestDeliver_LabelCooldownSurvivesLaterCommentError(t *testing.T) {
+	retryAfter := 3 * time.Minute
+	for _, suppress := range []bool{false, true} {
+		commenterMock := &perPRErrCommenter{
+			fakeCommenter: &fakeCommenter{},
+			labelErrs: map[int]error{1: &gh.AbuseRateLimitError{
+				Response:   &http.Response{StatusCode: http.StatusForbidden, Request: httptest.NewRequest(http.MethodPost, "https://api.example.com/labels", nil)},
+				Message:    "secondary rate limit",
+				RetryAfter: &retryAfter,
+			}},
+			postErrs:   map[int]error{2: errors.New("server error")},
+			removeErrs: map[int]error{2: errors.New("server error")},
+		}
+		proc := New(&config.Config{PRLabelEnabled: true}, nil, nil, nil, commenterMock, nil, dedupe.NewNoExpiry(16), slog.Default())
+		cooldown, err := proc.deliver(context.Background(), prDelivery{
+			owner: "o", repo: "r", ns: "ns", name: "k", body: "b", stabilityKey: "b",
+			outcome: bridgegithub.OutcomeSuccess, suppress: suppress,
+		}, []bridgegithub.PRInfo{{Number: 1, HeadSHA: "a"}, {Number: 2, HeadSHA: "b"}}, map[int]bool{})
+		if err == nil {
+			t.Fatalf("suppress=%v: expected PR 2's comment error", suppress)
+		}
+		if cooldown != retryAfter {
+			t.Errorf("suppress=%v: cooldown = %s, want PR 1's %s label Retry-After", suppress, cooldown, retryAfter)
+		}
+	}
+}
+
+// One batch, two deliveries: the self-removal report for PR 42, whose label
+// write is rate-limited, then the normal report for PR 43. The second
+// delivery's zero cooldown must not overwrite the first one's, or PR 42's mark
+// is released instead of cooled down.
+func TestProcess_SelfRemovalLabelCooldownSurvivesNormalDelivery(t *testing.T) {
+	cache, mr := newRedisDedupe(t)
+	retryAfter := 3 * time.Minute
+	commenterMock := &perPRErrCommenter{
+		fakeCommenter: &fakeCommenter{
+			prs: []bridgegithub.PRInfo{
+				{Number: 42, HeadSHA: "head42", State: "open"},
+				{Number: 43, HeadSHA: "head43", State: "open"},
+			},
+			filesByPR: map[int][]bridgegithub.PRFile{
+				42: {selfRemovalCRDFile, {Path: "clusters/base/legacy-crds-ks.yaml", BlobSHA: "ks-blob", Status: "removed"}},
+				43: {selfRemovalCRDFile},
+			},
+			blobs: map[string][]byte{"crd-blob": []byte(selfRemovalCRD), "ks-blob": []byte(selfRemovalCR)},
+		},
+		labelErrs: map[int]error{42: &gh.AbuseRateLimitError{
+			Response:   &http.Response{StatusCode: http.StatusForbidden, Request: httptest.NewRequest(http.MethodPost, "https://api.example.com/labels", nil)},
+			Message:    "secondary rate limit",
+			RetryAfter: &retryAfter,
+		}},
+	}
+	mcpMock := &fakeMCPClient{
+		data:                 []byte(selfRemovalChild),
+		kustomizationsByName: map[string][]byte{"flux-system/cluster-base": []byte(selfRemovalParent)},
+		resources:            selfRemovalSources,
+	}
+	cfg := &config.Config{
+		LLMProvider: "none", PRLabelEnabled: true, CommentOnSuccess: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
+	}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, cache, slog.Default())
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "legacy-crds", Namespace: "flux-system"},
+		Severity:       eventv1.EventSeverityError,
+		Message:        "kustomization path not found: stat /tmp/x: no such file or directory",
+	}
+	if err := proc.Process(context.Background(), event, "sha-teardown"); err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+	if len(commenterMock.posts) != 2 {
+		t.Fatalf("expected both PRs' comments, got %+v", commenterMock.posts)
+	}
+	if got := mr.TTL("p:flux-system:legacy-crds:pr42:head42"); got != retryAfter {
+		t.Fatalf("PR 42 mark TTL after its rate-limited label = %s, want the %s Retry-After", got, retryAfter)
 	}
 }

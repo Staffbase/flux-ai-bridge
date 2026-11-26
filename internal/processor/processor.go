@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
@@ -955,14 +956,16 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	// Deliver to every target PR — including budget-exhausted piggyback PRs,
 	// whose delivery rides on the analysis the others paid for. The body is
 	// the same whole-Kustomization status; labels reconcile per PR regardless
-	// of suppression.
-	rateLimitCooldown, err = p.deliver(ctx, prDelivery{
+	// of suppression. A cooldown the self-removal delivery above returned
+	// still applies: it is kept, not overwritten.
+	cooldown, err := p.deliver(ctx, prDelivery{
 		owner: owner, repo: repo,
 		ns: event.InvolvedObject.Namespace, name: event.InvolvedObject.Name,
 		body: analysis, stabilityKey: stabilityKey, outcome: outcome,
 		suppress: suppress, commentCurrent: commentCurrent, wasReEval: wasReEval,
 		llmDegraded: llmDegraded, resources: len(resourceStatuses),
 	}, append(append([]bridgegithub.PRInfo{}, toPost...), piggyback...), keepMark)
+	rateLimitCooldown = max(rateLimitCooldown, cooldown)
 	return err
 }
 
@@ -1014,7 +1017,7 @@ func (p *Processor) deliver(ctx context.Context, d prDelivery, prs []bridgegithu
 			// stale comment from an earlier failing run (cache-guarded → a
 			// healthy-from-start PR pays no GitHub call).
 			if err := p.commenter.RemoveComment(ctx, owner, repo, d.ns, d.name, pr.Number); err != nil {
-				return bridgegithub.RateLimitCooldown(err), fmt.Errorf("remove stale pr comment: %w", err)
+				return max(labelCooldown, bridgegithub.RateLimitCooldown(err)), fmt.Errorf("remove stale pr comment: %w", err)
 			}
 			p.logger.Info("healthy outcome; comment suppressed (COMMENT_ON_SUCCESS=false)",
 				"owner", owner, "repo", repo, "pr", pr.Number,
@@ -1030,8 +1033,9 @@ func (p *Processor) deliver(ctx context.Context, d prDelivery, prs []bridgegithu
 			if err := p.commenter.PostOrUpdateCommentKeyed(ctx, owner, repo, d.ns, d.name, pr.Number, d.body, d.stabilityKey); err != nil {
 				// A rate limit puts the undelivered marks on a cooldown (0 for
 				// any other error, which the deferred rollback releases); see
-				// the keepMark docstring.
-				return bridgegithub.RateLimitCooldown(err), fmt.Errorf("post pr comment: %w", err)
+				// the keepMark docstring. An earlier PR's rate-limited label
+				// write keeps its cooldown whatever this error is.
+				return max(labelCooldown, bridgegithub.RateLimitCooldown(err)), fmt.Errorf("post pr comment: %w", err)
 			}
 			p.logger.Info("delivered PR comment", "owner", owner, "repo", repo, "pr", pr.Number,
 				"kustomization", scope,
@@ -1226,9 +1230,18 @@ func (p *Processor) reconcileLabels(ctx context.Context, owner, repo, scope, hea
 // are would keep a PREVIOUS head's flux-success on a head nothing verified yet.
 // A roster that can't be read holds success the same way (fail closed).
 //
+// A roster that can't be read also returns an error once the head is labelled
+// flux-warning, so deliver releases the admission mark and a later event
+// retries: kept, the mark would skip the head until the next push, and the
+// held success would never be written.
+//
 // The aggregate is read and written under a per-PR lock: computed outside it, a
 // worker holding an all-green view could write flux-success after another
-// worker recorded and wrote flux-failed for the same head.
+// worker recorded and wrote flux-failed for the same head. That lock covers
+// this replica only; SetPRLabels' cross-replica lock covers the write but not
+// the read. So the aggregate is read again after the write, and rewritten if
+// another replica recorded an outcome meanwhile: the last writer always
+// leaves the labels matching every outcome recorded before its write.
 //
 // fallback is this event's own outcome, used when no scopes are recorded (cache
 // unavailable) so single-Kustomization labelling still works without persistence;
@@ -1237,8 +1250,36 @@ func (p *Processor) applyPRLabel(ctx context.Context, owner, repo string, prNumb
 	mu := &p.labelLocks[labelLockIndex(owner, repo, prNumber)]
 	mu.Lock()
 	defer mu.Unlock()
+	agg, skip, rosterErr := p.prLabelAggregate(owner, repo, prNumber, headSHA, fallback, true)
+	if skip {
+		return nil
+	}
+	if err := p.writePRLabels(ctx, owner, repo, prNumber, headSHA, agg); err != nil {
+		return err
+	}
+	if again, skip, againErr := p.prLabelAggregate(owner, repo, prNumber, headSHA, fallback, false); !skip {
+		if again != agg {
+			p.logger.Info("PR label aggregate changed during the label write (another replica recorded an outcome); rewriting",
+				"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA, "written", string(agg), "aggregate", string(again))
+			if err := p.writePRLabels(ctx, owner, repo, prNumber, headSHA, again); err != nil {
+				return err
+			}
+		}
+		rosterErr = againErr
+	}
+	if rosterErr != nil {
+		return fmt.Errorf("PR roster unreadable, flux-success held: %w", rosterErr)
+	}
+	return nil
+}
+
+// prLabelAggregate reads the per-head scope outcomes and the roster and
+// returns the label to write (see applyPRLabel). skip reports a clear that
+// must not happen yet; rosterErr is set when success was held because the
+// roster couldn't be read. logHold logs why success was held.
+func (p *Processor) prLabelAggregate(owner, repo string, prNumber int, headSHA string, fallback bridgegithub.Outcome, logHold bool) (agg bridgegithub.Outcome, skip bool, rosterErr error) {
 	scopes := p.dedupe.ScopeOutcomes(owner, repo, prNumber, headSHA)
-	agg := aggregatePRLabelOutcome(scopes)
+	agg = aggregatePRLabelOutcome(scopes)
 	if len(scopes) == 0 {
 		agg = fallback
 	}
@@ -1251,9 +1292,11 @@ func (p *Processor) applyPRLabel(ctx context.Context, owner, repo string, prNumb
 	// pending scopes assert the right state when they report.
 	if agg == bridgegithub.OutcomeNone {
 		if roster := p.dedupe.PRScopes(owner, repo, prNumber); len(roster) > 0 {
-			p.logger.Debug("skipping label clear: roster still has pending scopes for this PR",
-				"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA, "roster", len(roster))
-			return nil
+			if logHold {
+				p.logger.Debug("skipping label clear: roster still has pending scopes for this PR",
+					"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA, "roster", len(roster))
+			}
+			return agg, true, nil
 		}
 	}
 	if agg == bridgegithub.OutcomeSuccess {
@@ -1262,16 +1305,26 @@ func (p *Processor) applyPRLabel(ctx context.Context, owner, repo string, prNumb
 		// roster does.
 		roster, rerr := p.dedupe.ReadPRScopes(owner, repo, prNumber)
 		if rerr != nil {
-			p.logger.Warn("holding flux-success: PR roster unreadable; labelling the head flux-warning meanwhile",
-				"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA, "error", rerr.Error())
-			agg = bridgegithub.OutcomeWarning
-		} else if !headCoversRoster(scopes, roster) {
-			p.logger.Info("holding flux-success: not all known scopes have reported for this head; labelling it flux-warning meanwhile",
-				"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA,
-				"reported", len(scopes), "roster", len(roster))
-			agg = bridgegithub.OutcomeWarning
+			if logHold {
+				p.logger.Warn("holding flux-success: PR roster unreadable; labelling the head flux-warning meanwhile",
+					"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA, "error", rerr.Error())
+			}
+			return bridgegithub.OutcomeWarning, false, rerr
+		}
+		if !headCoversRoster(scopes, roster) {
+			if logHold {
+				p.logger.Info("holding flux-success: not all known scopes have reported for this head; labelling it flux-warning meanwhile",
+					"owner", owner, "repo", repo, "pr", prNumber, "head_sha", headSHA,
+					"reported", len(scopes), "roster", len(roster))
+			}
+			return bridgegithub.OutcomeWarning, false, nil
 		}
 	}
+	return agg, false, nil
+}
+
+// writePRLabels sets the PR's labels to agg and logs the result.
+func (p *Processor) writePRLabels(ctx context.Context, owner, repo string, prNumber int, headSHA string, agg bridgegithub.Outcome) error {
 	if err := p.commenter.SetPRLabels(ctx, owner, repo, prNumber, headSHA, agg); err != nil {
 		// Another replica is reconciling this PR's labels: expected with
 		// several replicas, and the returned error makes a later event retry.
@@ -1512,7 +1565,13 @@ func (p *Processor) filterPRs(ctx context.Context, owner, repo, ns, name, revisi
 				removedRoster := p.dedupe.RemovePRScope(owner, repo, pr.Number, ns+"/"+name)
 				if removedOutcome || removedRoster {
 					// Best-effort like the comment cleanup above (logged inside).
-					_ = p.applyPRLabel(ctx, owner, repo, pr.Number, pr.HeadSHA, bridgegithub.OutcomeNone)
+					// A failed write puts the scope back on the roster: with
+					// both entries gone, the next event would find nothing to
+					// remove and never retry the write. Back on the roster, it
+					// holds flux-success (fail closed) until that retry.
+					if err := p.applyPRLabel(ctx, owner, repo, pr.Number, pr.HeadSHA, bridgegithub.OutcomeNone); err != nil {
+						p.dedupe.AddPRScope(owner, repo, pr.Number, ns+"/"+name, labelStateTTL)
+					}
 				}
 			}
 		}
@@ -1637,6 +1696,10 @@ func (p *Processor) prTouchesInventory(ctx context.Context, owner, repo string, 
 		path         string
 		headIDs      []string
 		headComplete bool // the head blob parsed completely (see splitParsedIDs)
+		// outOfBuild: the file is outside this Kustomization's build at the
+		// head, so none of its head resources are applied here; only a prune
+		// of one of its base resources makes it relevant (see the diff below).
+		outOfBuild bool
 	}
 	var modifiedFiles []modifiedFile
 	for _, f := range files {
@@ -1687,6 +1750,13 @@ func (p *Processor) prTouchesInventory(ctx context.Context, owner, repo string, 
 					p.logger.Debug("PR file is not part of this Kustomization's build; checking it only for this Kustomization's own CR",
 						"pr", prNumber, "path", f.Path)
 					outOfBuild = true
+					// The PR may have dropped this still-present file from the
+					// build (e.g. from a kustomization.yaml's resources) and
+					// so pruned what its base declared: keep it for the
+					// in-place diff, which needs no head blob for it.
+					if f.Status == "modified" && !skippableFile(f.Path) {
+						modifiedFiles = append(modifiedFiles, modifiedFile{path: f.Path, headComplete: true, outOfBuild: true})
+					}
 					break
 				}
 				fileInBuild = true
@@ -1879,9 +1949,19 @@ func (p *Processor) prTouchesInventory(ctx context.Context, owner, repo string, 
 	//     drop ONE of several resources. This catches a finalizer-stuck in-place
 	//     teardown in a mixed PR — so its pruned ID lands in prunedIDs and keeps
 	//     the verdict non-green — without a base fetch for every ordinary edit.
+	//
+	// A modified file OUTSIDE the build at the head is diffed too, but only
+	// when this reconcile pruned something: the PR may have dropped it from the
+	// build (out of a kustomization.yaml's resources) while editing it, which
+	// prunes what its base declared. None of its head resources are applied
+	// here, so every base resource counts as removed; only a prune match
+	// counts, never mere absence from the inventory.
 	if baseRef != "" {
 		attributed := presentMatch || pruneMatched || buildMatch
 		for _, mf := range modifiedFiles {
+			if mf.outOfBuild && (pruneSet == nil || len(pruneSet()) == 0) {
+				continue // outside the build: only a prune of a base resource can make it ours
+			}
 			if attributed && len(mf.headIDs) > 0 && (pruneSet == nil || len(pruneSet()) == 0) {
 				continue // already attributed, this file still declares resources, and nothing was pruned
 			}
@@ -1925,7 +2005,10 @@ func (p *Processor) prTouchesInventory(ctx context.Context, owner, repo string, 
 					pruneMatched = true
 					prunedIDs = append(prunedIDs, id)
 				}
-				if _, present := inventory[id]; !present {
+				// An out-of-build file's base may never have been in this
+				// build (another overlay's file): its absence here proves no
+				// deletion of ours.
+				if _, present := inventory[id]; !present && !mf.outOfBuild {
 					removedAbsent = true
 				}
 			}
@@ -3185,7 +3268,8 @@ func formatCondition(c readiness.Condition) string {
 // non-healthy run violates the SKILL contract that requires both a
 // `## Root Cause` and a `## Next steps to fix` section. Case-insensitive
 // heading match; "## Next steps" alone is accepted so minor phrasing drift
-// doesn't trigger a pointless retry, and so is a deeper level (`###`). Only
+// doesn't trigger a pointless retry, and so is a deeper level (`###`); the
+// phrase must end at a word boundary (see sectionTitle). Only
 // real headings count: one quoted inside a fenced or indented code block
 // gives the reviewer no section (same scan as stripFailureSections).
 func llmMissingFailureSections(reply string) bool {
@@ -3196,8 +3280,8 @@ func llmMissingFailureSections(reply string) bool {
 			continue
 		}
 		if level, title, ok := atxHeading(line); ok && level >= 2 {
-			rootCause = rootCause || strings.HasPrefix(title, "root cause")
-			nextSteps = nextSteps || strings.HasPrefix(title, "next steps")
+			rootCause = rootCause || sectionTitle(title, "root cause")
+			nextSteps = nextSteps || sectionTitle(title, "next steps")
 		}
 	}
 	return !rootCause || !nextSteps
@@ -3216,7 +3300,7 @@ func stripFailureSections(reply string) string {
 	for _, line := range lines {
 		if !fences.Line(line) {
 			if level, title, ok := atxHeading(line); ok && level <= 2 {
-				dropping = level == 2 && (strings.HasPrefix(title, "root cause") || strings.HasPrefix(title, "next steps"))
+				dropping = level == 2 && (sectionTitle(title, "root cause") || sectionTitle(title, "next steps"))
 			}
 		}
 		if !dropping {
@@ -3224,6 +3308,21 @@ func stripFailureSections(reply string) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+// sectionTitle reports whether a lower-cased heading title starts with the
+// phrase as whole words: "next steps to fix" and "root cause:" match, "next
+// stepstones" doesn't. A plural "root causes" counts as the same section.
+func sectionTitle(title, phrase string) bool {
+	rest, ok := strings.CutPrefix(title, phrase)
+	if !ok {
+		return false
+	}
+	if phrase == "root cause" {
+		rest = strings.TrimPrefix(rest, "s")
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return rest == "" || !unicode.IsLetter(r) && !unicode.IsDigit(r)
 }
 
 // atxHeading parses line as a CommonMark ATX heading: at most three leading
@@ -3477,8 +3576,10 @@ func revisionUnapplied(k kustomizationSpec) bool {
 }
 
 // revisionMovedOn re-reads the Kustomization and reports whether it no longer
-// describes the analysed revision: it was recreated (a different UID), or it
-// confidently applied another revision since (see revisionMismatch).
+// describes the analysed revision healthily: it was recreated (a different
+// UID), it confidently applied another revision since (see revisionMismatch),
+// or its reconcile of this revision now fails or waits on a dependency (see
+// reconcileFailureMessage).
 func (p *Processor) revisionMovedOn(ctx context.Context, event eventv1.Event, analysed kustomizationSpec, sha string) (bool, error) {
 	data, err := p.mcp.GetKustomizationStatus(ctx, event.InvolvedObject.Name, event.InvolvedObject.Namespace)
 	if err != nil {
@@ -3493,6 +3594,16 @@ func (p *Processor) revisionMovedOn(ctx context.Context, event eventv1.Event, an
 		p.logger.Info("Kustomization moved on during analysis; deferring the green verdict to its newer revision",
 			"name", event.InvolvedObject.Name, "namespace", event.InvolvedObject.Namespace,
 			"sha", sha, "applied_revision", now.Status.LastAppliedRevision, "recreated", recreated)
+		return true, nil
+	}
+	// A later reconcile of the same revision may have failed meanwhile (a
+	// retry hitting a failed health check or apply): its Ready=False comes
+	// with an error event of its own, which reports it. Recording green here
+	// could freeze the head on a verdict the controller already contradicts.
+	if failed, waiting := reconcileFailureMessage(eventv1.Event{}, now, sha); failed != "" || waiting != "" {
+		p.logger.Info("Kustomization reconcile no longer healthy at the analysed revision; deferring the green verdict",
+			"name", event.InvolvedObject.Name, "namespace", event.InvolvedObject.Namespace,
+			"sha", sha, "reconcile", cmp.Or(failed, waiting))
 		return true, nil
 	}
 	return false, nil

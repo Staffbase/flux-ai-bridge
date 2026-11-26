@@ -367,12 +367,16 @@ func TestProcess_DefersGreenWhenRevisionMovedOnDuringAnalysis(t *testing.T) {
 	const appliedR1 = "dev@sha1:1111111111111111111111111111111111111111"
 	atR1 := strings.Replace(notYetAppliedKustomization, "dev@sha1:0000000000000000000000000000000000000000", appliedR1, 1)
 	atR2 := notYetAppliedKustomization // applied a different revision since
+	// A retry of the same revision failed during the readiness poll.
+	failingAtR1 := strings.Replace(atR1, "status:\n", "status:\n  lastAttemptedRevision: "+appliedR1+
+		"\n  conditions:\n    - type: Ready\n      status: \"False\"\n      reason: HealthCheckFailed\n      message: health check failed\n", 1)
 	for name, tc := range map[string]struct {
 		next     string
 		wantPost bool
 	}{
-		"moved on": {next: atR2},
-		"stayed":   {next: atR1, wantPost: true},
+		"moved on":          {next: atR2},
+		"stayed":            {next: atR1, wantPost: true},
+		"failing meanwhile": {next: failingAtR1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cm := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n  namespace: ns\n")

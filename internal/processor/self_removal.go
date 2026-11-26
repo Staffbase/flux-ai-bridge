@@ -156,8 +156,8 @@ func (p *Processor) selfRemovalExpected(ctx context.Context, owner, repo string,
 // lists the child when the budget runs out (or its inventory can't be read, or
 // is empty while the parent isn't Ready), the answer is "no". attributed is
 // the parent snapshot the PR's files were judged against: a parent recreated,
-// or switched to another source or path since, renders another build, whose
-// dropping the child says nothing about this PR.
+// or switched to another source, path or set of components since, renders
+// another build, whose dropping the child says nothing about this PR.
 func (p *Processor) parentDroppedChild(ctx context.Context, attributed kustomizationSpec, parentName, parentNS, childName, childNS, childUID string) bool {
 	childID := childNS + "_" + childName + "_" + fluxKustomizationGroupKind
 	deadline := time.Now().Add(settleBudget(ctx, p.cfg.ReadinessPollTimeout))
@@ -189,13 +189,16 @@ func (p *Processor) parentDroppedChild(ctx context.Context, attributed kustomiza
 }
 
 // sameParentBuild reports whether two snapshots of a parent Kustomization are
-// the same object (uid, when both carry one) building the same source and path.
+// the same object (uid, when both carry one) building the same source, path
+// and components.
 func sameParentBuild(a, b kustomizationSpec) bool {
 	if a.Metadata.UID != "" && b.Metadata.UID != "" && a.Metadata.UID != b.Metadata.UID {
 		return false
 	}
 	return a.Spec.SourceRef == b.Spec.SourceRef &&
-		bridgesource.CleanPath(a.Spec.Path) == bridgesource.CleanPath(b.Spec.Path)
+		bridgesource.CleanPath(a.Spec.Path) == bridgesource.CleanPath(b.Spec.Path) &&
+		slices.Equal(a.Spec.Components, b.Spec.Components) &&
+		a.Spec.IgnoreMissingComponents == b.Spec.IgnoreMissingComponents
 }
 
 // parentBuildPath returns the repo path the Kustomization's Flux parent builds

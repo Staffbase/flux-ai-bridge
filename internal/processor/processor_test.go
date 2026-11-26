@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1207,23 +1209,30 @@ func TestReconcileLabels_HoldsSuccessUntilRosterComplete(t *testing.T) {
 }
 
 // blockingLabelCommenter parks the first SetPRLabels call until released, so a
-// test can interleave two label writers.
+// test can interleave two label writers. second is closed when a second call
+// starts.
 type blockingLabelCommenter struct {
 	*fakeCommenter
 	mu      sync.Mutex
-	started bool
+	calls   int
 	entered chan struct{}
 	release chan struct{}
+	second  chan struct{}
 }
 
 func (b *blockingLabelCommenter) SetPRLabels(ctx context.Context, owner, repo string, prNumber int, headSHA string, outcome bridgegithub.Outcome) error {
 	b.mu.Lock()
-	first := !b.started
-	b.started = true
+	b.calls++
+	call := b.calls
 	b.mu.Unlock()
-	if first {
+	switch call {
+	case 1:
 		close(b.entered)
 		<-b.release
+	case 2:
+		if b.second != nil {
+			close(b.second)
+		}
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1234,7 +1243,8 @@ func (b *blockingLabelCommenter) SetPRLabels(ctx context.Context, owner, repo st
 // aggregate must not write flux-success after another worker recorded and
 // wrote flux-failed: the aggregate is read and written under one per-PR lock.
 func TestReconcileLabels_StaleSuccessCannotOverwriteNewerFailure(t *testing.T) {
-	commenterMock := &blockingLabelCommenter{fakeCommenter: &fakeCommenter{}, entered: make(chan struct{}), release: make(chan struct{})}
+	commenterMock := &blockingLabelCommenter{fakeCommenter: &fakeCommenter{},
+		entered: make(chan struct{}), release: make(chan struct{}), second: make(chan struct{})}
 	proc := New(&config.Config{PRLabelEnabled: true}, nil, nil, nil, commenterMock, nil, dedupe.NewNoExpiry(16), slog.Default())
 	ctx := context.Background()
 
@@ -1249,7 +1259,21 @@ func TestReconcileLabels_StaleSuccessCannotOverwriteNewerFailure(t *testing.T) {
 		defer wg.Done()
 		_ = proc.reconcileLabels(ctx, "o", "r", "ns/b", "h1", 42, bridgegithub.OutcomeFailure)
 	}()
-	time.Sleep(50 * time.Millisecond)
+	// No sleep: wait until b either writes labels (no lock: fail) or is
+	// parked on the label lock inside applyPRLabel.
+	for deadline := time.Now().Add(10 * time.Second); !goroutineWaitsOnLock("(*Processor).applyPRLabel"); {
+		select {
+		case <-commenterMock.second:
+			close(commenterMock.release)
+			wg.Wait()
+			t.Fatal("scope b wrote labels while scope a's write was in flight: the aggregate isn't read and written under one lock")
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("scope b neither waited on the label lock nor wrote labels")
+		}
+		runtime.Gosched()
+	}
 	close(commenterMock.release)
 	wg.Wait()
 
@@ -1257,6 +1281,60 @@ func TestReconcileLabels_StaleSuccessCannotOverwriteNewerFailure(t *testing.T) {
 	if len(calls) == 0 || calls[len(calls)-1].Outcome != bridgegithub.OutcomeFailure {
 		t.Fatalf("a stale flux-success overwrote the newer flux-failed; label calls %+v", calls)
 	}
+}
+
+// Two replicas (separate processors, one shared outcome store) report scopes of
+// one PR head. Replica A reads an all-green aggregate and its write stalls;
+// replica B records a failure and writes flux-failed meanwhile. A's stale
+// flux-success then lands last, so A must re-read the aggregate after its
+// write and correct the labels.
+func TestReconcileLabels_StaleSuccessAcrossReplicasIsCorrected(t *testing.T) {
+	commenterMock := &blockingLabelCommenter{fakeCommenter: &fakeCommenter{}, entered: make(chan struct{}), release: make(chan struct{})}
+	shared := dedupe.NewNoExpiry(16)
+	replicaA := New(&config.Config{PRLabelEnabled: true}, nil, nil, nil, commenterMock, nil, shared, slog.Default())
+	replicaB := New(&config.Config{PRLabelEnabled: true}, nil, nil, nil, commenterMock, nil, shared, slog.Default())
+	ctx := context.Background()
+
+	done := make(chan error, 1)
+	go func() { done <- replicaA.reconcileLabels(ctx, "o", "r", "ns/a", "h1", 42, bridgegithub.OutcomeSuccess) }()
+	<-commenterMock.entered
+	if err := replicaB.reconcileLabels(ctx, "o", "r", "ns/b", "h1", 42, bridgegithub.OutcomeFailure); err != nil {
+		t.Fatalf("replica B: %v", err)
+	}
+	close(commenterMock.release)
+	if err := <-done; err != nil {
+		t.Fatalf("replica A: %v", err)
+	}
+	calls := commenterMock.labelCalls
+	if len(calls) == 0 || calls[len(calls)-1].Outcome != bridgegithub.OutcomeFailure {
+		t.Fatalf("a replica's stale flux-success stayed on the PR after another replica wrote flux-failed; label calls %+v", calls)
+	}
+}
+
+// goroutineWaitsOnLock reports whether some goroutine is blocked acquiring a
+// sync.Mutex directly inside the function named by frame.
+func goroutineWaitsOnLock(frame string) bool {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	for g := range strings.SplitSeq(string(buf), "\n\n") {
+		lines := strings.Split(g, "\n")
+		for i, l := range lines {
+			if !strings.Contains(l, "Mutex).Lock") {
+				continue
+			}
+			// The frame after Lock (and its file line) is the caller.
+			for _, next := range lines[i+1:] {
+				if strings.HasPrefix(next, "\t") || strings.Contains(next, "Mutex).") {
+					continue
+				}
+				if strings.Contains(next, frame) {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
 }
 
 // The hold releases on COMPLETENESS, not a timer: once every rostered scope has
@@ -1372,6 +1450,44 @@ func TestProcess_DeScope_ReleasesHeldSuccessWithoutHeadOutcome(t *testing.T) {
 		if s == "default/other" {
 			t.Fatalf("default/other still in roster after de-scope")
 		}
+	}
+}
+
+// A de-scope removes the scope's outcome and roster entry, then rewrites the
+// labels. When that write fails, the next event must retry it: with both
+// entries already gone it would find nothing to remove and never write again,
+// leaving flux-success held (or a de-scoped failure) on the PR.
+func TestProcess_DeScope_FailedLabelWriteIsRetried(t *testing.T) {
+	dd := dedupe.NewNoExpiry(16)
+	owner, repo, pr, head := "owner", "repo", 42, "h-new"
+	dd.AddPRScope(owner, repo, pr, "default/apps", time.Hour)
+	dd.AddPRScope(owner, repo, pr, "default/other", time.Hour)
+	dd.PutScopeOutcome(owner, repo, pr, head, "default/apps", string(bridgegithub.OutcomeSuccess), time.Hour)
+
+	mcpMock := &fakeMCPClient{data: []byte(kustomizationOneInventoryEntry)} // inventory: default_any__ConfigMap
+	commenterMock := &fakeCommenter{
+		prNumber: pr, prState: "open", prHeadSHA: head,
+		prFiles:  []bridgegithub.PRFile{{Path: "x.yaml", BlobSHA: "b1", Status: "modified"}},
+		blobs:    map[string][]byte{"b1": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nope\n  namespace: default\n")},
+		labelErr: errors.New("server error"),
+	}
+	cfg := &config.Config{GitHubRepo: owner + "/" + repo, LLMProvider: "none", PRLabelEnabled: true, ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, dd, slog.Default())
+	event := eventv1.Event{InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "other", Namespace: "default"}}
+
+	if err := proc.Process(context.Background(), event, "srcrev"); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	commenterMock.labelErr = nil
+	before := len(commenterMock.labelCalls)
+	if err := proc.Process(context.Background(), event, "srcrev"); err != nil {
+		t.Fatalf("Process (retry): %v", err)
+	}
+	if calls := commenterMock.labelCalls[before:]; len(calls) == 0 || calls[len(calls)-1].Outcome != bridgegithub.OutcomeSuccess {
+		t.Fatalf("the failed de-scope label write was not retried; label calls on the next event %+v", calls)
+	}
+	if slices.Contains(dd.PRScopes(owner, repo, pr), "default/other") {
+		t.Fatalf("default/other still in the roster after the retried de-scope")
 	}
 }
 
@@ -2643,6 +2759,11 @@ func TestStripFailureSections(t *testing.T) {
 			name: "heading with up to three spaces is a heading",
 			in:   "## Kustomization Status\nok\n   ## Root Cause\nx",
 			want: "## Kustomization Status\nok",
+		},
+		{
+			name: "a title that only starts with the phrase is kept",
+			in:   "## Kustomization Status\nok\n## Next stepstones\nkept",
+			want: "## Kustomization Status\nok\n## Next stepstones\nkept",
 		},
 		{
 			name: "tab after the hashes is a heading",

@@ -168,7 +168,7 @@ func (p *Processor) fetchFailureContext(ctx context.Context, event eventv1.Event
 	logPods := failing
 	withheldLogs := 0
 	if ownedLogs {
-		logPods, withheldLogs = p.ownedFailingPods(ctx, failing, statuses, podStatuses)
+		logPods, withheldLogs = p.ownedFailingPods(ctx, failing, statuses)
 	}
 	failing = failing[:min(len(failing), maxFailingPods)]
 	cutoffs := earliestFailingPodPerNamespace(failing)
@@ -968,12 +968,14 @@ func (p *Processor) sweepFailingPods(ctx context.Context, namespaces []string, l
 // is resolved like the pod scan does it (resolvePodController: Pod →
 // ReplicaSet → Deployment; StatefulSet, DaemonSet and Job directly), plus one
 // hop Job → CronJob, as a CronJob's runs are never inventory entries
-// themselves. A pod the inventory lists by name counts too. A pod whose owner
+// themselves. It starts from the failing pod's own ownerReferences, never
+// from the pod scan's row of the same name: that row may describe an earlier
+// pod the name belonged to. A pod the inventory lists by name counts too. A pod whose owner
 // can't be resolved (naked, a ReplicaSet lookup that failed, a Job read that
 // failed) is left out: fail closed, an unrelated app's logs must not reach the
 // prompt on a guess. Returns at most maxFailingPods pods and the number of
 // failing pods left out for ownership.
-func (p *Processor) ownedFailingPods(ctx context.Context, failing []failingPod, statuses, podStatuses []readiness.ResourceStatus) (owned []failingPod, withheld int) {
+func (p *Processor) ownedFailingPods(ctx context.Context, failing []failingPod, statuses []readiness.ResourceStatus) (owned []failingPod, withheld int) {
 	inventory := make(map[string]bool, len(statuses))
 	for _, r := range statuses {
 		inventory[r.Kind+"/"+r.Namespace+"/"+r.Name] = true
@@ -981,7 +983,7 @@ func (p *Processor) ownedFailingPods(ctx context.Context, failing []failingPod, 
 	rsCache := map[string]string{}
 	jobOwners := map[string]string{}
 	for _, fp := range failing {
-		if !p.podOwnedByInventory(ctx, fp, inventory, podStatuses, rsCache, jobOwners) {
+		if !p.podOwnedByInventory(ctx, fp, inventory, rsCache, jobOwners) {
 			withheld++
 			p.logger.Debug("failure context: logs withheld, pod not owned by the inventory",
 				"pod", fp.namespace+"/"+fp.name)
@@ -995,21 +997,17 @@ func (p *Processor) ownedFailingPods(ctx context.Context, failing []failingPod, 
 }
 
 // podOwnedByInventory reports whether a workload in the inventory set
-// ("Kind/namespace/name") owns the failing pod. podStatuses supplies the
-// controller the pod scan already resolved; other pods (other namespaces, or
-// pods the scan didn't see) are resolved here. jobOwners caches a Job's
+// ("Kind/namespace/name") owns the failing pod, resolved from the pod's own
+// ownerReferences as the failure sweep read them. jobOwners caches a Job's
 // owner ("Kind/name", "" for none) by "namespace/job".
-func (p *Processor) podOwnedByInventory(ctx context.Context, fp failingPod, inventory map[string]bool, podStatuses []readiness.ResourceStatus, rsCache, jobOwners map[string]string) bool {
+func (p *Processor) podOwnedByInventory(ctx context.Context, fp failingPod, inventory map[string]bool, rsCache, jobOwners map[string]string) bool {
 	listed := func(kind, name string) bool { return inventory[kind+"/"+fp.namespace+"/"+name] }
 	if listed("Pod", fp.name) {
 		return true
 	}
-	ctrl := controllerFor(podStatuses, fp.namespace, fp.name)
-	if ctrl == "" {
-		ctrl = p.resolvePodController(ctx, podInfo{Metadata: podMetadata{
-			Name: fp.name, Namespace: fp.namespace, OwnerReferences: fp.ownerRefs,
-		}}, rsCache)
-	}
+	ctrl := p.resolvePodController(ctx, podInfo{Metadata: podMetadata{
+		Name: fp.name, Namespace: fp.namespace, OwnerReferences: fp.ownerRefs,
+	}}, rsCache)
 	kind, name, ok := strings.Cut(ctrl, "/")
 	if !ok {
 		return false // naked pod: no owner
@@ -1413,7 +1411,8 @@ func parseJobList(yamlStream []byte) ([]jobInfo, error) {
 // active, or one created after the pod scan, has proven nothing yet, so it
 // can't read green. Families whose newest run HAS visible pods are
 // skipped: the pod rows already carry the verdict with container-level
-// detail. A CronJob run is a Job a CronJob owns and named after it
+// detail — except a Failed=True run none of whose visible pods reads Failed
+// (only a succeeded pod is left), which still gets its Failed row. A CronJob run is a Job a CronJob owns and named after it
 // (`<cronjob>-<slot>`); the second return value holds their names for
 // dropSupersededJobPods. One MCP list per analysis; errors yield no rows and
 // no runs — no superseded run is dropped, so an old run's failure stays
@@ -1462,16 +1461,21 @@ func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows 
 	if len(newest) == 0 {
 		return nil, cronRuns
 	}
-	// Families whose newest run already shows pods are judged by those rows.
+	// Families whose newest run already shows pods are judged by those rows —
+	// unless the Job failed and none of them reads Failed: a run with several
+	// completions can fail (deadline exceeded, its running pods deleted)
+	// after one pod succeeded, and that pod alone would read green.
 	covered := make(map[string]bool, len(podRows))
+	podFailed := make(map[string]bool, len(podRows))
 	for _, r := range podRows {
 		if jobName, isJob := strings.CutPrefix(r.Controller, "Job/"); isJob {
 			covered[jobName] = true
+			podFailed[jobName] = podFailed[jobName] || r.Status == "Failed"
 		}
 	}
 	var out []readiness.ResourceStatus
 	for fam, r := range newest {
-		if covered[r.job.Metadata.Name] {
+		if covered[r.job.Metadata.Name] && (podFailed[r.job.Metadata.Name] || !jobFailed(r.job)) {
 			continue
 		}
 		row := readiness.ResourceStatus{
@@ -1489,7 +1493,11 @@ func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows 
 					msg = "Job failed"
 				}
 				row.Status = "Failed"
-				row.Message = msg + " (run's pods already removed)"
+				if covered[r.job.Metadata.Name] {
+					row.Message = msg + " (no failed pod of the run left)"
+				} else {
+					row.Message = msg + " (run's pods already removed)"
+				}
 				break
 			}
 			if c.Type == "Complete" && c.Status == "True" {
@@ -1501,6 +1509,16 @@ func (p *Processor) cronRunFallbackRows(ctx context.Context, ns string, podRows 
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, cronRuns
+}
+
+// jobFailed reports whether the Job carries Failed=True.
+func jobFailed(j jobInfo) bool {
+	for _, c := range j.Status.Conditions {
+		if c.Type == "Failed" && c.Status == "True" {
+			return true
+		}
+	}
+	return false
 }
 
 // dropOlderCronRunPods removes the pod rows of CronJob runs older than a run

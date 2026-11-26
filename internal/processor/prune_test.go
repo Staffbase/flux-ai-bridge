@@ -23,6 +23,7 @@ import (
 
 	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
 	"github.com/staffbase/flux-ai-bridge/internal/config"
+	"github.com/staffbase/flux-ai-bridge/internal/dedupe"
 	bridgegithub "github.com/staffbase/flux-ai-bridge/internal/github"
 	"github.com/staffbase/flux-ai-bridge/internal/readiness"
 	corev1 "k8s.io/api/core/v1"
@@ -592,6 +593,135 @@ metadata:
 	}
 	if got != bridgegithub.OutcomeWarning {
 		t.Errorf("mixed PR with a finalizer-stuck in-place removal label = %q, want warning", got)
+	}
+}
+
+// A PR drops a still-present manifest from the build (out of the
+// kustomization.yaml's resources) and edits it too. The file is now outside
+// the build, so it can't attribute; but its base resource was pruned and is
+// finalizer-stuck, so the in-place diff must still see it and keep the verdict
+// ⚠️ instead of a premature ✅.
+func TestProcess_FileDroppedFromBuildStuckTeardownIsWarning(t *testing.T) {
+	const inventoryWithKeptCM = `
+spec:
+  sourceRef:
+    name: flux-system
+    kind: GitRepository
+status:
+  inventory:
+    entries:
+      - id: "batch-jobs_kept-cm__ConfigMap"
+`
+	keptCM := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kept-cm\n  namespace: batch-jobs\n")
+	stuckLive := []byte(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stuck-cm
+  namespace: batch-jobs
+  deletionTimestamp: "2026-06-15T10:00:00Z"
+  finalizers:
+    - example.com/protect
+`)
+	mcpMock := &fakeMCPClient{
+		data: []byte(inventoryWithKeptCM),
+		lists: map[string][]byte{
+			"v1|Event|flux-system": eventsListYAML("batch-jobs", "ConfigMap/batch-jobs/stuck-cm deleted"),
+		},
+		resources: map[string][]byte{
+			"v1|ConfigMap|kept-cm|batch-jobs":  keptCM,
+			"v1|ConfigMap|stuck-cm|batch-jobs": stuckLive,
+		},
+	}
+	commenterMock := &fakeCommenter{
+		prNumber:  89,
+		prBaseSHA: "base-sha",
+		prFiles: []bridgegithub.PRFile{
+			{Path: "apps/batch-jobs/base/kustomization.yaml", BlobSHA: "kustomization-head", Status: "modified"},
+			{Path: "apps/batch-jobs/base/stuck-cm.yaml", BlobSHA: "stuck-head", Status: "modified"},
+		},
+		blobs: map[string][]byte{
+			// Edited, still declares stuck-cm, but no longer in the build.
+			"stuck-head": []byte(stuckConfigMapBlob + "data:\n  note: edited\n"),
+		},
+		baseFiles: map[string][]byte{"apps/batch-jobs/base/stuck-cm.yaml": []byte(stuckConfigMapBlob)},
+	}
+	cfg := &config.Config{
+		GitHubRepo: "owner/repo", LLMProvider: "none",
+		PRLabelEnabled: true, PRAttributePrunes: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
+	}
+	scope := fakeScope{files: map[string]struct{}{
+		"apps/batch-jobs/base/kustomization.yaml": {},
+		"apps/batch-jobs/base/kept-cm.yaml":       {},
+	}}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, nil, slog.Default()).WithScopeResolver(scope)
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "batch-jobs", Namespace: "flux-system"},
+		Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
+	}
+	if err := proc.Process(context.Background(), event, "sha-dropped"); err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+	got, ok := lastLabel(commenterMock.labelCalls, 89)
+	if !ok {
+		t.Fatalf("expected a label on the PR; labelCalls=%v", commenterMock.labelCalls)
+	}
+	if got != bridgegithub.OutcomeWarning {
+		t.Errorf("PR whose dropped-from-build file's teardown is stuck: label = %q, want warning", got)
+	}
+}
+
+// The out-of-build diff only attributes by prune. A PR that now edits only
+// another overlay's file, whose base resource this inventory never had, is not
+// a completed deletion here: it is de-scoped like any PR that stopped touching
+// this Kustomization, even while this reconcile pruned something unrelated.
+func TestProcess_OutOfBuildEditIsNotADeletionHere(t *testing.T) {
+	const inventoryWithKeptCM = `
+spec:
+  sourceRef:
+    name: flux-system
+    kind: GitRepository
+status:
+  inventory:
+    entries:
+      - id: "batch-jobs_kept-cm__ConfigMap"
+`
+	keptCM := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kept-cm\n  namespace: batch-jobs\n")
+	otherCM := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: other-cm\n  namespace: batch-jobs\n")
+	mcpMock := &fakeMCPClient{
+		data: []byte(inventoryWithKeptCM),
+		lists: map[string][]byte{
+			"v1|Event|flux-system": eventsListYAML("batch-jobs", "ConfigMap/batch-jobs/unrelated deleted"),
+		},
+		resources: map[string][]byte{"v1|ConfigMap|kept-cm|batch-jobs": keptCM},
+	}
+	commenterMock := &fakeCommenter{
+		prNumber: 90, prHeadSHA: "h1", prBaseSHA: "base-sha",
+		prFiles:   []bridgegithub.PRFile{{Path: "apps/prod/other-cm.yaml", BlobSHA: "other-head", Status: "modified"}},
+		blobs:     map[string][]byte{"other-head": append(otherCM, []byte("data:\n  note: edited\n")...)},
+		baseFiles: map[string][]byte{"apps/prod/other-cm.yaml": otherCM},
+	}
+	dd := dedupe.NewNoExpiry(16)
+	dd.AddPRScope("owner", "repo", 90, "flux-system/batch-jobs", time.Hour)
+	cfg := &config.Config{
+		GitHubRepo: "owner/repo", LLMProvider: "none", CommentOnSuccess: true,
+		PRLabelEnabled: true, PRAttributePrunes: true,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 10 * time.Millisecond,
+	}
+	scope := fakeScope{files: map[string]struct{}{"apps/batch-jobs/base/kept-cm.yaml": {}}}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), nil, commenterMock, nil, dd, slog.Default()).WithScopeResolver(scope)
+	event := eventv1.Event{
+		InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "batch-jobs", Namespace: "flux-system"},
+		Severity:       eventv1.EventSeverityInfo, Reason: "ReconciliationSucceeded",
+	}
+	if err := proc.Process(context.Background(), event, "sha-other"); err != nil {
+		t.Fatalf("Process() error: %v", err)
+	}
+	if len(commenterMock.posts) != 0 {
+		t.Errorf("a PR editing only another overlay's file was kept attributed: %+v", commenterMock.posts)
+	}
+	if len(commenterMock.removeCalls) != 1 {
+		t.Errorf("expected the de-scope cleanup, got %d RemoveComment calls", len(commenterMock.removeCalls))
 	}
 }
 
