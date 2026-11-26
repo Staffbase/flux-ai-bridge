@@ -626,12 +626,12 @@ config:
 # GitHub auth is via a GitHub App — set all three credentials.githubApp
 # fields. See docs/github-app.md for App setup + required permissions.
 credentials:
-  anthropicApiKey: "" # only required when config.llm.provider=claude
+  anthropicApiKey: ""  # only required when config.llm.provider=claude
   # All three fields must be set together. Partial config fails at bridge
   # startup with a clear error. See docs/github-app.md.
   githubApp:
-    appId: "" # e.g. "12345"
-    installationId: "" # e.g. "67890"
+    appId: ""  # e.g. "12345"
+    installationId: ""  # e.g. "67890"
     # The full PEM contents of the App's private key. Use --set-file when
     # bootstrapping by hand:  --set-file credentials.githubApp.privateKey=key.pem
     privateKey: ""
