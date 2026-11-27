@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       published: ${{ steps.check.outputs.published }}
+      sha: ${{ steps.check.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,6 +43,7 @@ jobs:
           image="ghcr.io/staffbase/flux-ai-bridge:$(yq '.appVersion' charts/flux-ai-bridge/Chart.yaml)"
           if out=$(docker manifest inspect "$image" 2>&1); then
             echo 'published=true' >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           elif echo "$out" | grep -q 'manifest unknown'; then
             echo "::notice title=Chart release waits for its image::$image isn't published yet. Publishing that app release releases the chart."
           else
@@ -66,7 +68,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event.repository.default_branch }}
+          # The commit the image check read: main may have moved since.
+          ref: ${{ needs.image.outputs.sha }}
 
       - name: Configure Git
         run: |
