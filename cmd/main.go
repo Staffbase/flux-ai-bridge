@@ -230,6 +230,7 @@ func run(logger *slog.Logger) error {
 	}
 	handler := webhook.NewHandler(proc, logger, webhook.Options{
 		MaxConcurrent:     parseIntEnv("WEBHOOK_MAX_CONCURRENT", 16),
+		QueueSize:         parseIntEnv("WEBHOOK_QUEUE_SIZE", 0),
 		HMACSecret:        hmacSecret,
 		Filter:            filter,
 		ProcessingTimeout: cfg.ProcessingTimeout(),

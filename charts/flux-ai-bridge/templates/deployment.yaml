@@ -129,6 +129,10 @@ spec:
             - name: WEBHOOK_MAX_CONCURRENT
               value: {{ .Values.config.webhook.maxConcurrent | quote }}
             {{- end }}
+            {{- if .Values.config.webhook.queueSize }}
+            - name: WEBHOOK_QUEUE_SIZE
+              value: {{ .Values.config.webhook.queueSize | quote }}
+            {{- end }}
             {{- if .Values.config.mcp.poolSize }}
             - name: MCP_POOL_SIZE
               value: {{ .Values.config.mcp.poolSize | quote }}

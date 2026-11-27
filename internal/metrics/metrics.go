@@ -37,8 +37,8 @@ var (
 	//     invalid          — the body couldn't be read (e.g. over 1 MiB) or
 	//                        decoded as an event; client gets 400/413
 	//     skipped          — event ignored before processing (wrong kind/severity, kustomization filter, etc.)
-	//     busy             — event queue full (4× WEBHOOK_MAX_CONCURRENT running
-	//                        + waiting); client gets 503. Also an event that
+	//     busy             — event queue full (WEBHOOK_MAX_CONCURRENT running
+	//                        + WEBHOOK_QUEUE_SIZE waiting); client gets 503. Also an event that
 	//                        arrives after shutdown began (503), and a queued
 	//                        event abandoned at shutdown
 	//
