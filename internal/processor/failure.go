@@ -1654,15 +1654,13 @@ func (p *Processor) waitPodsSettled(ctx context.Context, namespaces []string, in
 
 // quietWindowOpen says why settled pods didn't count yet: what last changed
 // the namespace, or the start of the readiness poll when nothing changed
-// since. No elapsed time: the comment body is the comment's stability key,
-// and a seconds count would repost an unchanged state on every re-eval.
+// since. It says nothing about when the change happened relative to a scan:
+// the last scan itself may be the one that saw it. No elapsed time either.
 func quietWindowOpen(lastChange string, fromPollStart bool, quietPeriod time.Duration) string {
-	since := "the readiness poll started"
-	if !fromPollStart && lastChange != "" {
-		since = lastChange
+	if fromPollStart || lastChange == "" {
+		return fmt.Sprintf("the pods hadn't stayed unchanged for %s (the pod quiet period) since the readiness poll started.", quietPeriod)
 	}
-	return fmt.Sprintf("%s less than %s (the pod quiet period) before the last pod scan, so the pods hadn't settled.",
-		since, quietPeriod)
+	return fmt.Sprintf("%s, and the pods hadn't stayed unchanged for %s (the pod quiet period) since then.", lastChange, quietPeriod)
 }
 
 // minPodScan is the least time one pod scan gets, even when the readiness

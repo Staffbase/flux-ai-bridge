@@ -214,7 +214,7 @@ func TestBuildPrompt_ReadinessTimeout(t *testing.T) {
 		t.Errorf("settled poll must not carry the timeout line, got: %q", settled)
 	}
 
-	const why = "pod `db-0` was created less than 1m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
+	const why = "pod `db-0` was created, and the pods hadn't stayed unchanged for 1m0s (the pod quiet period) since then."
 	if withWhy := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, false, why); !strings.Contains(withWhy, line+": ") || !strings.Contains(withWhy, "\nWhat was still changing: "+why+"\n") {
 		t.Errorf("unsettled poll with a reason must carry it after the timeout line, got: %q", withWhy)
 	}
@@ -3478,6 +3478,53 @@ func TestProcess_UnchangedState_SkipsLLMAndRepost(t *testing.T) {
 	}
 	if len(commenterMock.posts) != 2 || analyzerMock.calls != 2 {
 		t.Fatalf("changed state must re-analyse and repost: want 2/2, got %d posts / %d calls", len(commenterMock.posts), analyzerMock.calls)
+	}
+}
+
+// TestProcess_QuietWindowReasonStaysOutOfStabilityKey: two re-evals end with
+// the same pods inside the quiet window, but for different reasons (a pod
+// removed in the first, nothing since the poll started in the second). The
+// reason is shown, yet it mustn't repost the comment or re-run the LLM.
+func TestProcess_QuietWindowReasonStaysOutOfStabilityKey(t *testing.T) {
+	created := time.Now().Add(-24 * time.Hour)
+	web := podSpec{name: "web", ready: true, created: created}
+	mcpMock := &fakeMCPClient{
+		data:      []byte(kustomizationOneInventoryEntry),
+		resources: map[string][]byte{"v1|ConfigMap|any|default": []byte(healthyConfigMapYAML)},
+		listQueue: map[string][][]byte{"v1|Pod|apps": {
+			[]byte(podsListYAML(web, podSpec{name: "old-0", ready: true, created: created})),
+			[]byte(podsListYAML(web)),
+		}},
+	}
+	analyzerMock := &fakeAnalyzer{result: "## Kustomization Status\npods settling"}
+	commenterMock := &fakeCommenter{prNumber: 42, prState: "open", prHeadSHA: "h1", stabilityKeys: map[int]string{}}
+	cfg := &config.Config{
+		GitHubRepo: "owner/repo", LLMProvider: "claude", CommentIncludeSummary: true,
+		DedupePRReEvalTTL: time.Millisecond, DedupeReEvalFailedOnly: true,
+		ReadinessIncludePods: true, ReadinessPodQuietPeriod: time.Hour,
+		ReadinessPollInterval: time.Millisecond, ReadinessPollTimeout: 30 * time.Millisecond,
+	}
+	proc := New(cfg, mcpMock, readiness.NewChecker(mcpMock), analyzerMock, commenterMock, nil, dedupe.NewNoExpiry(16), slog.Default())
+	event := eventv1.Event{InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "apps", Namespace: "default"}, Message: "applied"}
+
+	if err := proc.Process(context.Background(), event, "srcrev1"); err != nil {
+		t.Fatalf("first Process: %v", err)
+	}
+	if len(commenterMock.posts) != 1 || analyzerMock.calls != 1 {
+		t.Fatalf("first run: want 1 post / 1 LLM call, got %d / %d", len(commenterMock.posts), analyzerMock.calls)
+	}
+	if body := commenterMock.posts[0].Body; !strings.Contains(body, "pod `old-0` was removed") {
+		t.Fatalf("first comment must name the removed pod, got: %q", body)
+	}
+	time.Sleep(3 * time.Millisecond) // let the re-eval floor elapse
+
+	mcpMock.listQueue["v1|Pod|apps"] = [][]byte{[]byte(podsListYAML(web))}
+	mcpMock.listCalls = nil
+	if err := proc.Process(context.Background(), event, "srcrev2"); err != nil {
+		t.Fatalf("second Process: %v", err)
+	}
+	if len(commenterMock.posts) != 1 || analyzerMock.calls != 1 {
+		t.Fatalf("only the reason changed: want no repost and no LLM call, got %d posts / %d calls", len(commenterMock.posts), analyzerMock.calls)
 	}
 }
 

@@ -1719,7 +1719,7 @@ func TestWaitPodsSettled_OpenQuietWindowNamesLastChange(t *testing.T) {
 	if settled {
 		t.Fatal("expected NOT settled: db-0 was created inside the quiet period")
 	}
-	want := "pod `db-0` was created less than 1h0m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
+	want := "pod `db-0` was created, and the pods hadn't stayed unchanged for 1h0m0s (the pod quiet period) since then."
 	if quietOpen != want {
 		t.Errorf("quietOpen = %q, want %q", quietOpen, want)
 	}
@@ -1737,7 +1737,7 @@ func TestWaitPodsSettled_OpenQuietWindowLatePodWasFirstSeen(t *testing.T) {
 	proc := quietFixture(t, mcp, time.Hour)
 
 	_, _, _, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
-	if !strings.HasPrefix(quietOpen, "pod `late` was first seen less than 1h0m0s") {
+	if !strings.HasPrefix(quietOpen, "pod `late` was first seen, and") {
 		t.Errorf("quietOpen = %q, want the late pod as first seen", quietOpen)
 	}
 }
@@ -1755,7 +1755,7 @@ func TestWaitPodsSettled_OpenQuietWindowNamesFirstRemovedPod(t *testing.T) {
 		}}
 		proc := quietFixture(t, mcp, time.Hour)
 		_, _, _, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
-		if !strings.HasPrefix(quietOpen, "pod `alpha` was removed less than") {
+		if !strings.HasPrefix(quietOpen, "pod `alpha` was removed, and") {
 			t.Fatalf("quietOpen = %q, want the alphabetically first removed pod", quietOpen)
 		}
 	}
@@ -1773,7 +1773,7 @@ func TestWaitPodsSettled_OpenQuietWindowFromPollStart(t *testing.T) {
 	if settled {
 		t.Fatal("expected NOT settled: the poll started inside the quiet period")
 	}
-	if !strings.HasPrefix(quietOpen, "the readiness poll started less than 1h0m0s") {
+	if !strings.HasSuffix(quietOpen, "since the readiness poll started.") {
 		t.Errorf("quietOpen = %q, want it to count from the poll start", quietOpen)
 	}
 }
@@ -1916,7 +1916,7 @@ items:
 		t.Error("expected NOT settled: a failed Job pod must not skip the quiet period")
 	}
 	// The reason describes only the window; it must not call the failed pod Current.
-	if want := "the readiness poll started less than 1h0m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."; quietOpen != want {
+	if want := "the pods hadn't stayed unchanged for 1h0m0s (the pod quiet period) since the readiness poll started."; quietOpen != want {
 		t.Errorf("quietOpen = %q, want %q", quietOpen, want)
 	}
 }

@@ -811,7 +811,10 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 		// HelmRelease with no visible children yet can otherwise leave the
 		// tables looking like a small, complete, all-green release when
 		// they're actually blind to whatever the chart renders.
-		analysis = buildKstatusBody(resourceStatuses, podStatuses, podsScanned, settled, p.cfg.CommentIncludeSummary, p.cfg.CommentFailedResourcesOnly, event.InvolvedObject.Name, reconcileFailedMsg, reconcileWaitingMsg, pendingHelmReleases, unsettledWhy)
+		kstatusBody := func(why string) string {
+			return buildKstatusBody(resourceStatuses, podStatuses, podsScanned, settled, p.cfg.CommentIncludeSummary, p.cfg.CommentFailedResourcesOnly, event.InvolvedObject.Name, reconcileFailedMsg, reconcileWaitingMsg, pendingHelmReleases, why)
+		}
+		analysis = kstatusBody(unsettledWhy)
 		// The deterministic body is the comment's STABILITY KEY: the LLM
 		// narrative below is non-deterministic (the same broken state gets
 		// re-worded on every re-eval window), and keying the repost decision on
@@ -825,7 +828,11 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 		// deterministic presentation changes (toggling COMMENT_INCLUDE_FOOTER,
 		// future wrapper changes) alter the key and refresh existing comments
 		// instead of matching their embedded key forever.
-		stabilityKey = formatComment(analysis, p.cfg.CommentIncludeFooter, retryNote)
+		//
+		// The quiet-window reason stays out of the key: runs with the same
+		// final state can end on different pod changes (or none), and that
+		// alone mustn't repost the comment or re-run the LLM.
+		stabilityKey = formatComment(kstatusBody(""), p.cfg.CommentIncludeFooter, retryNote)
 		allCommentsCurrent := true
 		for _, pr := range toPost {
 			if p.commenter.CommentCurrent(ctx, owner, repo, event.InvolvedObject.Namespace, event.InvolvedObject.Name, pr.Number, stabilityKey) {
