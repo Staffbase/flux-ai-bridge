@@ -2975,9 +2975,16 @@ func buildPrompt(event eventv1.Event, revision, kustomizationYAML string, status
 	builder.WriteString("\n\n## Resource Readiness\n")
 	if !settled {
 		builder.WriteString("Readiness poll timed out: at least one resource or pod was still changing state when the bridge stopped waiting, so the rows below are the last snapshot, not a settled result.\n")
+		if anyStale(statuses) {
+			builder.WriteString("Rows marked `" + staleRowNote + "` were not read in the last poll: it ran out of time before it reached them. They show the poll before, so their current state is unknown: say they weren't read, and don't call them healthy or broken from those rows alone.\n")
+		}
 	}
 	writeReadinessSummary(&builder, "resources", statuses, func(r readiness.ResourceStatus) string {
-		line := fmt.Sprintf("- %s/%s/%s: %s — %s", r.Kind, r.Namespace, r.Name, r.Status, r.Message)
+		msg := r.Message
+		if r.Stale {
+			msg = staleRowNote + msg
+		}
+		line := fmt.Sprintf("- %s/%s/%s: %s — %s", r.Kind, r.Namespace, r.Name, r.Status, msg)
 		// Hard replica counts for workloads (Deployment/StatefulSet/…): the
 		// ground truth the model must use instead of guessing availability from
 		// the Deployment `Available` condition. "0/1 ready" is unambiguous.
@@ -3009,7 +3016,9 @@ func buildPrompt(event eventv1.Event, revision, kustomizationYAML string, status
 // writeReadinessSummary writes a token-frugal readiness section: a one-line
 // "X of N <noun> reached Current" count, then a line (via the formatter) for
 // each NON-Current row only. All-Current collapses to just the count line.
-// Empty input writes nothing.
+// A stale row (kept from the previous poll) is never counted as Current and
+// is always listed: it wasn't read in the last poll. Empty input writes
+// nothing.
 func writeReadinessSummary(b *strings.Builder, noun string, statuses []readiness.ResourceStatus, line func(readiness.ResourceStatus) string) {
 	total := len(statuses)
 	if total == 0 {
@@ -3017,7 +3026,7 @@ func writeReadinessSummary(b *strings.Builder, noun string, statuses []readiness
 	}
 	current := 0
 	for _, s := range statuses {
-		if s.Status == "Current" {
+		if s.Status == "Current" && !s.Stale {
 			current++
 		}
 	}
@@ -3025,12 +3034,26 @@ func writeReadinessSummary(b *strings.Builder, noun string, statuses []readiness
 		fmt.Fprintf(b, "All %d %s reached Current.\n", total, noun)
 		return
 	}
-	fmt.Fprintf(b, "%d of %d %s reached Current. Not Current:\n", current, total, noun)
+	label := "Not Current:"
+	if anyStale(statuses) {
+		label = "Not Current, or not read in the last poll:"
+	}
+	fmt.Fprintf(b, "%d of %d %s reached Current. %s\n", current, total, noun, label)
 	for _, s := range statuses {
-		if s.Status != "Current" {
+		if s.Status != "Current" || s.Stale {
 			b.WriteString(line(s))
 		}
 	}
+}
+
+// anyStale reports whether any row was kept from the previous poll.
+func anyStale(statuses []readiness.ResourceStatus) bool {
+	for _, s := range statuses {
+		if s.Stale {
+			return true
+		}
+	}
+	return false
 }
 
 // kstatusReadmeURL is the upstream reference linked from the optional

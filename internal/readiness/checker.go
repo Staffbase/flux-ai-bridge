@@ -312,23 +312,20 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func(contex
 	}
 }
 
-// rowsFor returns the poll's rows for the latest refs when the poll ends right
-// after a check found different refs: a ref the poll read keeps its row, and a
-// ref it never read (a HelmRelease child that just appeared) gets an Unknown
-// row, so no caller can count the result as settled. With no latest refs it
-// returns results unchanged.
+// rowsFor adds the refs a check after the poll found but the poll never read
+// (a HelmRelease child that just appeared) to the poll's rows, as Unknown, so
+// no caller can count the result as settled. Every row the poll read stays,
+// even when the check returned fewer refs: a shorter list (an expansion read
+// that failed) doesn't prove a resource is gone, and dropping a Failed row
+// would hide an observed failure. Removal is left to the prune handling.
 func rowsFor(latest, refs []string, results []ResourceStatus) []ResourceStatus {
-	if latest == nil {
-		return results
+	read := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		read[ref] = true
 	}
-	byRef := make(map[string]ResourceStatus, len(refs))
-	for i, ref := range refs {
-		byRef[ref] = results[i]
-	}
-	out := make([]ResourceStatus, 0, len(latest))
+	out := results
 	for _, ref := range latest {
-		if r, ok := byRef[ref]; ok {
-			out = append(out, r)
+		if read[ref] {
 			continue
 		}
 		parsed, err := ParseInventoryID(ref)

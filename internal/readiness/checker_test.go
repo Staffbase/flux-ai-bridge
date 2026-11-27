@@ -1411,3 +1411,58 @@ func (s *slowRefsFetcher) GetKubernetesResource(ctx context.Context, apiVersion,
 		return nil, ctx.Err()
 	}
 }
+
+// failedDeploymentYAML is a Deployment past its progress deadline, which
+// kstatus reads as Failed.
+const failedDeploymentYAML = `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: default
+  generation: 1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+status:
+  observedGeneration: 1
+  replicas: 1
+  updatedReplicas: 1
+  readyReplicas: 0
+  availableReplicas: 0
+  conditions:
+    - type: Progressing
+      status: "False"
+      reason: ProgressDeadlineExceeded
+`
+
+// When the final refs check returns fewer refs (an expansion read failed),
+// the rows the poll read stay: a shorter list doesn't prove the child is gone,
+// and dropping its Failed row would hide an observed failure.
+func TestWaitUntilSettledFunc_ShrinkingRefsKeepReadRows(t *testing.T) {
+	fake := &fakeFetcher{resources: map[string]string{
+		"apps/v1|Deployment|api|default":    readyDeploymentYAML,
+		"apps/v1|Deployment|worker|default": failedDeploymentYAML,
+	}}
+	slow := &slowRefsFetcher{inner: fake, delay: 30 * time.Millisecond}
+	calls := 0
+	refsFunc := func(context.Context) []string {
+		calls++
+		if calls == 1 {
+			return []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+		}
+		return []string{"default_api_apps_Deployment"}
+	}
+	// The poll reads both rows in 60ms; the refs check then lists only api,
+	// and a second 60ms poll can't fit in the 40ms left.
+	results, settled, err := NewChecker(slow).WaitUntilSettledFunc(context.Background(), refsFunc,
+		10*time.Millisecond, 100*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if len(results) != 2 || results[1].Name != "worker" || results[1].Status != "Failed" {
+		t.Fatalf("results = %+v, want the Failed worker row kept", results)
+	}
+}
