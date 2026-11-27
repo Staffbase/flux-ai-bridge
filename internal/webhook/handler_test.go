@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -401,7 +402,7 @@ func TestHandler_QueuesEventsBeyondConcurrency(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(proc.release) }) }
 	t.Cleanup(release)
-	h := NewHandler(proc, discardLogger(), Options{MaxConcurrent: 1})
+	h := NewHandler(proc, discardLogger(), Options{MaxConcurrent: 1, QueueSize: 3})
 	codes := make([]int, 0, 5)
 	for range 5 {
 		codes = append(codes, postWebhook(h, newKustomizationEvent("apps", "default", "main@sha1:"+testSHA)).Code)
@@ -430,6 +431,32 @@ func TestHandler_QueuesEventsBeyondConcurrency(t *testing.T) {
 	}
 	if got := proc.done.Load(); got != 4 {
 		t.Fatalf("processed %d events, want all 4 accepted ones", got)
+	}
+}
+
+// The queue holds the running events plus QueueSize waiting ones; unset, the
+// default lets a revision's whole event wave wait instead of answering 503.
+func TestNewHandler_QueueSize(t *testing.T) {
+	tests := []struct {
+		name string
+		opts Options
+		want int
+	}{
+		{name: "defaults", opts: Options{}, want: 16 + defaultQueueSize},
+		{name: "configured", opts: Options{MaxConcurrent: 4, QueueSize: 10}, want: 14},
+		{name: "negative uses default", opts: Options{MaxConcurrent: 4, QueueSize: -1}, want: 4 + defaultQueueSize},
+		// An oversized setting must not overflow the capacity (a negative
+		// make size panics at startup).
+		{name: "above the maximum uses the maximum", opts: Options{QueueSize: math.MaxInt}, want: 16 + maxQueueSize},
+		{name: "huge concurrency saturates", opts: Options{MaxConcurrent: math.MaxInt, QueueSize: 10}, want: math.MaxInt},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewHandler(&countingProcessor{}, discardLogger(), tt.opts)
+			if got := cap(h.queue); got != tt.want {
+				t.Errorf("queue capacity = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
 

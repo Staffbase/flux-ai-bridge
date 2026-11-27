@@ -626,6 +626,11 @@ config:
     # Maximum number of webhook events processed concurrently.
     # Empty = bridge default (16).
     maxConcurrent: ""
+    # Events that may wait for a processing slot; beyond that the bridge
+    # answers 503. A new source revision makes every Kustomization that uses
+    # it send an event within seconds, so keep it above the number of
+    # Kustomizations the bridge watches. Empty = bridge default (512).
+    queueSize: ""
 
 # Credentials placed into a Secret created by this chart.
 # Ignored when existingSecret is set.

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
@@ -44,12 +45,19 @@ const (
 	// the per-event pipeline budget always exceeds the readiness poll budget.
 	defaultProcessingTimeout = 5 * time.Minute
 
-	// queueFactor sizes the admission queue as a multiple of the concurrency
-	// limit: events beyond the running ones wait for a slot instead of being
-	// turned away. notification-controller retries a 503 only a few times
-	// within about a minute while a pipeline takes minutes, so a revision that
-	// fans out to more Kustomizations than there are slots lost events.
-	queueFactor = 4
+	// defaultQueueSize is how many events may wait for a running slot when
+	// Options.QueueSize is unset. Events beyond the running ones wait instead
+	// of being turned away: notification-controller retries a 503 only a few
+	// times within about a minute, and a new source revision makes every
+	// Kustomization that uses it send an event within seconds. The queue
+	// must hold such a wave. A waiting event costs one idle goroutine plus
+	// the decoded event (a few KB), and its processing deadline starts only
+	// once it gets a slot.
+	defaultQueueSize = 512
+
+	// maxQueueSize caps QueueSize far above any real burst, so a mistyped
+	// setting can't overflow the queue capacity.
+	maxQueueSize = 1 << 20
 )
 
 type Processor interface {
@@ -83,6 +91,10 @@ type Handler struct {
 type Options struct {
 	HMACSecret    string
 	MaxConcurrent int
+	// QueueSize is how many accepted events may wait for a running slot;
+	// beyond that the handler answers 503. Zero or less uses
+	// defaultQueueSize; more than maxQueueSize uses maxQueueSize.
+	QueueSize int
 	// Filter admits/drops events by Kustomization name (config.kustomizations
 	// in the chart). Nil admits everything — see internal/kustomizations.
 	Filter *kustomizations.Filter
@@ -105,6 +117,23 @@ func NewHandler(processor Processor, logger *slog.Logger, opts Options) *Handler
 	if maxConcurrent <= 0 {
 		maxConcurrent = 16
 	}
+	queueSize := opts.QueueSize
+	if queueSize <= 0 {
+		queueSize = defaultQueueSize
+	}
+	if queueSize > maxQueueSize {
+		if logger != nil {
+			logger.Warn("WEBHOOK_QUEUE_SIZE is above the maximum; using the maximum",
+				"configured", queueSize, "used", maxQueueSize)
+		}
+		queueSize = maxQueueSize
+	}
+	// The queue holds the running events plus the waiting ones. Saturate
+	// instead of overflowing for an absurd maxConcurrent.
+	queueCap := maxConcurrent + queueSize
+	if queueCap < maxConcurrent {
+		queueCap = math.MaxInt
+	}
 	processingTimeout := opts.ProcessingTimeout
 	if processingTimeout <= 0 {
 		processingTimeout = defaultProcessingTimeout
@@ -115,7 +144,7 @@ func NewHandler(processor Processor, logger *slog.Logger, opts Options) *Handler
 		logger:            logger,
 		processingTimeout: processingTimeout,
 		sem:               make(chan struct{}, maxConcurrent),
-		queue:             make(chan struct{}, maxConcurrent*queueFactor),
+		queue:             make(chan struct{}, queueCap),
 	}
 	h.baseCtx, h.cancelBase = context.WithCancel(context.Background())
 	if opts.HMACSecret != "" {
