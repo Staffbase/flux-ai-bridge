@@ -135,6 +135,32 @@ func TestSettleHelmReleaseChildren_RemovedByReleaseIsDropped(t *testing.T) {
 	}
 }
 
+// A fresh inventory with an unreadable entry is not trusted: that entry may be
+// the missing child, so its row stays NotFound instead of being dropped.
+func TestSettleHelmReleaseChildren_UnreadableInventoryEntryKeepsNotFound(t *testing.T) {
+	const hr = `apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: db
+  namespace: apps
+status:
+  inventory:
+    entries:
+      - id: "apps_db_apps_StatefulSet"
+      - id: "not-an-inventory-id"
+`
+	proc := helmReleaseChildrenProcessor(&fakeMCPClient{resources: map[string][]byte{helmReleaseDBKey: []byte(hr)}})
+	statuses := []readiness.ResourceStatus{
+		{Kind: "HelmRelease", Namespace: "apps", Name: "db", Status: "Current"},
+		{Kind: "StatefulSet", Namespace: "apps", Name: "db", Status: "Current"},
+		{Kind: "ConfigMap", Namespace: "apps", Name: "db-init-old", Status: "NotFound"},
+	}
+	got := proc.settleHelmReleaseChildren(context.Background(), statuses, dbParents())
+	if len(got) != 3 || got[2].Name != "db-init-old" || got[2].Status != "NotFound" {
+		t.Fatalf("want the NotFound row kept, got %+v", got)
+	}
+}
+
 // A replacement that is missing too must not let the verdict go green: it is
 // added as NotFound.
 func TestSettleHelmReleaseChildren_MissingReplacementIsReported(t *testing.T) {

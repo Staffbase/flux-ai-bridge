@@ -3620,9 +3620,14 @@ func (p *Processor) settleHelmReleaseChildren(ctx context.Context, statuses []re
 		}
 		inv := &inventory{ids: ids, keys: make(map[string]struct{}, len(ids))}
 		for _, id := range ids {
-			if ref, err := readiness.ParseInventoryID(id); err == nil {
-				inv.keys[rowKey(ref.Kind, ref.Namespace, ref.Name)] = struct{}{}
+			ref, err := readiness.ParseInventoryID(id)
+			if err != nil {
+				// The unreadable entry may be the missing child: dropping its
+				// row as removed could turn a failure green.
+				p.logger.Warn("HelmRelease inventory has an unreadable entry; keeping its NotFound children", "helmrelease", hr, "id", id, "error", err.Error())
+				return nil
 			}
+			inv.keys[rowKey(ref.Kind, ref.Namespace, ref.Name)] = struct{}{}
 		}
 		fresh[hr] = inv
 		return inv
