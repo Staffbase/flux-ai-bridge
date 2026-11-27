@@ -1300,7 +1300,7 @@ func TestWaitPodsSettled_WaitsOutStartingPod(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{podListYAML(false), podListYAML(false), podListYAML(true)}}
 	proc, namespaces := waitPodsFixture(t, mcp)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), namespaces, time.Millisecond, 2*time.Second, time.Now())
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), namespaces, time.Millisecond, 2*time.Second, time.Now())
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1319,7 +1319,7 @@ func TestWaitPodsSettled_FailedPodExitsImmediately(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{crashloopingPodListYAML}}
 	proc, namespaces := waitPodsFixture(t, mcp)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), namespaces, 10*time.Millisecond, 5*time.Second, time.Now())
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), namespaces, 10*time.Millisecond, 5*time.Second, time.Now())
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled for a terminal Failed pod, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1338,7 +1338,7 @@ func TestWaitPodsSettled_TimesOutOnStuckPod(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{podListYAML(false)}}
 	proc, namespaces := waitPodsFixture(t, mcp)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), namespaces, time.Millisecond, 30*time.Millisecond, time.Now())
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), namespaces, time.Millisecond, 30*time.Millisecond, time.Now())
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1375,7 +1375,7 @@ func TestWaitPodsSettled_ScanFailureIsNotSettled(t *testing.T) {
 	mcp := &errPodMCP{fakeMCPClient: &fakeMCPClient{}}
 	proc, namespaces := waitPodsFixture(t, mcp)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), namespaces, time.Millisecond, 30*time.Millisecond, time.Now())
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), namespaces, time.Millisecond, 30*time.Millisecond, time.Now())
 	if scanned {
 		t.Error("expected scanned=false when every pod list fails")
 	}
@@ -1400,7 +1400,7 @@ func TestWaitPodsSettled_DisabledIsVacuouslySettled(t *testing.T) {
 	cfg := &config.Config{ReadinessIncludePods: false}
 	proc := New(cfg, &fakeMCPClient{}, readiness.NewChecker(&fakeMCPClient{}), &fakeAnalyzer{}, &fakeCommenter{}, nil, nil, slog.Default())
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, time.Second, time.Now())
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, time.Second, time.Now())
 	if scanned || !settled || len(pods) != 0 {
 		t.Fatalf("disabled pods must be (scanned=false, settled=true, no pods), got scanned=%v settled=%v pods=%+v", scanned, settled, pods)
 	}
@@ -1493,7 +1493,7 @@ func TestWaitPodsSettled_QuietWindowCountsFromScanStart(t *testing.T) {
 		body: podsListYAML(podSpec{name: "old", ready: true, created: time.Now().Add(-time.Hour)})}
 	proc := quietFixture(t, mcp, 100*time.Millisecond)
 
-	_, _, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
+	_, _, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
 	if !settled {
 		t.Fatal("expected settled")
 	}
@@ -1512,7 +1512,7 @@ func TestWaitPodsSettled_ScanBoundedByBudget(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		_, _, settled := proc.waitPodsSettled(ctx, []string{"default"}, time.Millisecond, 10*time.Millisecond, time.Now())
+		_, _, settled, _ := proc.waitPodsSettled(ctx, []string{"default"}, time.Millisecond, 10*time.Millisecond, time.Now())
 		done <- settled
 	}()
 	select {
@@ -1540,7 +1540,7 @@ func TestWaitPodsSettled_QuietPeriodWaitsOutLatePod(t *testing.T) {
 	}}
 	proc := quietFixture(t, mcp, time.Second)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1568,7 +1568,7 @@ func TestWaitPodsSettled_NewReadyPodRestartsQuietPeriod(t *testing.T) {
 	proc := quietFixture(t, mcp, time.Hour)
 	quietFrom := time.Now().Add(-time.Hour + time.Second)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1591,7 +1591,7 @@ func TestWaitPodsSettled_PodCreatedBeforeFirstScanRestartsQuietPeriod(t *testing
 	)}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now().Add(-2*time.Hour))
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now().Add(-2*time.Hour))
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1612,7 +1612,7 @@ func TestWaitPodsSettled_RecreatedPodRestartsQuietPeriod(t *testing.T) {
 	}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 300*time.Millisecond, time.Now().Add(-2*time.Hour))
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 300*time.Millisecond, time.Now().Add(-2*time.Hour))
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1638,7 +1638,7 @@ func TestWaitPodsSettled_TerminatingPodHoldsQuietPeriod(t *testing.T) {
 	)}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now().Add(-2*time.Hour))
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now().Add(-2*time.Hour))
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1660,7 +1660,7 @@ func TestWaitPodsSettled_TerminatingJobPodDoesNotHoldQuietPeriod(t *testing.T) {
 	)}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, time.Second, time.Now().Add(-2*time.Hour))
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, time.Second, time.Now().Add(-2*time.Hour))
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1676,7 +1676,7 @@ func TestWaitPodsSettled_FutureCreationTimeStillSettles(t *testing.T) {
 	)}}
 	proc := quietFixture(t, mcp, 50*time.Millisecond)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 2*time.Second, time.Now().Add(-2*time.Hour))
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 2*time.Second, time.Now().Add(-2*time.Hour))
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1695,12 +1695,100 @@ func TestWaitPodsSettled_LaterPodWithOldCreationTimeRestartsQuietPeriod(t *testi
 	proc := quietFixture(t, mcp, time.Hour)
 	quietFrom := time.Now().Add(-time.Hour + time.Second)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
 	if settled {
 		t.Error("expected NOT settled: the late pod appeared during the wait")
+	}
+}
+
+// TestWaitPodsSettled_OpenQuietWindowNamesLastChange: every pod is ready, but
+// a StatefulSet pod was just recreated and the budget ends inside the quiet
+// period. The wait names that pod, because the tables show nothing pending.
+func TestWaitPodsSettled_OpenQuietWindowNamesLastChange(t *testing.T) {
+	old := podSpec{name: "web", ready: true, created: time.Now().Add(-24 * time.Hour)}
+	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{
+		podsListYAML(old, podSpec{name: "db-0", ready: true, created: time.Now()}),
+	}}
+	proc := quietFixture(t, mcp, time.Hour)
+	quietFrom := time.Now().Add(-2 * time.Hour)
+
+	_, _, settled, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 30*time.Millisecond, quietFrom)
+	if settled {
+		t.Fatal("expected NOT settled: db-0 was created inside the quiet period")
+	}
+	want := "pod `db-0` was created, and the pods hadn't stayed unchanged for 1h0m0s (the pod quiet period) since then."
+	if quietOpen != want {
+		t.Errorf("quietOpen = %q, want %q", quietOpen, want)
+	}
+}
+
+// TestWaitPodsSettled_OpenQuietWindowLatePodWasFirstSeen: a pod first listed
+// in a later scan counts from when the bridge saw it, so the reason says
+// "first seen", not "created" — its creationTimestamp may be much older.
+func TestWaitPodsSettled_OpenQuietWindowLatePodWasFirstSeen(t *testing.T) {
+	old := podSpec{name: "web", ready: true, created: time.Now().Add(-24 * time.Hour)}
+	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{
+		podsListYAML(old),
+		podsListYAML(old, podSpec{name: "late", ready: true, created: time.Now().Add(-2 * time.Hour)}),
+	}}
+	proc := quietFixture(t, mcp, time.Hour)
+
+	_, _, _, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
+	if !strings.HasPrefix(quietOpen, "pod `late` was first seen, and") {
+		t.Errorf("quietOpen = %q, want the late pod as first seen", quietOpen)
+	}
+}
+
+// TestWaitPodsSettled_OpenQuietWindowNamesFirstRemovedPod: two pods vanish in
+// the same scan; the reason names the alphabetically first one, so the same
+// scans always give the same comment body.
+func TestWaitPodsSettled_OpenQuietWindowNamesFirstRemovedPod(t *testing.T) {
+	created := time.Now().Add(-24 * time.Hour)
+	keep := podSpec{name: "web", ready: true, created: created}
+	for range 5 {
+		mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{
+			podsListYAML(keep, podSpec{name: "zeta", ready: true, created: created}, podSpec{name: "alpha", ready: true, created: created}, podSpec{name: "mid", ready: true, created: created}),
+			podsListYAML(keep),
+		}}
+		proc := quietFixture(t, mcp, time.Hour)
+		_, _, _, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
+		if !strings.HasPrefix(quietOpen, "pod `alpha` was removed, and") {
+			t.Fatalf("quietOpen = %q, want the alphabetically first removed pod", quietOpen)
+		}
+	}
+}
+
+// TestWaitPodsSettled_OpenQuietWindowFromPollStart: nothing changed since the
+// readiness poll started, but the poll is younger than the quiet period.
+func TestWaitPodsSettled_OpenQuietWindowFromPollStart(t *testing.T) {
+	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{
+		podsListYAML(podSpec{name: "web", ready: true, created: time.Now().Add(-24 * time.Hour)}),
+	}}
+	proc := quietFixture(t, mcp, time.Hour)
+
+	_, _, settled, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 30*time.Millisecond, time.Now())
+	if settled {
+		t.Fatal("expected NOT settled: the poll started inside the quiet period")
+	}
+	if !strings.HasSuffix(quietOpen, "since the readiness poll started.") {
+		t.Errorf("quietOpen = %q, want it to count from the poll start", quietOpen)
+	}
+}
+
+// TestWaitPodsSettled_PendingPodHasNoQuietReason: a pod that isn't ready yet
+// shows up in the tables itself, so no quiet-window reason is given.
+func TestWaitPodsSettled_PendingPodHasNoQuietReason(t *testing.T) {
+	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{
+		podsListYAML(podSpec{name: "db-0", ready: false, created: time.Now()}),
+	}}
+	proc := quietFixture(t, mcp, time.Hour)
+
+	_, _, settled, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 30*time.Millisecond, time.Now())
+	if settled || quietOpen != "" {
+		t.Errorf("want unsettled without a quiet reason, got settled=%v quietOpen=%q", settled, quietOpen)
 	}
 }
 
@@ -1718,7 +1806,7 @@ func TestWaitPodsSettled_VanishedPodStillHoldsQuietPeriod(t *testing.T) {
 	proc := quietFixture(t, mcp, time.Hour)
 	quietFrom := time.Now().Add(-time.Hour + time.Second)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1758,7 +1846,7 @@ func TestWaitPodsSettled_FailedScansDontCountAsFirstScan(t *testing.T) {
 		body: podsListYAML(podSpec{name: "api", ready: true, created: time.Now().Add(-24 * time.Hour)})}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 2*time.Second, time.Now().Add(-2*time.Hour))
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 2*time.Second, time.Now().Add(-2*time.Hour))
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1784,7 +1872,7 @@ func TestWaitPodsSettled_VanishedOldPodRestartsQuietPeriod(t *testing.T) {
 	proc := quietFixture(t, mcp, time.Hour)
 	quietFrom := time.Now().Add(-time.Hour + time.Second)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 1500*time.Millisecond, quietFrom)
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1817,7 +1905,7 @@ items:
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{failedJobPod}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
+	pods, scanned, settled, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1826,6 +1914,10 @@ items:
 	}
 	if settled {
 		t.Error("expected NOT settled: a failed Job pod must not skip the quiet period")
+	}
+	// The reason describes only the window; it must not call the failed pod Current.
+	if want := "the pods hadn't stayed unchanged for 1h0m0s (the pod quiet period) since the readiness poll started."; quietOpen != want {
+		t.Errorf("quietOpen = %q, want %q", quietOpen, want)
 	}
 }
 
@@ -1842,7 +1934,7 @@ func TestWaitPodsSettled_SleepStopsAtBudget(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		_, _, settled := proc.waitPodsSettled(ctx, []string{"default"}, time.Hour, 50*time.Millisecond, time.Now())
+		_, _, settled, _ := proc.waitPodsSettled(ctx, []string{"default"}, time.Hour, 50*time.Millisecond, time.Now())
 		done <- settled
 	}()
 	select {
@@ -1866,7 +1958,7 @@ func TestWaitPodsSettled_JobPodDoesNotRestartQuietPeriod(t *testing.T) {
 	proc := quietFixture(t, mcp, time.Hour)
 	quietFrom := time.Now().Add(-time.Hour + time.Second)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, quietFrom)
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, quietFrom)
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled once the window closed, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1882,7 +1974,7 @@ func TestWaitPodsSettled_QuietPeriodCountsFromQuietFrom(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{podsListYAML(podSpec{name: "api", ready: true})}}
 	proc := quietFixture(t, mcp, time.Minute)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now().Add(-2*time.Minute))
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now().Add(-2*time.Minute))
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1898,7 +1990,7 @@ func TestWaitPodsSettled_QuietPeriodCutShortByBudgetIsNotSettled(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{podsListYAML(podSpec{name: "api", ready: true})}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	pods, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 30*time.Millisecond, time.Now())
+	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 30*time.Millisecond, time.Now())
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1917,7 +2009,7 @@ func TestWaitPodsSettled_QuietPeriodZeroDisables(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{podsListYAML(old), podsListYAML(old, podSpec{name: "late"})}}
 	proc := quietFixture(t, mcp, 0)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
@@ -1932,7 +2024,7 @@ func TestWaitPodsSettled_QuietPeriodSkippedForFailedPod(t *testing.T) {
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{crashloopingPodListYAML}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	_, scanned, settled := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
+	_, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 5*time.Second, time.Now())
 	if !scanned || !settled {
 		t.Fatalf("expected scanned+settled, got scanned=%v settled=%v", scanned, settled)
 	}
