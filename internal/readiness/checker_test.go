@@ -1258,3 +1258,81 @@ func TestCheckOne_FailedRefreshLeavesCachedVersionUnconfirmedDuringCooldown(t *t
 		}
 	}
 }
+
+// scriptedFetcher answers the nth read (counting from 1) with an InProgress
+// Deployment, except the reads listed in block: those wait for ctx to end and
+// fail with its error, like an MCP call cut short by the poll deadline. Each
+// read takes delay first. The poll reads one row at a time, so a plain
+// counter is enough.
+type scriptedFetcher struct {
+	block map[int]bool
+	delay time.Duration
+	calls int
+}
+
+func (s *scriptedFetcher) GetKubernetesResource(ctx context.Context, _, _, _, _ string) ([]byte, error) {
+	s.calls++
+	if s.block[s.calls] {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	select {
+	case <-time.After(s.delay):
+		return []byte(inProgressDeploymentYAML), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// A row the deadline cuts short keeps what the previous poll read for it, so
+// the result shows the last state seen instead of a timeout error. A row cut
+// short with no previous read stays Unknown.
+func TestWaitUntilSettled_CutRowKeepsPreviousPoll(t *testing.T) {
+	refs := []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+	// Poll 1 reads both rows (#1, #2); poll 2 reads api (#3) and is cut on
+	// worker (#4).
+	fetcher := &scriptedFetcher{block: map[int]bool{4: true}}
+	results, settled, err := NewChecker(fetcher).WaitUntilSettled(context.Background(), refs,
+		10*time.Millisecond, 200*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if fetcher.calls != 4 {
+		t.Fatalf("reads = %d, want 4 (two polls, the second cut short)", fetcher.calls)
+	}
+	for i, r := range results {
+		if r.Status != "InProgress" {
+			t.Errorf("row %d (%s) = %s %q, want InProgress kept from the previous poll", i, r.Name, r.Status, r.Message)
+		}
+	}
+
+	// Cut short in the first poll: nothing to keep.
+	fetcher = &scriptedFetcher{block: map[int]bool{2: true}}
+	results, _, _ = NewChecker(fetcher).WaitUntilSettled(context.Background(), refs,
+		10*time.Millisecond, 50*time.Millisecond)
+	if results[1].Status != "Unknown" {
+		t.Errorf("row cut in the first poll = %s, want Unknown", results[1].Status)
+	}
+}
+
+// The poll doesn't start a poll that can't finish by the deadline, judged by
+// how long the previous one took: it reports the previous poll instead of
+// one the deadline would cut short.
+func TestWaitUntilSettled_NoPollThatCannotFinish(t *testing.T) {
+	fetcher := &scriptedFetcher{delay: 60 * time.Millisecond}
+	start := time.Now()
+	results, settled, err := NewChecker(fetcher).WaitUntilSettled(context.Background(),
+		[]string{"default_api_apps_Deployment"}, 10*time.Millisecond, 100*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if fetcher.calls != 1 {
+		t.Errorf("reads = %d, want 1: a second 60ms poll can't finish in the 40ms left", fetcher.calls)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("poll returned after %s, want before the 100ms deadline", elapsed)
+	}
+	if len(results) != 1 || results[0].Status != "InProgress" {
+		t.Errorf("results = %+v, want the first poll's InProgress row", results)
+	}
+}
