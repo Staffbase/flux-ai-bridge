@@ -108,4 +108,5 @@ bottom, after the chart's own keys, sorted among themselves. `Chart.yaml` keeps 
 
 `ct lint` checks that the chart version goes up. A change under `charts/` bumps `version` in `Chart.yaml`, as a
 separate commit: `chore(chart): bump chart to X.Y.Z, appVersion vA.B.C`. `appVersion` matches the image tag of the
-release.
+release. It may name an app release that isn't published yet: the chart is then released after that app release pushed
+its image (see `docs/development.md`, Release Process).

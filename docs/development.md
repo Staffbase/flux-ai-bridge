@@ -477,10 +477,8 @@ For e2e-shaped local installs (kind cluster + Flux + bridge + mocks all together
 
 ## Release Process
 
-1. Tag the commit: `git tag v0.x.y && git push origin v0.x.y`
-2. The `ci` workflow builds and pushes `ghcr.io/staffbase/flux-ai-bridge:v0.x.y`. Pushes to `main` and `dev` also publish `main-<sha>` / `dev-<sha>` tags.
-3. Update `charts/flux-ai-bridge/Chart.yaml` `appVersion` to match the new tag.
-4. Bump `charts/flux-ai-bridge/Chart.yaml` `version` (semantic versioning for chart changes).
-5. On merge to `main`, the `Release Helm Charts` workflow pushes the chart to `oci://ghcr.io/staffbase/charts/flux-ai-bridge`.
+1. Publish the release that Release Drafter drafts (`vX.Y.Z`). The `ci` workflow builds and pushes `ghcr.io/staffbase/flux-ai-bridge:vX.Y.Z`. Pushes to `main` and `dev` also publish `main-<sha>` / `dev-<sha>` tags.
+2. To ship that version in the chart, set `appVersion` in `charts/flux-ai-bridge/Chart.yaml` to `vX.Y.Z` and bump `version`. This can happen before or after step 1, also in the pull request that adds the feature.
+3. On merge to `main`, the `Release Helm Charts` workflow pushes the chart to `oci://ghcr.io/staffbase/charts/flux-ai-bridge` and creates its `flux-ai-bridge-<version>` release, but only once the `appVersion` image exists. Until then it skips with a notice, and `helm-ci` warns on the pull request. Publishing the app release then runs `Release Helm Charts` from the `ci` workflow, which releases the waiting chart. If that run fails, start `Release Helm Charts` by hand; already released versions are skipped.
 
 Dependabot PRs are merged by the `GITHUB_TOKEN`, and those merges don't trigger the push workflows: they publish no `main` image and no chart. The next merge by a person publishes what its own path filters cover: a `main` image for changes outside `charts/` and `docs/`, a chart release for changes under `charts/`.

@@ -1,6 +1,6 @@
 name: Release Helm Charts
 
-permissions: read-all
+permissions: {}
 
 on:
   push:
@@ -8,12 +8,55 @@ on:
       - main
     paths:
       - 'charts/**/**'
+  # Called by the ci workflow after an app release pushed its image, to
+  # release a chart that was waiting for that image.
+  workflow_call:
+  # Fallback when that run failed; skip_existing makes reruns safe.
+  workflow_dispatch:
 
 env:
   helm-version: "v4.3.2"
 
 jobs:
+  # The chart installs the image of its appVersion by default. A chart that
+  # names an unpublished image waits: publishing that app release builds the
+  # image and runs this workflow again.
+  image:
+    name: Check the chart's image
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    outputs:
+      published: ${{ steps.check.outputs.published }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # After an app release, the chart on main, not the one at the tag.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Check that the image is published
+        id: check
+        run: |
+          image="ghcr.io/staffbase/flux-ai-bridge:$(yq '.appVersion' charts/flux-ai-bridge/Chart.yaml)"
+          if out=$(docker manifest inspect "$image" 2>&1); then
+            echo 'published=true' >> "$GITHUB_OUTPUT"
+          elif echo "$out" | grep -q 'manifest unknown'; then
+            echo "::notice title=Chart release waits for its image::$image isn't published yet. Publishing that app release releases the chart."
+          else
+            echo "$out"
+            exit 1
+          fi
+
   release:
+    needs: image
+    if: needs.image.outputs.published == 'true'
+    # Merging a chart change and publishing an app release can run this at
+    # the same time.
+    concurrency:
+      group: helm-release
+      cancel-in-progress: false
     permissions:
       contents: write # to create the chart's GitHub release (helm/chart-releaser-action)
       packages: write # to push the chart to GHCR
@@ -23,6 +66,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Configure Git
         run: |
@@ -71,10 +115,9 @@ jobs:
           CR_USERNAME: "${{ github.actor }}"
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         with:
-          # Package this chart on every run (the workflow only runs on chart
-          # changes) instead of diffing against the last tag: a fresh
-          # single-commit history has nothing to diff against. skip_existing
-          # makes an unchanged chart version a no-op.
+          # Package this chart on every run instead of diffing against the
+          # last tag: a run after an app release has no chart change to find.
+          # skip_existing makes an already released chart version a no-op.
           charts: charts/flux-ai-bridge
           oci_registry_url: "oci://ghcr.io/staffbase/charts"
           # Chart releases share the repository with the app's v* releases;

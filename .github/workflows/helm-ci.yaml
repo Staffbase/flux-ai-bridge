@@ -32,6 +32,14 @@ jobs:
         uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
       - name: Run chart-testing (lint)
         run: ct lint --config .github/ct.yaml
+      # Doesn't fail: a chart may name the next app release. It is released
+      # once that release has published its image.
+      - name: Check that the chart's image is published
+        run: |
+          image="ghcr.io/staffbase/flux-ai-bridge:$(yq '.appVersion' charts/flux-ai-bridge/Chart.yaml)"
+          if ! out=$(docker manifest inspect "$image" 2>&1); then
+            echo "::warning title=Image not published yet::$image: $out. The chart is released after that app release is published."
+          fi
 
   # Installs the chart into a kind cluster running Flux, once per
   # charts/flux-ai-bridge/ci/*-values.yaml, and waits until every resource
