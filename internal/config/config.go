@@ -16,6 +16,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"strconv"
@@ -172,7 +173,8 @@ type Config struct {
 	// Zero (default) disables re-evaluation: each PR-head is analysed exactly
 	// once. A positive value must cover one analysis (ProcessingTimeout), or a
 	// slow failed analysis could release a newer analysis's mark; Load
-	// rejects shorter values. Set via DEDUPE_PR_REEVAL_TTL (e.g. "30m").
+	// raises shorter values to that and logs a warning. Set via
+	// DEDUPE_PR_REEVAL_TTL (e.g. "30m").
 	DedupePRReEvalTTL time.Duration
 	// DedupeReEvalFailedOnly narrows re-evaluation (when DedupePRReEvalTTL > 0)
 	// to PR-heads whose LAST analysis was NOT healthy. A previously-green deploy
@@ -361,8 +363,12 @@ func Load() (*Config, error) {
 	// A re-eval window shorter than one analysis lets a slow failed analysis
 	// roll back the admission mark that a newer analysis of the same PR-head
 	// took after the window expired. 0 (never re-evaluate) has no window.
+	// Raised instead of rejected: the Helm chart's default TTL must not stop
+	// an install with a long READINESS_POLL_TIMEOUT from starting.
 	if floor := processingTimeout(pollTimeout); prReEvalTTL > 0 && prReEvalTTL < floor {
-		return nil, fmt.Errorf("DEDUPE_PR_REEVAL_TTL (%s) must be 0 or at least READINESS_POLL_TIMEOUT (%s) + %s = %s, the time one analysis may take", prReEvalTTL, pollTimeout, processingSlack, floor)
+		slog.Warn("DEDUPE_PR_REEVAL_TTL is shorter than one analysis (READINESS_POLL_TIMEOUT + slack); using that instead",
+			"configured", prReEvalTTL.String(), "readiness_poll_timeout", pollTimeout.String(), "used", floor.String())
+		prReEvalTTL = floor
 	}
 	// The quiet window comes out of the poll budget: one that doesn't fit
 	// would end every healthy analysis unsettled (⚠️). The default shrinks to

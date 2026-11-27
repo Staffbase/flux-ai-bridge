@@ -237,9 +237,10 @@ config:
       # Set "0" to analyse each PR exactly ONCE per its head commit: a Flux
       # reconcile that re-fires for an unchanged PR is then skipped ("PR already
       # analysed at this head"), so the comment is NOT refreshed and a warning
-      # stays a warning until the next push. The bridge refuses a positive value
-      # shorter than one analysis (config.readiness.pollTimeout + 2m, so 5m with
-      # the defaults): raising pollTimeout above 13m needs a longer ttl too.
+      # stays a warning until the next push. A positive value shorter than one
+      # analysis (config.readiness.pollTimeout + 2m, so 5m with the defaults) is
+      # raised to that, with a warning in the log: with pollTimeout above 13m
+      # the 15m default becomes pollTimeout + 2m.
       #
       # Enabling this on a RUNNING install also applies to PRs analysed before
       # the change: their existing admission records (without an expiry, or with
