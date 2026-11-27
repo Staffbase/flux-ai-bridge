@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -444,6 +445,10 @@ func TestNewHandler_QueueSize(t *testing.T) {
 		{name: "defaults", opts: Options{}, want: 16 + defaultQueueSize},
 		{name: "configured", opts: Options{MaxConcurrent: 4, QueueSize: 10}, want: 14},
 		{name: "negative uses default", opts: Options{MaxConcurrent: 4, QueueSize: -1}, want: 4 + defaultQueueSize},
+		// An oversized setting must not overflow the capacity (a negative
+		// make size panics at startup).
+		{name: "above the maximum uses the maximum", opts: Options{QueueSize: math.MaxInt}, want: 16 + maxQueueSize},
+		{name: "huge concurrency saturates", opts: Options{MaxConcurrent: math.MaxInt, QueueSize: 10}, want: math.MaxInt},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
