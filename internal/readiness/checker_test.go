@@ -1260,14 +1260,15 @@ func TestCheckOne_FailedRefreshLeavesCachedVersionUnconfirmedDuringCooldown(t *t
 }
 
 // scriptedFetcher answers the nth read (counting from 1) with an InProgress
-// Deployment, except the reads listed in block: those wait for ctx to end and
-// fail with its error, like an MCP call cut short by the poll deadline. Each
-// read takes delay first. The poll reads one row at a time, so a plain
-// counter is enough.
+// Deployment, or a ready one for the reads listed in current. The reads listed
+// in block wait for ctx to end and fail with its error, like an MCP call cut
+// short by the poll deadline. Each read takes delay first. The poll reads one
+// row at a time, so a plain counter is enough.
 type scriptedFetcher struct {
-	block map[int]bool
-	delay time.Duration
-	calls int
+	block   map[int]bool
+	current map[int]bool
+	delay   time.Duration
+	calls   int
 }
 
 func (s *scriptedFetcher) GetKubernetesResource(ctx context.Context, _, _, _, _ string) ([]byte, error) {
@@ -1276,9 +1277,13 @@ func (s *scriptedFetcher) GetKubernetesResource(ctx context.Context, _, _, _, _ 
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
+	body := inProgressDeploymentYAML
+	if s.current[s.calls] {
+		body = readyDeploymentYAML
+	}
 	select {
 	case <-time.After(s.delay):
-		return []byte(inProgressDeploymentYAML), nil
+		return []byte(body), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -1304,6 +1309,9 @@ func TestWaitUntilSettled_CutRowKeepsPreviousPoll(t *testing.T) {
 		if r.Status != "InProgress" {
 			t.Errorf("row %d (%s) = %s %q, want InProgress kept from the previous poll", i, r.Name, r.Status, r.Message)
 		}
+	}
+	if results[0].Stale || !results[1].Stale {
+		t.Errorf("Stale = %v, %v; want only the kept worker row stale", results[0].Stale, results[1].Stale)
 	}
 
 	// Cut short in the first poll: nothing to keep.
@@ -1334,5 +1342,26 @@ func TestWaitUntilSettled_NoPollThatCannotFinish(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].Status != "InProgress" {
 		t.Errorf("results = %+v, want the first poll's InProgress row", results)
+	}
+}
+
+// A kept row is never settled, even when it and every fresh row read Current:
+// the processor recomputes settled with AllSettled after dropping pruned rows,
+// and a poll the deadline cut short must not turn settled there.
+func TestWaitUntilSettled_KeptCurrentRowIsNotSettled(t *testing.T) {
+	refs := []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+	// Poll 1: api InProgress (#1), worker Current (#2). Poll 2: api Current
+	// (#3), worker cut short (#4).
+	fetcher := &scriptedFetcher{block: map[int]bool{4: true}, current: map[int]bool{2: true, 3: true}}
+	results, settled, err := NewChecker(fetcher).WaitUntilSettled(context.Background(), refs,
+		10*time.Millisecond, 200*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if results[0].Status != "Current" || results[1].Status != "Current" || !results[1].Stale {
+		t.Fatalf("results = %+v, want fresh Current api and kept Current worker", results)
+	}
+	if AllSettled(results) {
+		t.Error("AllSettled = true for a poll with a kept row, want false")
 	}
 }
