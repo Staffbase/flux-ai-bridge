@@ -365,7 +365,14 @@ func (r *redisStore) markIfNewAtomic(k Key, t time.Time, ttl time.Duration) (boo
 	// aren't atomic, but LT never extends an expiry, so a race can at worst
 	// shorten a cooldown set in between.
 	cur, perr := r.client.PTTL(ctx, key).Result()
-	if perr != nil || (cur != -1 && cur <= MaxCooldown) {
+	if perr != nil {
+		// Same best-effort handling as the EXPIRE below: the next event of
+		// this PR-head retries the migration.
+		slog.Default().Warn("dedupe: redis PTTL for re-eval floor failed; pre-floor mark keeps its expiry until the next event retries",
+			"namespace", k.Namespace, "name", k.Name, "sha", k.SHA, "error", perr.Error())
+		return false, nil
+	}
+	if cur != -1 && cur <= MaxCooldown {
 		return false, nil
 	}
 	// Best-effort: the admission answer is already "duplicate" either way; a
