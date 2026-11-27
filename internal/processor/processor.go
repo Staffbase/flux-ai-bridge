@@ -640,7 +640,12 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	// The same for a HelmRelease's children: its inventory is written when a
 	// release ends, so while an upgrade runs it still lists objects the new
 	// chart version removed or renamed, and those read NotFound.
-	resourceStatuses = p.settleHelmReleaseChildren(ctx, resourceStatuses, helmReleaseParents)
+	// Bounded by the readiness deadline (at least 1s, like the poll's reads),
+	// so the re-reads can't eat the time the failure analysis needs. A read
+	// cut short keeps the rows as they are, or reads Unknown.
+	settleCtx, cancelSettle := context.WithDeadline(ctx, laterOf(settleDeadline, time.Now().Add(time.Second)))
+	resourceStatuses = p.settleHelmReleaseChildren(settleCtx, resourceStatuses, helmReleaseParents)
+	cancelSettle()
 	// NotFound is deliberately NON-terminal for the poll (see
 	// readiness.allSettled), so pruned rows held the poll open until timeout
 	// and left settled=false. With them filtered out, re-evaluate: if every
