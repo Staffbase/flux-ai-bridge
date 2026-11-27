@@ -573,27 +573,29 @@ func TestLoad_PodQuietPeriodDefaultFitsShortPollTimeout(t *testing.T) {
 func TestLoad_PRReEvalTTLCoversOneAnalysis(t *testing.T) {
 	for _, tc := range []struct {
 		pollTimeout, ttl string
-		ok               bool
+		want             time.Duration
 	}{
-		{"", "", true},          // unset: never re-evaluate
-		{"", "0", true},         // explicit 0: never re-evaluate
-		{"", "4m59s", false},    // default 3m poll + 2m slack = 5m
-		{"", "5m", true},        // exactly one analysis
-		{"", "30m", true},       // the documented example
-		{"10m", "11m", false},   // follows READINESS_POLL_TIMEOUT
-		{"10m", "12m", true},    // 10m + 2m
-		{"30s", "2m29s", false}, // a short poll timeout still needs the slack
+		{"", "", 0},                                      // unset: never re-evaluate
+		{"", "0", 0},                                     // explicit 0: never re-evaluate
+		{"", "4m59s", 5 * time.Minute},                   // default 3m poll + 2m slack = 5m
+		{"", "5m", 5 * time.Minute},                      // exactly one analysis
+		{"", "30m", 30 * time.Minute},                    // the documented example
+		{"10m", "11m", 12 * time.Minute},                 // follows READINESS_POLL_TIMEOUT
+		{"10m", "12m", 12 * time.Minute},                 // 10m + 2m
+		{"30s", "2m29s", 2*time.Minute + 30*time.Second}, // a short poll timeout still needs the slack
+		{"20m", "15m", 22 * time.Minute},                 // the chart default with a long poll timeout still starts
 	} {
 		setEnv(t, mergeEnv(baseClaudeEnv(), map[string]string{
 			"READINESS_POLL_TIMEOUT": tc.pollTimeout,
 			"DEDUPE_PR_REEVAL_TTL":   tc.ttl,
 		}))
-		_, err := config.Load()
-		if tc.ok && err != nil {
+		cfg, err := config.Load()
+		if err != nil {
 			t.Errorf("poll=%q ttl=%q: err = %v, want accepted", tc.pollTimeout, tc.ttl, err)
+			continue
 		}
-		if !tc.ok && (err == nil || !strings.Contains(err.Error(), "DEDUPE_PR_REEVAL_TTL") || !strings.Contains(err.Error(), "READINESS_POLL_TIMEOUT")) {
-			t.Errorf("poll=%q ttl=%q: err = %v, want a rejection naming DEDUPE_PR_REEVAL_TTL and READINESS_POLL_TIMEOUT", tc.pollTimeout, tc.ttl, err)
+		if cfg.DedupePRReEvalTTL != tc.want {
+			t.Errorf("poll=%q ttl=%q: DedupePRReEvalTTL = %s, want %s", tc.pollTimeout, tc.ttl, cfg.DedupePRReEvalTTL, tc.want)
 		}
 	}
 }

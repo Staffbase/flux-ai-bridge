@@ -86,6 +86,17 @@ jobs:
           # which GHCR doesn't accept.
           docker-disable-retagging: true
 
+  # Releases the chart once the image it installs exists. A chart whose
+  # appVersion names this release was skipped when it was merged.
+  helm-release:
+    name: Release Helm chart
+    needs: cd
+    if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/helm-release.yaml
+
   # Approves Dependabot PRs and enables auto-merge once CI is green. The PR
   # author check is the trusted one; the actor check additionally skips runs
   # triggered by someone else pushing to a Dependabot branch.

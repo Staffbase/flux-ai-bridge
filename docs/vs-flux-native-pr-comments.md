@@ -111,7 +111,7 @@ flux-ai-bridge: a per-Kustomization hidden HTML marker `<!-- flux-ai-bridge:<nam
 
 Opt-in to native-style behavior: `config.github.comments.keepHistory=true` flips the delete-and-recreate to append-only, so each analysis adds a new comment and the PR keeps a chronological trail. Useful when iterating on a workload that toggles healthy/broken and you want to read the history; off by default because the common case ("show me the current verdict") works better when the comment stays at the top.
 
-Per-PR-head dedupe — keyed on `(namespace, kustomization, PR number, PR head SHA)`, governed by `DEDUPE_PR_REEVAL_TTL` (default: analyse each PR-head exactly once) — ensures Flux's periodic re-reconciles don't re-trigger the pipeline for an unchanged PR head — so the bridge isn't constantly re-deleting and re-posting either.
+Per-PR-head dedupe — keyed on `(namespace, kustomization, PR number, PR head SHA)`, governed by `DEDUPE_PR_REEVAL_TTL` (bridge default: analyse each PR-head exactly once; the Helm chart re-checks failed/warning heads every 15 minutes, up to 4 times) — ensures Flux's periodic re-reconciles don't re-trigger the pipeline for an unchanged PR head — so the bridge isn't constantly re-deleting and re-posting either.
 
 ### 4. Operational surface
 

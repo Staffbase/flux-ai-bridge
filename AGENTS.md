@@ -56,8 +56,8 @@ that test code shells out to. Never rely on the kubeconfig current-context. The 
   a failing reconcile must not produce `flux-success`. When in doubt, the outcome is ⚠️ warning. A non-`Current` row
   outside the pod-scanned namespace never counts as a harmless rollout in progress (`rolloutInProgress`); healthy rows
   in other namespaces are fine. A PR that deletes resources is attributed through prune events and is not a failure.
-- **Redis/Valkey: plain keyspace commands only** (`SET NX`, `EXPIRE NX`, `GET`, `DEL`, `HSET`). Production ACL users
-  may not run `EVAL` / `EVALSHA`, so do not use Lua. `EXPIRE NX` needs Redis 7 or later. Dedupe fails closed: on a
+- **Redis/Valkey: plain keyspace commands only** (`SET NX`, `EXPIRE LT`, `GET`, `DEL`, `HSET`). Production ACL users
+  may not run `EVAL` / `EVALSHA`, so do not use Lua. `EXPIRE LT` needs Redis 7 or later. Dedupe fails closed: on a
   backend error the PR is skipped.
 - **The chart ships secure defaults.** NetworkPolicies for the bridge and the bundled MCP are on by default, and their
   ports can be configured (Redis 6379, Sentinel 26379). Bridge egress is derived from the configured URLs (LLM base
@@ -108,4 +108,5 @@ bottom, after the chart's own keys, sorted among themselves. `Chart.yaml` keeps 
 
 `ct lint` checks that the chart version goes up. A change under `charts/` bumps `version` in `Chart.yaml`, as a
 separate commit: `chore(chart): bump chart to X.Y.Z, appVersion vA.B.C`. `appVersion` matches the image tag of the
-release.
+release. It may name an app release that isn't published yet: the chart is then released after that app release pushed
+its image (see `docs/development.md`, Release Process).

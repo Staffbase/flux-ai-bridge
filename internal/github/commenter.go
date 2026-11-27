@@ -563,6 +563,8 @@ func IsRateLimit(err error) bool {
 
 // Rate-limit cooldown bounds. Secondary limits without a Retry-After ask
 // clients to wait "at least a minute" and back off further on repeats.
+// maxRateLimitCooldown must not exceed dedupe.MaxCooldown, which caps the
+// cooldown the processor stores.
 const (
 	minRateLimitCooldown     = time.Minute
 	maxRateLimitCooldown     = time.Hour

@@ -609,9 +609,11 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	// use the poll's read context, so they are bounded by the poll timeout
 	// like the row reads; a cut-short read leaves that HelmRelease pending.
 	var pendingHelmReleases []pendingHelmRelease
+	var helmReleaseParents map[string]string
 	resourceStatuses, settled, err := p.checker.WaitUntilSettledFunc(ctx, func(readCtx context.Context) []string {
-		expanded, pending := p.expandHelmReleaseInventories(readCtx, readinessRefs)
+		expanded, pending, parents := p.expandHelmReleases(readCtx, readinessRefs)
 		pendingHelmReleases = pending
+		helmReleaseParents = parents
 		return expanded
 	}, p.cfg.ReadinessPollInterval, pollTimeout)
 	if err != nil {
@@ -635,6 +637,15 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	// gone with it; listing it as "could not be inspected" would turn a clean
 	// deletion ⚠️. Drop pending entries whose row was just pruned.
 	pendingHelmReleases = withoutPrunedHelmReleases(pendingHelmReleases, helmReleasesBefore, resourceStatuses)
+	// The same for a HelmRelease's children: its inventory is written when a
+	// release ends, so while an upgrade runs it still lists objects the new
+	// chart version removed or renamed, and those read NotFound.
+	// Bounded by the readiness deadline (at least 1s, like the poll's reads),
+	// so the re-reads can't eat the time the failure analysis needs. A read
+	// cut short keeps the rows as they are, or reads Unknown.
+	settleCtx, cancelSettle := context.WithDeadline(ctx, laterOf(settleDeadline, time.Now().Add(time.Second)))
+	resourceStatuses = p.settleHelmReleaseChildren(settleCtx, resourceStatuses, helmReleaseParents)
+	cancelSettle()
 	// NotFound is deliberately NON-terminal for the poll (see
 	// readiness.allSettled), so pruned rows held the poll open until timeout
 	// and left settled=false. With them filtered out, re-evaluate: if every
@@ -2552,10 +2563,11 @@ func helmReleaseInventoryIDs(data []byte) ([]string, error) {
 //
 //  1. `.status.inventory.entries[*].id`        — kustomize-controller's
 //     native shape (raw IDs).
-//  2. `.status.history[*].inventory[*].{...}`  — flux-operator-mcp's
+//  2. `.status.history[0].inventory[*].{...}`  — flux-operator-mcp's
 //     rendered HelmRelease shape
 //     (each history entry carries
-//     a structured object list).
+//     a structured object list; only
+//     the newest release counts).
 //  3. `.status.inventory[*].{...}`             — same structured shape but
 //     attached directly to
 //     status (defensive: some
@@ -2565,7 +2577,8 @@ func helmReleaseInventoryIDs(data []byte) ([]string, error) {
 // reconstruct the inventory ID from those — `group` is the part before `/`
 // in apiVersion (empty for core v1 like Service/ConfigMap).
 //
-// All shapes are walked even if multiple coexist; the caller dedupes.
+// Shapes 1 and 3 are both walked if they coexist (the caller dedupes); shape
+// 2 only applies when they yield nothing.
 func extractInventoryIDs(n *yaml.Node) []string {
 	if n == nil {
 		return nil
@@ -2604,13 +2617,15 @@ func extractInventoryIDs(n *yaml.Node) []string {
 			}
 		}
 	}
-	// Shape 2: status.history[*].inventory[*].{...}
-	if history := mappingChild(status, "history"); history != nil && history.Kind == yaml.SequenceNode {
-		for _, hentry := range history.Content {
-			hinv := mappingChild(hentry, "inventory")
-			if hinv == nil || hinv.Kind != yaml.SequenceNode {
-				continue
-			}
+	// Shape 2: status.history[0].inventory[*].{...}, only when status carries
+	// no inventory of its own. history[0] is the newest release; older entries
+	// are superseded releases, whose objects the current release may have
+	// removed or renamed, so they'd read NotFound for good.
+	if len(ids) > 0 {
+		return ids
+	}
+	if history := mappingChild(status, "history"); history != nil && history.Kind == yaml.SequenceNode && len(history.Content) > 0 {
+		if hinv := mappingChild(history.Content[0], "inventory"); hinv != nil && hinv.Kind == yaml.SequenceNode {
 			for _, ref := range hinv.Content {
 				if id := inventoryIDFromStructuredRef(ref); id != "" {
 					ids = append(ids, id)
@@ -2747,8 +2762,17 @@ type pendingHelmRelease struct {
 // Returns the base list unchanged (and no pending entries) when the feature
 // is disabled or when nothing in the inventory is a HelmRelease.
 func (p *Processor) expandHelmReleaseInventories(ctx context.Context, baseRefs []string) ([]string, []pendingHelmRelease) {
+	refs, pending, _ := p.expandHelmReleases(ctx, baseRefs)
+	return refs, pending
+}
+
+// expandHelmReleases is expandHelmReleaseInventories that also returns, for
+// every added child, the HelmRelease whose inventory listed it: rowKey of the
+// child → "<namespace>/<name>" of the HelmRelease. Children that are in the
+// base inventory too, or that several HelmReleases list, aren't mapped.
+func (p *Processor) expandHelmReleases(ctx context.Context, baseRefs []string) ([]string, []pendingHelmRelease, map[string]string) {
 	if !p.cfg.ReadinessExpandHelmReleases {
-		return baseRefs, nil
+		return baseRefs, nil, nil
 	}
 	// Fetch the HelmReleases' own inventories CONCURRENTLY (bounded), then
 	// assemble in the original ref order so the output stays deterministic
@@ -2830,7 +2854,39 @@ func (p *Processor) expandHelmReleaseInventories(ctx context.Context, baseRefs [
 			pending = append(pending, *pendingEntries[i])
 		}
 	}
-	return out, pending
+	base := make(map[string]struct{}, len(baseRefs))
+	for _, ref := range baseRefs {
+		base[ref] = struct{}{}
+	}
+	// A child several HelmReleases list stays unmapped: settling it against
+	// one of them could drop a row another release still expects.
+	parents := make(map[string]string)
+	shared := make(map[string]struct{})
+	for i, ref := range baseRefs {
+		if len(children[i]) == 0 {
+			continue
+		}
+		hr, _ := readiness.ParseInventoryID(ref) // parsed fine above, or it would have no children
+		owner := hr.Namespace + "/" + hr.Name
+		for _, sub := range children[i] {
+			if _, inBase := base[sub]; inBase {
+				continue
+			}
+			child, err := readiness.ParseInventoryID(sub)
+			if err != nil {
+				continue
+			}
+			k := rowKey(child.Kind, child.Namespace, child.Name)
+			if prev, ok := parents[k]; ok && prev != owner {
+				shared[k] = struct{}{}
+			}
+			parents[k] = owner
+		}
+	}
+	for k := range shared {
+		delete(parents, k)
+	}
+	return out, pending, parents
 }
 
 // promptKustomizationYAML returns the Kustomization YAML with the (potentially
@@ -3506,6 +3562,151 @@ func (p *Processor) dropPrunedRows(ctx context.Context, event eventv1.Event, ori
 	if len(dropped) > 0 {
 		p.logger.Info("dropped pruned inventory rows: deleted from the Kustomization, not failures",
 			"name", event.InvolvedObject.Name, "count", len(dropped), "resources", strings.Join(dropped, ", "))
+	}
+	return kept
+}
+
+// rowKey identifies a resource row by kind, namespace and name, the identity
+// dropPrunedRows matches on too.
+func rowKey(kind, namespace, name string) string {
+	return kind + "|" + namespace + "|" + name
+}
+
+// settleHelmReleaseChildren handles NotFound rows of objects that came from a
+// HelmRelease's inventory (parents, from expandHelmReleases). helm-controller
+// writes that inventory when a release ends, so while an upgrade runs it still
+// lists the previous release's objects, and one the new chart version removed
+// or renamed reads NotFound. For each such row it re-reads the HelmRelease:
+//   - the fresh inventory no longer lists the object → the release removed
+//     it: drop the row (the upgrade finished after the poll's last
+//     inventory read). Objects the fresh inventory lists that the poll never
+//     read (a renamed object's replacement) are read once and added, so they
+//     count toward the verdict; if that read fails, nothing is dropped.
+//   - otherwise, if the HelmRelease row is still reconciling (neither
+//     Current nor Failed) → the row reads InProgress, so the verdict is ⚠️
+//     rather than ❌ until the release ends.
+//   - otherwise the object is genuinely missing and stays NotFound.
+//
+// An empty or unreadable fresh inventory isn't trusted for dropping rows,
+// like the Kustomization re-read in dropPrunedRows.
+func (p *Processor) settleHelmReleaseChildren(ctx context.Context, statuses []readiness.ResourceStatus, parents map[string]string) []readiness.ResourceStatus {
+	releaseStatus := make(map[string]string)
+	polled := make(map[string]struct{}, len(statuses))
+	for _, r := range statuses {
+		polled[rowKey(r.Kind, r.Namespace, r.Name)] = struct{}{}
+		if r.Kind == "HelmRelease" {
+			releaseStatus[r.Namespace+"/"+r.Name] = r.Status
+		}
+	}
+	type inventory struct {
+		ids  []string
+		keys map[string]struct{}
+	}
+	fresh := make(map[string]*inventory) // HelmRelease → fresh inventory (nil: not trusted)
+	freshInventory := func(hr string) *inventory {
+		if inv, done := fresh[hr]; done {
+			return inv
+		}
+		fresh[hr] = nil
+		ns, name, _ := strings.Cut(hr, "/")
+		data, err := p.mcp.GetKubernetesResource(ctx, helmReleaseAPIVersion, "HelmRelease", name, ns)
+		if err != nil {
+			p.logger.Warn("HelmRelease re-read failed; keeping its NotFound children", "helmrelease", hr, "error", err.Error())
+			return nil
+		}
+		ids, err := helmReleaseInventoryIDs(data)
+		if err != nil || len(ids) == 0 {
+			return nil
+		}
+		inv := &inventory{ids: ids, keys: make(map[string]struct{}, len(ids))}
+		for _, id := range ids {
+			ref, err := readiness.ParseInventoryID(id)
+			if err != nil {
+				// The unreadable entry may be the missing child: dropping its
+				// row as removed could turn a failure green.
+				p.logger.Warn("HelmRelease inventory has an unreadable entry; keeping its NotFound children", "helmrelease", hr, "id", id, "error", err.Error())
+				return nil
+			}
+			inv.keys[rowKey(ref.Kind, ref.Namespace, ref.Name)] = struct{}{}
+		}
+		fresh[hr] = inv
+		return inv
+	}
+	removed := make(map[string]bool) // row key → removed by its release
+	var added []string               // objects the fresh inventories list that the poll never read
+	addedSeen := make(map[string]struct{})
+	for _, r := range statuses {
+		k := rowKey(r.Kind, r.Namespace, r.Name)
+		hr, isChild := parents[k]
+		if r.Status != "NotFound" || !isChild {
+			continue
+		}
+		inv := freshInventory(hr)
+		if inv == nil {
+			continue
+		}
+		if _, listed := inv.keys[k]; listed {
+			continue
+		}
+		removed[k] = true
+		// The release that removed this object may have replaced it (a
+		// rename): judge the replacement too, or the verdict could go green
+		// without it ever being read.
+		for _, id := range inv.ids {
+			ref, err := readiness.ParseInventoryID(id)
+			if err != nil {
+				continue
+			}
+			nk := rowKey(ref.Kind, ref.Namespace, ref.Name)
+			if _, seen := polled[nk]; seen {
+				continue
+			}
+			if _, dup := addedSeen[nk]; dup {
+				continue
+			}
+			addedSeen[nk] = struct{}{}
+			added = append(added, id)
+		}
+	}
+	var addedRows []readiness.ResourceStatus
+	if len(added) > 0 {
+		rows, err := p.checker.CheckAll(ctx, added)
+		if err != nil {
+			// Without the replacements' state, dropping the old rows could
+			// turn the verdict green unseen: keep them.
+			p.logger.Warn("reading objects a HelmRelease added failed; keeping its removed children", "error", err.Error())
+			removed = nil
+		} else {
+			addedRows = rows
+		}
+	}
+	kept := statuses[:0]
+	var dropped, waiting []string
+	for _, r := range statuses {
+		k := rowKey(r.Kind, r.Namespace, r.Name)
+		hr, isChild := parents[k]
+		if r.Status == "NotFound" && isChild {
+			if removed[k] {
+				dropped = append(dropped, r.Kind+"/"+r.Namespace+"/"+r.Name)
+				continue
+			}
+			if st, ok := releaseStatus[hr]; ok && st != "Current" && st != "Failed" {
+				r.Status = "InProgress"
+				r.Message = "not found while HelmRelease " + hr + " is still reconciling"
+				waiting = append(waiting, r.Kind+"/"+r.Namespace+"/"+r.Name)
+			}
+		}
+		kept = append(kept, r)
+	}
+	if len(dropped) > 0 {
+		p.logger.Info("dropped HelmRelease child rows: removed by the release, not failures", "count", len(dropped), "resources", strings.Join(dropped, ", "))
+	}
+	if len(waiting) > 0 {
+		p.logger.Info("HelmRelease child rows not found while the release reconciles: in progress, not failures", "count", len(waiting), "resources", strings.Join(waiting, ", "))
+	}
+	if removed != nil && len(addedRows) > 0 {
+		p.logger.Info("read objects a HelmRelease added after the poll", "count", len(addedRows))
+		kept = append(kept, addedRows...)
 	}
 	return kept
 }

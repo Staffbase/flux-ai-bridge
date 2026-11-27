@@ -33,7 +33,7 @@
 //     Bitnami/production layout the bridge's docs describe.
 //  3. Runs this test, which connects via `NewRedisSentinel` with BOTH
 //     credential pairs populated and drives every Redis command the bridge
-//     issues (SET NX with expiry, EXPIRE NX, the INCR+EXPIRE and
+//     issues (SET NX with expiry, EXPIRE LT, the INCR+EXPIRE and
 //     HSET+EXPIRE pipelines, EXPIRE, DEL, PING) through the real wire —
 //     all plain keyspace commands, no scripting, so they work under ACLs
 //     that deny EVAL.
@@ -103,7 +103,7 @@ func TestSentinel_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRedisSentinel: %v (is sentinel reachable at %s? did `make test-sentinel` start the containers?)", err, sentinelAddrFromEnv())
 	}
-	cache.WithMaxTTL(time.Hour) // exercise the EXPIRE NX backstop path
+	cache.WithMaxTTL(time.Hour) // exercise the EXPIRE LT backstop path
 
 	ns, name, pr := "test-ns", "test-name", 42
 	head := fmt.Sprintf("sentinel-%d", time.Now().UnixNano())
