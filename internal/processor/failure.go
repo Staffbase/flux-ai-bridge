@@ -1597,9 +1597,14 @@ func cronRunSlot(jobName string) (family string, slot int64, ok bool) {
 // settled=false, so the outcome degrades to a warning instead of reading
 // success off pods we never saw — the exact window an MCP degradation would
 // otherwise hide a crashlooping rollout in.
-func (p *Processor) waitPodsSettled(ctx context.Context, namespaces []string, interval, budget time.Duration, quietFrom time.Time) (pods []readiness.ResourceStatus, scanned, settled bool) {
+//
+// quietOpen is set only when the wait ends unsettled with every pod of the
+// last scan settled, so the open quiet window was the only thing missing. It
+// names the change that last restarted the window, for the comment and the
+// LLM prompt; the tables alone show nothing pending then.
+func (p *Processor) waitPodsSettled(ctx context.Context, namespaces []string, interval, budget time.Duration, quietFrom time.Time) (pods []readiness.ResourceStatus, scanned, settled bool, quietOpen string) {
 	if !p.cfg.ReadinessIncludePods || len(namespaces) == 0 {
-		return nil, false, true
+		return nil, false, true, ""
 	}
 	// Shared across iterations: RS → Deployment mappings are immutable, so
 	// re-resolving them on every re-scan would be pure repeated MCP traffic.
@@ -1616,6 +1621,7 @@ func (p *Processor) waitPodsSettled(ctx context.Context, namespaces []string, in
 		scanCtx, cancelScan := context.WithDeadline(ctx, laterOf(deadline, scanStart.Add(minPodScan)))
 		pods, scanned, shuttingDown = p.scanPodStatuses(scanCtx, namespaces, rsCache)
 		cancelScan()
+		quietOpen = ""
 		if scanned {
 			now := time.Now()
 			windowStart := quietFrom
@@ -1625,23 +1631,38 @@ func (p *Processor) waitPodsSettled(ctx context.Context, namespaces []string, in
 			// The rows were listed during the scan, so the window must have
 			// been quiet long enough when the scan STARTED: a pod created
 			// while a slow scan ran is in none of its rows.
-			if readiness.AllSettled(pods) &&
-				(anyWorkloadPodFailed(pods) || scanStart.Sub(windowStart) >= quietPeriod) {
-				return pods, scanned, true
+			if readiness.AllSettled(pods) {
+				if anyWorkloadPodFailed(pods) || scanStart.Sub(windowStart) >= quietPeriod {
+					return pods, scanned, true, ""
+				}
+				quietOpen = quietWindowOpen(changes.lastWhat, windowStart.Equal(quietFrom), quietPeriod)
 			}
 		}
 		if !time.Now().Before(deadline) {
 			// Budget exhausted: report the partial snapshot, unsettled.
-			return pods, scanned, false
+			return pods, scanned, false, quietOpen
 		}
 		// Never sleep past the budget: the last scan lands at the deadline
 		// instead of up to a whole interval after it.
 		select {
 		case <-ctx.Done():
-			return pods, scanned, false
+			return pods, scanned, false, quietOpen
 		case <-time.After(min(interval, time.Until(deadline))):
 		}
 	}
+}
+
+// quietWindowOpen says why settled pods didn't count yet: what last changed
+// the namespace, or the start of the readiness poll when nothing changed
+// since. No elapsed time: the comment body is the comment's stability key,
+// and a seconds count would repost an unchanged state on every re-eval.
+func quietWindowOpen(lastChange string, fromPollStart bool, quietPeriod time.Duration) string {
+	since := "the readiness poll started"
+	if !fromPollStart && lastChange != "" {
+		since = lastChange
+	}
+	return fmt.Sprintf("every pod reads `Current`, but %s less than %s (the pod quiet period) before the last pod scan, so the pods hadn't settled.",
+		since, quietPeriod)
 }
 
 // minPodScan is the least time one pod scan gets, even when the readiness
@@ -1682,6 +1703,8 @@ type podChanges struct {
 	// last is the latest change across all scans so far, so a pod that was
 	// seen once and is gone by the next scan still counts.
 	last time.Time
+	// lastWhat describes the change at last, e.g. "pod `db-0` was created".
+	lastWhat string
 }
 
 type podSighting struct {
@@ -1725,14 +1748,16 @@ func (c *podChanges) observe(pods []readiness.ResourceStatus, shuttingDown bool,
 		if s.inFirstScan && p.CreatedAt.Before(appeared) {
 			appeared = p.CreatedAt
 		}
-		c.record(appeared)
+		c.record(appeared, fmt.Sprintf("pod `%s` was created", p.Name))
 	}
 	if shuttingDown {
-		c.record(now)
+		c.record(now, "a pod was shutting down")
 	}
 	for id := range c.prevPresent {
 		if !current[id] {
-			c.record(now)
+			_, nameAt, _ := strings.Cut(id, "/")
+			name, _, _ := strings.Cut(nameAt, "@")
+			c.record(now, fmt.Sprintf("pod `%s` was removed", name))
 			break
 		}
 	}
@@ -1741,9 +1766,9 @@ func (c *podChanges) observe(pods []readiness.ResourceStatus, shuttingDown bool,
 }
 
 // record moves the last change forward to t if t is later.
-func (c *podChanges) record(t time.Time) {
+func (c *podChanges) record(t time.Time, what string) {
 	if t.After(c.last) {
-		c.last = t
+		c.last, c.lastWhat = t, what
 	}
 }
 

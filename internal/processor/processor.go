@@ -677,10 +677,16 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 	if podNamespace == "" {
 		podNamespace = event.InvolvedObject.Name
 	}
-	podStatuses, podsScanned, podsSettled := p.waitPodsSettled(ctx, []string{podNamespace}, p.cfg.ReadinessPollInterval, time.Until(settleDeadline), analysisStart)
+	podStatuses, podsScanned, podsSettled, podsQuietOpen := p.waitPodsSettled(ctx, []string{podNamespace}, p.cfg.ReadinessPollInterval, time.Until(settleDeadline), analysisStart)
 	p.logger.Debug("pod kstatus snapshot", "count", len(podStatuses), "scanned", podsScanned, "settled", podsSettled)
 	// Fold the pod result into the overall settled flag: an unsettled pod at the
 	// deadline is a timeout just like an unsettled inventory row.
+	// When only the pods' open quiet window kept the run from settling, the
+	// tables show nothing pending; unsettledWhy names the window instead.
+	var unsettledWhy string
+	if settled && !podsSettled {
+		unsettledWhy = podsQuietOpen
+	}
 	settled = settled && podsSettled
 	// CronJob runs whose pods are already cleaned up are judged by their Job
 	// object's conditions instead — a stable verdict that doesn't flap with
@@ -728,6 +734,7 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 		if rows := p.verifyTeardownComplete(ctx, prunedToVerify); len(rows) > 0 {
 			resourceStatuses = append(resourceStatuses, rows...)
 			settled = false
+			unsettledWhy = ""
 		}
 	}
 
@@ -804,7 +811,7 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 		// HelmRelease with no visible children yet can otherwise leave the
 		// tables looking like a small, complete, all-green release when
 		// they're actually blind to whatever the chart renders.
-		analysis = buildKstatusBody(resourceStatuses, podStatuses, podsScanned, settled, p.cfg.CommentIncludeSummary, p.cfg.CommentFailedResourcesOnly, event.InvolvedObject.Name, reconcileFailedMsg, reconcileWaitingMsg, pendingHelmReleases)
+		analysis = buildKstatusBody(resourceStatuses, podStatuses, podsScanned, settled, p.cfg.CommentIncludeSummary, p.cfg.CommentFailedResourcesOnly, event.InvolvedObject.Name, reconcileFailedMsg, reconcileWaitingMsg, pendingHelmReleases, unsettledWhy)
 		// The deterministic body is the comment's STABILITY KEY: the LLM
 		// narrative below is non-deterministic (the same broken state gets
 		// re-worded on every re-eval window), and keying the repost decision on
@@ -853,7 +860,7 @@ func (p *Processor) Process(ctx context.Context, event eventv1.Event, sha string
 			// noise with no root-cause signal (the readiness tables already
 			// carry per-resource status).
 			promptYAML := promptKustomizationYAML(string(kustomizationYAML), refs)
-			userPayload := buildPrompt(event, sha, promptYAML, resourceStatuses, podStatuses, settled)
+			userPayload := buildPrompt(event, sha, promptYAML, resourceStatuses, podStatuses, settled, unsettledWhy)
 			if len(pendingHelmReleases) > 0 {
 				// Without this, the model only sees the same all-Current
 				// snapshot buildKstatusBody does and can describe the run as
@@ -2956,7 +2963,7 @@ func distinctNamespaceCount(refs []string) int {
 // with a timeout line: the poll timing out makes the outcome at least a
 // warning even over an all-Current snapshot, and without the line the model
 // would read that snapshot as a healthy run.
-func buildPrompt(event eventv1.Event, revision, kustomizationYAML string, statuses, podStatuses []readiness.ResourceStatus, settled bool) string {
+func buildPrompt(event eventv1.Event, revision, kustomizationYAML string, statuses, podStatuses []readiness.ResourceStatus, settled bool, unsettledWhy string) string {
 	var builder strings.Builder
 	builder.WriteString("## Flux Event\n")
 	fmt.Fprintf(&builder, "- Resource: %s/%s (%s)\n", event.InvolvedObject.Namespace, event.InvolvedObject.Name, event.InvolvedObject.Kind)
@@ -2975,6 +2982,9 @@ func buildPrompt(event eventv1.Event, revision, kustomizationYAML string, status
 	builder.WriteString("\n\n## Resource Readiness\n")
 	if !settled {
 		builder.WriteString("Readiness poll timed out: at least one resource or pod was still changing state when the bridge stopped waiting, so the rows below are the last snapshot, not a settled result.\n")
+		if unsettledWhy != "" {
+			builder.WriteString("What was still changing: " + unsettledWhy + "\n")
+		}
 	}
 	writeReadinessSummary(&builder, "resources", statuses, func(r readiness.ResourceStatus) string {
 		line := fmt.Sprintf("- %s/%s/%s: %s — %s", r.Kind, r.Namespace, r.Name, r.Status, r.Message)
@@ -3173,7 +3183,7 @@ func unverifiedHelmReleaseNote(names []string) string {
 // note below the tables so the caveat can't be missed, softened by an LLM,
 // or lost when a healthy outcome would otherwise suppress the comment
 // entirely (COMMENT_ON_SUCCESS=false).
-func buildKstatusBody(statuses, podStatuses []readiness.ResourceStatus, podsScanned, settled, includeSummary, failedOnly bool, scope, reconcileFailedMsg, reconcileWaitingMsg string, pendingHelmReleases []pendingHelmRelease) string {
+func buildKstatusBody(statuses, podStatuses []readiness.ResourceStatus, podsScanned, settled, includeSummary, failedOnly bool, scope, reconcileFailedMsg, reconcileWaitingMsg string, pendingHelmReleases []pendingHelmRelease, unsettledWhy string) string {
 	invFailed, invNotCurrent := countStatuses(statuses)
 	podFailed, podNotCurrent := countStatuses(podStatuses)
 	helmReleasesPending := len(pendingHelmReleases) > 0
@@ -3222,7 +3232,7 @@ func buildKstatusBody(statuses, podStatuses []readiness.ResourceStatus, podsScan
 				summary = "every visible resource is current, but a HelmRelease could not be inspected, so its inventory couldn't be verified (see note below)"
 			}
 		default:
-			summary = warningSummary(invNotCurrent, len(statuses), podNotCurrent, len(podStatuses), settled, noun)
+			summary = warningSummary(invNotCurrent, len(statuses), podNotCurrent, len(podStatuses), settled, noun, unsettledWhy)
 		}
 	default:
 		marker = statusEmojiHealthy
@@ -4320,8 +4330,9 @@ func failureSummary(invFailed, invTotal, podFailed, podTotal int, noun string) s
 // is reported as "not confirmed", not "timed out": it is also unsettled when
 // only pods were still settling, or when a resource the PR deleted was still
 // being torn down — and the counts cover pods too, so the line never claims
-// a timeout over "0 of N" pending resources.
-func warningSummary(invNotCurrent, invTotal, podNotCurrent, podTotal int, settled bool, noun string) string {
+// a timeout over "0 of N" pending resources. unsettledWhy, when set, says why
+// an all-Current snapshot is unsettled (the pods' quiet window was open).
+func warningSummary(invNotCurrent, invTotal, podNotCurrent, podTotal int, settled bool, noun, unsettledWhy string) string {
 	var counts string
 	switch {
 	case invNotCurrent > 0 && podNotCurrent > 0:
@@ -4335,6 +4346,8 @@ func warningSummary(invNotCurrent, invTotal, podNotCurrent, podTotal int, settle
 	switch {
 	case settled:
 		return counts
+	case counts == "" && unsettledWhy != "":
+		return "Readiness not confirmed: " + unsettledWhy
 	case counts == "":
 		return "Readiness not confirmed before the poll ended, although the last snapshot reads `Current`."
 	default:

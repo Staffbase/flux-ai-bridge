@@ -177,7 +177,7 @@ func TestBuildPrompt_AllCurrentCollapses(t *testing.T) {
 	pods := []readiness.ResourceStatus{
 		{Kind: "Pod", Namespace: "default", Name: "api-x", Status: "Current", Controller: "Deployment/api"},
 	}
-	prompt := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, pods, true)
+	prompt := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, pods, true, "")
 
 	if !strings.Contains(prompt, "All 2 resources reached Current.") {
 		t.Errorf("expected collapsed resource count line, got: %q", prompt)
@@ -202,7 +202,7 @@ func TestBuildPrompt_ReadinessTimeout(t *testing.T) {
 	}
 	const line = "Readiness poll timed out"
 
-	unsettled := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, false)
+	unsettled := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, false, "")
 	if !strings.Contains(unsettled, "## Resource Readiness\n"+line) {
 		t.Errorf("unsettled poll: Resource Readiness must open with the timeout line, got: %q", unsettled)
 	}
@@ -210,8 +210,16 @@ func TestBuildPrompt_ReadinessTimeout(t *testing.T) {
 		t.Errorf("unsettled poll: count line must still follow the timeout line, got: %q", unsettled)
 	}
 
-	if settled := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, true); strings.Contains(settled, line) {
+	if settled := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, true, ""); strings.Contains(settled, line) {
 		t.Errorf("settled poll must not carry the timeout line, got: %q", settled)
+	}
+
+	const why = "every pod reads `Current`, but pod `db-0` was created less than 1m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
+	if withWhy := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, false, why); !strings.Contains(withWhy, line+": ") || !strings.Contains(withWhy, "\nWhat was still changing: "+why+"\n") {
+		t.Errorf("unsettled poll with a reason must carry it after the timeout line, got: %q", withWhy)
+	}
+	if strings.Contains(unsettled, "What was still changing") {
+		t.Errorf("no reason, no line, got: %q", unsettled)
 	}
 }
 
@@ -231,7 +239,7 @@ func TestBuildPrompt(t *testing.T) {
 		{Kind: "HelmRelease", Namespace: "default", Name: "web", Status: "Failed", Message: "InstallFailed"},
 	}
 
-	prompt := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, true)
+	prompt := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, true, "")
 
 	// buildPrompt is data-only since the instructions live in SKILL.md.
 	// Assert the data sections; do NOT assert "Instructions" here — that section was deliberately
