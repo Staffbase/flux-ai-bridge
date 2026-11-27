@@ -280,11 +280,18 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func(contex
 			c.log().Warn("readiness: poll cut short by its timeout; keeping the previous poll's rows",
 				"rows", len(refs), "timeout", timeout)
 		}
-		if allSettled(results) && slices.Equal(readRefs(), refs) {
-			return results, true, nil
+		// latest holds the refs of the check below when they differ from the
+		// poll's: a HelmRelease finished its install and now lists a child.
+		var latest []string
+		if allSettled(results) {
+			now := readRefs()
+			if slices.Equal(now, refs) {
+				return results, true, nil
+			}
+			latest = now
 		}
 		if !time.Now().Before(deadline) {
-			return results, false, nil
+			return rowsFor(latest, refs, results), false, nil
 		}
 		prev = make(map[string]ResourceStatus, len(refs))
 		for i, ref := range refs {
@@ -295,7 +302,7 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func(contex
 		// cut it short.
 		wait := min(interval, time.Until(deadline)-time.Since(pollStart))
 		if wait < 0 {
-			return results, false, nil
+			return rowsFor(latest, refs, results), false, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -303,6 +310,38 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func(contex
 		case <-time.After(wait):
 		}
 	}
+}
+
+// rowsFor returns the poll's rows for the latest refs when the poll ends right
+// after a check found different refs: a ref the poll read keeps its row, and a
+// ref it never read (a HelmRelease child that just appeared) gets an Unknown
+// row, so no caller can count the result as settled. With no latest refs it
+// returns results unchanged.
+func rowsFor(latest, refs []string, results []ResourceStatus) []ResourceStatus {
+	if latest == nil {
+		return results
+	}
+	byRef := make(map[string]ResourceStatus, len(refs))
+	for i, ref := range refs {
+		byRef[ref] = results[i]
+	}
+	out := make([]ResourceStatus, 0, len(latest))
+	for _, ref := range latest {
+		if r, ok := byRef[ref]; ok {
+			out = append(out, r)
+			continue
+		}
+		parsed, err := ParseInventoryID(ref)
+		if err != nil {
+			out = append(out, ResourceStatus{Status: "Unknown", Message: err.Error()})
+			continue
+		}
+		out = append(out, ResourceStatus{
+			Kind: parsed.Kind, Name: parsed.Name, Namespace: parsed.Namespace,
+			Status: "Unknown", Message: "appeared in the inventory after the last poll; not read yet",
+		})
+	}
+	return out
 }
 
 // minPollRead is the least time one poll's reads get, even when the timeout

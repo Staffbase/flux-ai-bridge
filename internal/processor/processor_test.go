@@ -3058,6 +3058,10 @@ func TestRolloutInProgress(t *testing.T) {
 		{name: "HelmRelease children unseen", outcome: warning, statuses: rows(current), pending: true},
 		{name: "Terminating row", outcome: warning, statuses: rows(readiness.ResourceStatus{Status: "Terminating"})},
 		{name: "Unknown pod", outcome: warning, pods: rows(readiness.ResourceStatus{Status: "Unknown"})},
+		// A row kept from the previous poll wasn't read in the last one, so
+		// the warning may come from it, not from an observed rollout.
+		{name: "stale Current row from a cut poll", outcome: warning, pods: rows(startingPod),
+			statuses: rows(inProgress, readiness.ResourceStatus{Kind: "Service", Namespace: "apps", Name: "api", Status: "Current", Stale: true})},
 		{name: "Ready=False SourceNotReady", outcome: warning, statuses: rows(withCond("Ready", "False", "SourceNotReady"))},
 		{name: "Stalled=True", outcome: warning, statuses: rows(withCond("Stalled", "True", "RetriesExceeded"))},
 		{name: "retry after failed upgrade", outcome: warning, statuses: rows(withCond("Reconciling", "True", "ProgressingWithRetry"))},

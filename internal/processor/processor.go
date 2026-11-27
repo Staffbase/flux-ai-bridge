@@ -4096,6 +4096,11 @@ func rolloutInProgress(outcome bridgegithub.Outcome, statuses, podStatuses []rea
 	}
 	for _, rows := range [][]readiness.ResourceStatus{statuses, podStatuses} {
 		for _, r := range rows {
+			// A Stale row is the previous poll's read: the last poll ran out
+			// of time before it reached the resource, so it proves nothing.
+			if r.Stale {
+				return false
+			}
 			if r.Status == "Current" {
 				continue
 			}

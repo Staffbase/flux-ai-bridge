@@ -1365,3 +1365,49 @@ func TestWaitUntilSettled_KeptCurrentRowIsNotSettled(t *testing.T) {
 		t.Error("AllSettled = true for a poll with a kept row, want false")
 	}
 }
+
+// When the poll ends right after the final refs check found a new ref (a
+// HelmRelease child that just appeared), the result has a row for it, Unknown
+// because it was never read, so no caller can count the result as settled.
+func TestWaitUntilSettledFunc_NewRefWithoutPollReadsUnknown(t *testing.T) {
+	fake := &fakeFetcher{resources: map[string]string{
+		"apps/v1|Deployment|api|default": readyDeploymentYAML,
+	}}
+	slow := &slowRefsFetcher{inner: fake, delay: 60 * time.Millisecond}
+	calls := 0
+	refsFunc := func(context.Context) []string {
+		calls++
+		if calls == 1 {
+			return []string{"default_api_apps_Deployment"}
+		}
+		return []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+	}
+	// The poll reads api Current in 60ms; the refs check then finds worker,
+	// and a second 60ms poll can't fit in the 40ms left.
+	results, settled, err := NewChecker(slow).WaitUntilSettledFunc(context.Background(), refsFunc,
+		10*time.Millisecond, 100*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if len(results) != 2 || results[0].Status != "Current" || results[1].Name != "worker" || results[1].Status != "Unknown" {
+		t.Fatalf("results = %+v, want api Current and an Unknown row for the unread worker", results)
+	}
+	if AllSettled(results) {
+		t.Error("AllSettled = true with an unread new ref, want false")
+	}
+}
+
+// slowRefsFetcher delays every read of inner by delay.
+type slowRefsFetcher struct {
+	inner ResourceFetcher
+	delay time.Duration
+}
+
+func (s *slowRefsFetcher) GetKubernetesResource(ctx context.Context, apiVersion, kind, name, namespace string) ([]byte, error) {
+	select {
+	case <-time.After(s.delay):
+		return s.inner.GetKubernetesResource(ctx, apiVersion, kind, name, namespace)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
