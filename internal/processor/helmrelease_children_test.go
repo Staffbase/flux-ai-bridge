@@ -61,7 +61,7 @@ status:
 const helmReleaseDBKey = "helm.toolkit.fluxcd.io/v2|HelmRelease|db|apps"
 
 func helmReleaseChildrenProcessor(mcp *fakeMCPClient) *Processor {
-	return New(&config.Config{ReadinessExpandHelmReleases: true}, mcp, nil, nil, &fakeCommenter{}, nil, nil, slog.Default())
+	return New(&config.Config{ReadinessExpandHelmReleases: true}, mcp, readiness.NewChecker(mcp), nil, &fakeCommenter{}, nil, nil, slog.Default())
 }
 
 func dbParents() map[string]string {
@@ -98,10 +98,46 @@ func TestSettleHelmReleaseChildren_UpgradeInProgressReadsInProgress(t *testing.T
 	}
 }
 
+const configMapDBInitKey = "v1|ConfigMap|db-init|apps"
+
+const configMapDBInitYAML = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init
+  namespace: apps
+`
+
 // The upgrade finished between the poll's inventory read and its row reads:
 // the fresh HelmRelease inventory no longer lists the object, so the release
-// removed it on purpose and the row is dropped.
+// removed it on purpose and the row is dropped. Its replacement, which the
+// poll never read, is read and added.
 func TestSettleHelmReleaseChildren_RemovedByReleaseIsDropped(t *testing.T) {
+	proc := helmReleaseChildrenProcessor(&fakeMCPClient{resources: map[string][]byte{
+		helmReleaseDBKey:   []byte(helmReleaseDBNewInventory),
+		configMapDBInitKey: []byte(configMapDBInitYAML),
+	}})
+	statuses := []readiness.ResourceStatus{
+		{Kind: "HelmRelease", Namespace: "apps", Name: "db", Status: "Current"},
+		{Kind: "StatefulSet", Namespace: "apps", Name: "db", Status: "Current"},
+		{Kind: "ConfigMap", Namespace: "apps", Name: "db-init-old", Status: "NotFound"},
+	}
+	got := proc.settleHelmReleaseChildren(context.Background(), statuses, dbParents())
+	if len(got) != 3 {
+		t.Fatalf("want the removed ConfigMap dropped and its replacement added, got %+v", got)
+	}
+	for _, r := range got {
+		if r.Name == "db-init-old" {
+			t.Fatalf("removed ConfigMap still listed: %+v", got)
+		}
+	}
+	if last := got[2]; last.Name != "db-init" || last.Status != "Current" {
+		t.Fatalf("want the replacement ConfigMap read as Current, got %+v", last)
+	}
+}
+
+// A replacement that is missing too must not let the verdict go green: it is
+// added as NotFound.
+func TestSettleHelmReleaseChildren_MissingReplacementIsReported(t *testing.T) {
 	proc := helmReleaseChildrenProcessor(&fakeMCPClient{resources: map[string][]byte{helmReleaseDBKey: []byte(helmReleaseDBNewInventory)}})
 	statuses := []readiness.ResourceStatus{
 		{Kind: "HelmRelease", Namespace: "apps", Name: "db", Status: "Current"},
@@ -109,13 +145,11 @@ func TestSettleHelmReleaseChildren_RemovedByReleaseIsDropped(t *testing.T) {
 		{Kind: "ConfigMap", Namespace: "apps", Name: "db-init-old", Status: "NotFound"},
 	}
 	got := proc.settleHelmReleaseChildren(context.Background(), statuses, dbParents())
-	if len(got) != 2 {
-		t.Fatalf("want the removed ConfigMap dropped, got %+v", got)
+	if failed, _ := countStatuses(got); failed != 1 {
+		t.Fatalf("want the missing replacement counted as failed, got %+v", got)
 	}
-	for _, r := range got {
-		if r.Name == "db-init-old" {
-			t.Fatalf("removed ConfigMap still listed: %+v", got)
-		}
+	if last := got[len(got)-1]; last.Name != "db-init" || last.Status != "NotFound" {
+		t.Fatalf("want the replacement ConfigMap read as NotFound, got %+v", last)
 	}
 }
 
@@ -279,5 +313,43 @@ status:
 	}
 	if got := commenterMock.labelCalls[len(commenterMock.labelCalls)-1].Outcome; got != bridgegithub.OutcomeWarning {
 		t.Errorf("label outcome = %v, want warning", got)
+	}
+}
+
+// helmReleaseTwoHistoriesYAML is a HelmRelease rendered with an inventory per
+// history entry: history[0] is the current release, history[1] a superseded
+// one that still lists the ConfigMap the current release renamed.
+const helmReleaseTwoHistoriesYAML = `apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: db
+  namespace: apps
+status:
+  history:
+    - status: deployed
+      version: 2
+      inventory:
+        - apiVersion: v1
+          kind: ConfigMap
+          name: db-init
+          namespace: apps
+    - status: superseded
+      version: 1
+      inventory:
+        - apiVersion: v1
+          kind: ConfigMap
+          name: db-init-old
+          namespace: apps
+`
+
+// Only the newest release's inventory counts: a superseded release's objects
+// may be gone for good.
+func TestHelmReleaseInventoryIDs_OnlyNewestHistoryEntry(t *testing.T) {
+	ids, err := helmReleaseInventoryIDs([]byte(helmReleaseTwoHistoriesYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != "apps_db-init__ConfigMap" {
+		t.Fatalf("ids = %v, want only the current release's ConfigMap", ids)
 	}
 }

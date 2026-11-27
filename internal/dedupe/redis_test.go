@@ -243,7 +243,7 @@ func prKey(prefix, ns, name string, pr int, sha string) string {
 // SETNX never updates an existing key's TTL — so before this migration path
 // existed, enabling DEDUPE_PR_REEVAL_TTL left every already-analysed PR-head
 // deduped forever. Pin the fix: the first duplicate event attaches the floor
-// (EXPIRE NX) to the persistent mark, the mark self-frees after one window,
+// (EXPIRE LT) to the persistent mark, the mark self-frees after one window,
 // and the next event re-admits the PR-head with a normally-expiring mark.
 func TestRedis_ReEvalFloorAdoptsPreFloorMark(t *testing.T) {
 	t.Parallel()
@@ -273,7 +273,7 @@ func TestRedis_ReEvalFloorAdoptsPreFloorMark(t *testing.T) {
 	}
 }
 
-// EXPIRE NX must not touch marks that already carry an expiry: a duplicate
+// EXPIRE LT must not extend marks that already carry a shorter expiry: a duplicate
 // event halfway through the window must NOT push the re-eval out by resetting
 // the countdown (Flux re-fires every few minutes — a refreshed TTL would mean
 // the floor never elapses on a busy Kustomization).
@@ -297,6 +297,32 @@ func TestRedis_ReEvalFloorDoesNotRefreshExistingExpiry(t *testing.T) {
 	}
 }
 
+// A mark written while the floor was unset carries the long persistence
+// backstop. Enabling the floor must lower it to one window, or the PR-head
+// would stay deduped until the backstop runs out.
+func TestRedis_ReEvalFloorLowersBackstopExpiry(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	c, err := dedupe.NewRedis("redis://"+mr.Addr(), "", "", "p:", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewRedis: %v", err)
+	}
+	key := prKey("p:", "ns", "k", 7, "head")
+	seedMark(t, mr, key, time.Now().Add(-time.Hour).Format(time.RFC3339Nano))
+	mr.SetTTL(key, 720*time.Hour)
+
+	if markPRNew(t, c, "ns", "k", 7, "head", 15*time.Minute) {
+		t.Fatal("backstop mark must still dedupe the event that lowers it")
+	}
+	if ttl := mr.TTL(key); ttl <= 0 || ttl > 15*time.Minute {
+		t.Fatalf("backstop expiry must be lowered to the floor, got ttl %v", ttl)
+	}
+	mr.FastForward(15*time.Minute + time.Second)
+	if !markPRNew(t, c, "ns", "k", 7, "head", 15*time.Minute) {
+		t.Fatal("mark must be re-admitted one window later")
+	}
+}
+
 // With the floor disabled (ttl 0) the migration path must stay dormant: a
 // pre-floor persistent mark keeps deduping and gains no expiry.
 func TestRedis_NoFloorLeavesPreFloorMarkPersistent(t *testing.T) {
@@ -317,7 +343,7 @@ func TestRedis_NoFloorLeavesPreFloorMarkPersistent(t *testing.T) {
 	}
 }
 
-// Replicas racing over the same pre-floor mark: EXPIRE NX is idempotent, so
+// Replicas racing over the same pre-floor mark: EXPIRE LT is idempotent, so
 // nobody is admitted while the mark stands, and after it expires the SETNX
 // race has exactly one winner — no duplicate-analysis storm at either stage.
 func TestRedis_ConcurrentPreFloorAdoption(t *testing.T) {
@@ -427,7 +453,7 @@ func TestRedis_PRReEvalCountPeek(t *testing.T) {
 
 // The WithMaxTTL backstop gives every "keep forever" record an expiry — new
 // admission marks without a re-eval floor, marks written before the backstop
-// existed (attached via EXPIRE NX on their next hit), outcome and label
+// existed (attached via EXPIRE LT on their next hit), outcome and label
 // records — while an explicit TTL wins.
 func TestRedis_MaxTTLBackstop(t *testing.T) {
 	t.Parallel()

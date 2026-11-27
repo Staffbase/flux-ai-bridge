@@ -217,8 +217,9 @@ func (c *Cache) Available() bool {
 // DEDUPE_PR_REEVAL_TTL on a running install picks up already-analysed PR-heads
 // instead of leaving them deduped forever: the in-memory backend compares the
 // mark's stored timestamp against ttl on every call, and the Redis backend
-// attaches the expiry to pre-floor (no-expiry) marks via EXPIRE NX (requires
-// Redis ≥ 7.0 / Valkey), so they self-free one window after their next event.
+// lowers the expiry of pre-floor marks (none, or the longer backstop) via
+// EXPIRE LT (requires Redis ≥ 7.0 / Valkey), so they self-free one window after
+// their next event.
 //
 // Returns (false, err) when the backend is unreachable (Redis down, auth
 // misconfigured): callers MUST fail closed and skip the PR — without dedupe

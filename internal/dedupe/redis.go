@@ -318,19 +318,22 @@ func (r *redisStore) hgetall(key string) (map[string]string, error) {
 // Cache.MarkPRIfNew).
 //
 // When the effective ttl is positive and the key already exists WITHOUT an
-// expiry, it is attached via EXPIRE NX. Such keys are marks written before the
-// floor or the backstop was configured (SETNX never updates an existing key's
-// TTL) — left alone they'd dedupe forever, so PRs analysed before an operator
-// enabled DEDUPE_PR_REEVAL_TTL would never re-evaluate at their current head,
-// and marks from before the backstop would never be reclaimed. With the expiry
-// attached, the mark self-frees after one window and the next event re-admits
-// via SETNX.
+// expiry or with a LONGER one, the expiry is lowered to ttl via EXPIRE LT.
+// Such keys are marks written before the floor was configured or shortened
+// (SETNX never updates an existing key's TTL): a mark without an expiry, or one
+// carrying the 30-day backstop from when the floor was unset, would keep
+// deduping long past the floor, so PRs analysed before an operator enabled
+// DEDUPE_PR_REEVAL_TTL wouldn't re-evaluate at their current head. With the
+// expiry lowered, the mark self-frees after one window and the next event
+// re-admits via SETNX.
 // Deliberately NOT a Lua compare-and-swap on the stored timestamp (which would
 // re-admit on the next event instead of one window later): managed Redis ACLs
 // commonly deny EVAL/EVALSHA — seen in production as "NOPERM ... has no
 // permissions to run the 'evalsha' command" — while EXPIRE is part of the
-// plain keyspace command set. NX keeps it idempotent across racing replicas
-// and leaves marks that already carry an expiry untouched. The NX modifier
+// plain keyspace command set. LT keeps it idempotent across racing replicas
+// and never extends an expiry, so a duplicate event inside the window doesn't
+// push the re-evaluation out (Redis treats a key without an expiry as having
+// an infinite one, so LT sets it there too). The LT modifier
 // requires Redis ≥ 7.0 (any Valkey version qualifies — Valkey forked from
 // Redis 7.2); on an older server the call fails and is WARN-logged, leaving
 // pre-floor marks deduping forever — the normal TTL-based re-eval is
@@ -357,10 +360,10 @@ func (r *redisStore) markIfNewAtomic(k Key, t time.Time, ttl time.Duration) (boo
 	}
 	// Best-effort: the admission answer is already "duplicate" either way; a
 	// failure here (an ACL that also denies EXPIRE, or a pre-7.0 Redis that
-	// doesn't know the NX modifier) only delays the pre-floor migration, so
+	// doesn't know the LT modifier) only delays the pre-floor migration, so
 	// log loudly and keep the event flowing rather than failing closed.
-	if eerr := r.client.ExpireNX(ctx, key, ttl).Err(); eerr != nil {
-		slog.Default().Warn("dedupe: redis EXPIRE NX for re-eval floor failed; pre-floor mark keeps deduping (best-effort; requires Redis 7+/Valkey)",
+	if eerr := r.client.ExpireLT(ctx, key, ttl).Err(); eerr != nil {
+		slog.Default().Warn("dedupe: redis EXPIRE LT for re-eval floor failed; pre-floor mark keeps deduping (best-effort; requires Redis 7+/Valkey)",
 			"namespace", k.Namespace, "name", k.Name, "sha", k.SHA, "error", eerr.Error())
 	}
 	return false, nil

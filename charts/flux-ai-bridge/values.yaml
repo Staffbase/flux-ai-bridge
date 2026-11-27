@@ -242,10 +242,11 @@ config:
       # the defaults): raising pollTimeout above 13m needs a longer ttl too.
       #
       # Enabling this on a RUNNING install also applies to PRs analysed before
-      # the change: their existing admission records get the expiry attached on
-      # their next Flux event, so pre-existing PR comments start refreshing
-      # within roughly two windows — no new commit or manual cache flush needed.
-      # NOTE: this migration of pre-existing records uses `EXPIRE ... NX` and
+      # the change: their existing admission records (without an expiry, or with
+      # the longer persistence.maxTTL backstop) get their expiry lowered to the
+      # ttl on their next Flux event, so pre-existing PR comments start
+      # refreshing within roughly two windows — no new commit or manual cache
+      # flush needed. NOTE: this migration uses `EXPIRE ... LT` and
       # therefore needs Redis >= 7.0 on the persistence backend. Any Valkey
       # version qualifies (Valkey forked from Redis 7.2), including the bundled
       # sub-chart. On older Redis the bridge logs a warning and only PR-heads
