@@ -3260,14 +3260,23 @@ func buildKstatusBody(statuses, podStatuses []readiness.ResourceStatus, podsScan
 // section (markdownTableCell escapes the pipe/newline). Current rows and rows
 // with no usable condition keep the kstatus message.
 func inventoryRowMessage(r readiness.ResourceStatus) string {
-	if r.Status == "Current" {
-		return r.Message
+	msg := r.Message
+	if r.Status != "Current" {
+		if cm := notReadyConditionMessage(r.Conditions); cm != "" {
+			msg = cm
+		}
 	}
-	if cm := notReadyConditionMessage(r.Conditions); cm != "" {
-		return cm
+	if r.Stale {
+		return staleRowNote + msg
 	}
-	return r.Message
+	return msg
 }
+
+// staleRowNote leads the message of a row kept from the previous poll (see
+// readiness.ResourceStatus.Stale), so the reader knows the status wasn't read
+// in the last one. It also changes the comment body, so a re-evaluation that
+// differs only in stale rows isn't mistaken for an unchanged one.
+const staleRowNote = "not read in the last poll (timed out); previous poll: "
 
 // abnormalTrueConditions are condition types whose True status signals a
 // problem (kstatus's "abnormal-true" polarity), so False is their healthy
@@ -4168,7 +4177,7 @@ func renderStatusTables(statuses, podStatuses []readiness.ResourceStatus, podsSc
 			// per managed namespace).
 			shown = shown[:0:0]
 			for _, r := range statuses {
-				if r.Status != "Current" {
+				if r.Status != "Current" || r.Stale {
 					shown = append(shown, r)
 				}
 			}
@@ -4263,10 +4272,12 @@ func writeResourceRows(b *strings.Builder, rows []readiness.ResourceStatus) {
 	}
 }
 
-// anyNotCurrent reports whether any row is in a non-`Current` kstatus.
+// anyNotCurrent reports whether any row is in a non-`Current` kstatus or is
+// stale: a stale `Current` row wasn't read in the last poll, so it isn't
+// folded into the all-Current summary row.
 func anyNotCurrent(statuses []readiness.ResourceStatus) bool {
 	for _, r := range statuses {
-		if r.Status != "Current" {
+		if r.Status != "Current" || r.Stale {
 			return true
 		}
 	}
