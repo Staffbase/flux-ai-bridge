@@ -214,7 +214,7 @@ func TestBuildPrompt_ReadinessTimeout(t *testing.T) {
 		t.Errorf("settled poll must not carry the timeout line, got: %q", settled)
 	}
 
-	const why = "every pod reads `Current`, but pod `db-0` was created less than 1m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
+	const why = "pod `db-0` was created less than 1m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
 	if withWhy := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, false, why); !strings.Contains(withWhy, line+": ") || !strings.Contains(withWhy, "\nWhat was still changing: "+why+"\n") {
 		t.Errorf("unsettled poll with a reason must carry it after the timeout line, got: %q", withWhy)
 	}

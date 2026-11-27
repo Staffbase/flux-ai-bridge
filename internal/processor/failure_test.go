@@ -1719,9 +1719,45 @@ func TestWaitPodsSettled_OpenQuietWindowNamesLastChange(t *testing.T) {
 	if settled {
 		t.Fatal("expected NOT settled: db-0 was created inside the quiet period")
 	}
-	want := "every pod reads `Current`, but pod `db-0` was created less than 1h0m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
+	want := "pod `db-0` was created less than 1h0m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
 	if quietOpen != want {
 		t.Errorf("quietOpen = %q, want %q", quietOpen, want)
+	}
+}
+
+// TestWaitPodsSettled_OpenQuietWindowLatePodWasFirstSeen: a pod first listed
+// in a later scan counts from when the bridge saw it, so the reason says
+// "first seen", not "created" — its creationTimestamp may be much older.
+func TestWaitPodsSettled_OpenQuietWindowLatePodWasFirstSeen(t *testing.T) {
+	old := podSpec{name: "web", ready: true, created: time.Now().Add(-24 * time.Hour)}
+	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{
+		podsListYAML(old),
+		podsListYAML(old, podSpec{name: "late", ready: true, created: time.Now().Add(-2 * time.Hour)}),
+	}}
+	proc := quietFixture(t, mcp, time.Hour)
+
+	_, _, _, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
+	if !strings.HasPrefix(quietOpen, "pod `late` was first seen less than 1h0m0s") {
+		t.Errorf("quietOpen = %q, want the late pod as first seen", quietOpen)
+	}
+}
+
+// TestWaitPodsSettled_OpenQuietWindowNamesFirstRemovedPod: two pods vanish in
+// the same scan; the reason names the alphabetically first one, so the same
+// scans always give the same comment body.
+func TestWaitPodsSettled_OpenQuietWindowNamesFirstRemovedPod(t *testing.T) {
+	created := time.Now().Add(-24 * time.Hour)
+	keep := podSpec{name: "web", ready: true, created: created}
+	for range 5 {
+		mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{
+			podsListYAML(keep, podSpec{name: "zeta", ready: true, created: created}, podSpec{name: "alpha", ready: true, created: created}, podSpec{name: "mid", ready: true, created: created}),
+			podsListYAML(keep),
+		}}
+		proc := quietFixture(t, mcp, time.Hour)
+		_, _, _, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
+		if !strings.HasPrefix(quietOpen, "pod `alpha` was removed less than") {
+			t.Fatalf("quietOpen = %q, want the alphabetically first removed pod", quietOpen)
+		}
 	}
 }
 
@@ -1737,7 +1773,7 @@ func TestWaitPodsSettled_OpenQuietWindowFromPollStart(t *testing.T) {
 	if settled {
 		t.Fatal("expected NOT settled: the poll started inside the quiet period")
 	}
-	if !strings.Contains(quietOpen, "but the readiness poll started less than 1h0m0s") {
+	if !strings.HasPrefix(quietOpen, "the readiness poll started less than 1h0m0s") {
 		t.Errorf("quietOpen = %q, want it to count from the poll start", quietOpen)
 	}
 }
@@ -1869,7 +1905,7 @@ items:
 	mcp := &seqPodMCP{fakeMCPClient: &fakeMCPClient{}, seq: []string{failedJobPod}}
 	proc := quietFixture(t, mcp, time.Hour)
 
-	pods, scanned, settled, _ := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
+	pods, scanned, settled, quietOpen := proc.waitPodsSettled(context.Background(), []string{"default"}, time.Millisecond, 50*time.Millisecond, time.Now())
 	if !scanned {
 		t.Fatal("expected scanned=true")
 	}
@@ -1878,6 +1914,10 @@ items:
 	}
 	if settled {
 		t.Error("expected NOT settled: a failed Job pod must not skip the quiet period")
+	}
+	// The reason describes only the window; it must not call the failed pod Current.
+	if want := "the readiness poll started less than 1h0m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."; quietOpen != want {
+		t.Errorf("quietOpen = %q, want %q", quietOpen, want)
 	}
 }
 

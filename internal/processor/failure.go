@@ -1661,7 +1661,7 @@ func quietWindowOpen(lastChange string, fromPollStart bool, quietPeriod time.Dur
 	if !fromPollStart && lastChange != "" {
 		since = lastChange
 	}
-	return fmt.Sprintf("every pod reads `Current`, but %s less than %s (the pod quiet period) before the last pod scan, so the pods hadn't settled.",
+	return fmt.Sprintf("%s less than %s (the pod quiet period) before the last pod scan, so the pods hadn't settled.",
 		since, quietPeriod)
 }
 
@@ -1704,6 +1704,8 @@ type podChanges struct {
 	// seen once and is gone by the next scan still counts.
 	last time.Time
 	// lastWhat describes the change at last, e.g. "pod `db-0` was created".
+	// Deterministic for the same scans: it ends up in the comment body,
+	// which is the comment's stability key.
 	lastWhat string
 }
 
@@ -1744,22 +1746,27 @@ func (c *podChanges) observe(pods []readiness.ResourceStatus, shuttingDown bool,
 			s = podSighting{firstSeen: now, inFirstScan: firstScan}
 			c.sightings[id] = s
 		}
-		appeared := s.firstSeen
+		// "created" only when the creationTimestamp is the time used; a pod
+		// the bridge first saw in a later scan counts from that sighting.
+		appeared, what := s.firstSeen, "was first seen"
 		if s.inFirstScan && p.CreatedAt.Before(appeared) {
-			appeared = p.CreatedAt
+			appeared, what = p.CreatedAt, "was created"
 		}
-		c.record(appeared, fmt.Sprintf("pod `%s` was created", p.Name))
+		c.record(appeared, fmt.Sprintf("pod `%s` %s", p.Name, what))
 	}
 	if shuttingDown {
 		c.record(now, "a pod was shutting down")
 	}
+	var removed []string
 	for id := range c.prevPresent {
 		if !current[id] {
 			_, nameAt, _ := strings.Cut(id, "/")
 			name, _, _ := strings.Cut(nameAt, "@")
-			c.record(now, fmt.Sprintf("pod `%s` was removed", name))
-			break
+			removed = append(removed, name)
 		}
+	}
+	if len(removed) > 0 {
+		c.record(now, fmt.Sprintf("pod `%s` was removed", slices.Min(removed)))
 	}
 	c.prevPresent = current
 	return c.last

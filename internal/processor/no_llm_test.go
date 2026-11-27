@@ -310,7 +310,7 @@ func TestBuildKstatusBody_OpenQuietWindowNamesReason(t *testing.T) {
 	statuses := []readiness.ResourceStatus{
 		{Kind: "StatefulSet", Namespace: "apps", Name: "db", Status: "Current", Message: "ready"},
 	}
-	why := "every pod reads `Current`, but pod `db-0` was created less than 1m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
+	why := "pod `db-0` was created less than 1m0s (the pod quiet period) before the last pod scan, so the pods hadn't settled."
 	got := buildKstatusBody(statuses, nil, false, false, true, false, "db", "", "", nil, why)
 	if !strings.HasPrefix(got, statusEmojiWarning+"\n") {
 		t.Errorf("expected ⚠️ marker, got: %q", got)
