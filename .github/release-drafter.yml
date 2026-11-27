@@ -34,6 +34,10 @@ version-resolver:
       - 'dependencies'
   default: patch
 template: |
+  ## Container image
+
+  [`ghcr.io/staffbase/flux-ai-bridge:v$RESOLVED_VERSION`](https://github.com/orgs/Staffbase/packages/container/package/flux-ai-bridge)
+
   ## Changes
 
   $CHANGES

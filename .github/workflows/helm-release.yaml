@@ -41,11 +41,30 @@ jobs:
           helm repo add ollama https://helm.otwld.com/
           helm repo update
 
+      # chart-releaser starts each chart release's notes with this file from
+      # the chart package instead of the chart description, which describes
+      # the app. Written here, not kept in git: the notes name the version.
+      - name: Write the chart release notes
+        run: |
+          chart=charts/flux-ai-bridge
+          version=$(yq '.version' "$chart/Chart.yaml")
+          app_version=$(yq '.appVersion' "$chart/Chart.yaml")
+          {
+            echo "Helm chart for flux-ai-bridge, chart version $version. It installs the image \`ghcr.io/staffbase/flux-ai-bridge:$app_version\` by default."
+            echo
+            echo "OCI artifact: [\`oci://ghcr.io/staffbase/charts/flux-ai-bridge:$version\`](https://github.com/orgs/Staffbase/packages/container/package/charts%2Fflux-ai-bridge)"
+            echo
+            echo '```bash'
+            echo "helm install flux-ai-bridge oci://ghcr.io/staffbase/charts/flux-ai-bridge --version $version"
+            echo '```'
+          } > "$chart/RELEASE-NOTES.md"
+
       - name: Run chart-releaser
         id: chart-releaser
         uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
         env:
           CR_GENERATE_RELEASE_NOTES: true
+          CR_RELEASE_NOTES_FILE: RELEASE-NOTES.md
           # Registry credentials for `cr push`, read from the environment so
           # the token isn't passed on the command line.
           CR_PASSWORD: "${{ secrets.GITHUB_TOKEN }}"
