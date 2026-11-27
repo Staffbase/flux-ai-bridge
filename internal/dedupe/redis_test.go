@@ -526,6 +526,48 @@ func TestRedis_ExpirePRCooldown(t *testing.T) {
 	}
 }
 
+// A rate-limit cooldown longer than the re-eval floor must run out in full:
+// a duplicate event during it must not lower it to the floor, or the PR-head
+// would be re-admitted before GitHub's limit resets.
+func TestRedis_ReEvalFloorKeepsLongerCooldown(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	c, err := dedupe.NewRedis("redis://"+mr.Addr(), "", "", "p:", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewRedis: %v", err)
+	}
+	key := prKey("p:", "ns", "k", 7, "head")
+	if !markPRNew(t, c, "ns", "k", 7, "head", 15*time.Minute) {
+		t.Fatal("first mark must be new")
+	}
+	c.ExpirePR("ns", "k", 7, "head", time.Hour)
+	mr.FastForward(5 * time.Minute)
+	if markPRNew(t, c, "ns", "k", 7, "head", 15*time.Minute) {
+		t.Fatal("mark must dedupe during the cooldown")
+	}
+	if ttl := mr.TTL(key); ttl != 55*time.Minute {
+		t.Fatalf("cooldown must keep its remaining 55m, got ttl %v", ttl)
+	}
+}
+
+// ExpirePR caps a cooldown at MaxCooldown, so the floor migration can tell
+// cooldowns from pre-floor marks.
+func TestRedis_ExpirePRCapsCooldown(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	c, err := dedupe.NewRedis("redis://"+mr.Addr(), "", "", "p:", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewRedis: %v", err)
+	}
+	if !markPRNew(t, c, "ns", "k", 7, "head", 0) {
+		t.Fatal("first mark must be new")
+	}
+	c.ExpirePR("ns", "k", 7, "head", 3*time.Hour)
+	if got := mr.TTL(prKey("p:", "ns", "k", 7, "head")); got != dedupe.MaxCooldown {
+		t.Fatalf("cooldown TTL = %s, want MaxCooldown %s", got, dedupe.MaxCooldown)
+	}
+}
+
 // Available costs nothing while admission writes succeed, reports an outage
 // after a failed write, and recovers as soon as the server answers again.
 func TestRedis_AvailableProbe(t *testing.T) {

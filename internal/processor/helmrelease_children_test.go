@@ -353,3 +353,33 @@ func TestHelmReleaseInventoryIDs_OnlyNewestHistoryEntry(t *testing.T) {
 		t.Fatalf("ids = %v, want only the current release's ConfigMap", ids)
 	}
 }
+
+const helmReleaseCacheSharedYAML = `apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cache
+  namespace: apps
+status:
+  inventory:
+    entries:
+      - id: "apps_db-init-old__ConfigMap"
+`
+
+// A child two HelmReleases list isn't mapped to either: settling it against
+// one release could drop a row the other still expects.
+func TestExpandHelmReleases_SharedChildIsUnmapped(t *testing.T) {
+	proc := helmReleaseChildrenProcessor(&fakeMCPClient{resources: map[string][]byte{
+		helmReleaseDBKey: []byte(helmReleaseDBOldInventory),
+		"helm.toolkit.fluxcd.io/v2|HelmRelease|cache|apps": []byte(helmReleaseCacheSharedYAML),
+	}})
+	_, _, parents := proc.expandHelmReleases(context.Background(), []string{
+		"apps_db_helm.toolkit.fluxcd.io_HelmRelease",
+		"apps_cache_helm.toolkit.fluxcd.io_HelmRelease",
+	})
+	if hr, ok := parents[rowKey("ConfigMap", "apps", "db-init-old")]; ok {
+		t.Fatalf("shared child mapped to %q, want unmapped", hr)
+	}
+	if parents[rowKey("StatefulSet", "apps", "db")] != "apps/db" {
+		t.Errorf("unshared child must stay mapped, got %v", parents)
+	}
+}

@@ -318,7 +318,8 @@ func (r *redisStore) hgetall(key string) (map[string]string, error) {
 // Cache.MarkPRIfNew).
 //
 // When the effective ttl is positive and the key already exists WITHOUT an
-// expiry or with a LONGER one, the expiry is lowered to ttl via EXPIRE LT.
+// expiry or with one longer than MaxCooldown (so it can't be a rate-limit
+// cooldown), the expiry is lowered to ttl via EXPIRE LT.
 // Such keys are marks written before the floor was configured or shortened
 // (SETNX never updates an existing key's TTL): a mark without an expiry, or one
 // carrying the 30-day backstop from when the floor was unset, would keep
@@ -357,6 +358,15 @@ func (r *redisStore) markIfNewAtomic(k Key, t time.Time, ttl time.Duration) (boo
 	r.lastFailure.Store(0)
 	if ok || ttl <= 0 {
 		return ok, nil
+	}
+	// Only marks without an expiry or with one longer than any cooldown are
+	// pre-floor marks to lower: an expiry up to MaxCooldown may be a rate-limit
+	// cooldown (ExpirePR), which must run out in full. The read and the EXPIRE
+	// aren't atomic, but LT never extends an expiry, so a race can at worst
+	// shorten a cooldown set in between.
+	cur, perr := r.client.PTTL(ctx, key).Result()
+	if perr != nil || (cur != -1 && cur <= MaxCooldown) {
+		return false, nil
 	}
 	// Best-effort: the admission answer is already "duplicate" either way; a
 	// failure here (an ACL that also denies EXPIRE, or a pre-7.0 Redis that

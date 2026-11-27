@@ -2769,7 +2769,7 @@ func (p *Processor) expandHelmReleaseInventories(ctx context.Context, baseRefs [
 // expandHelmReleases is expandHelmReleaseInventories that also returns, for
 // every added child, the HelmRelease whose inventory listed it: rowKey of the
 // child → "<namespace>/<name>" of the HelmRelease. Children that are in the
-// base inventory too aren't mapped: the Kustomization owns them.
+// base inventory too, or that several HelmReleases list, aren't mapped.
 func (p *Processor) expandHelmReleases(ctx context.Context, baseRefs []string) ([]string, []pendingHelmRelease, map[string]string) {
 	if !p.cfg.ReadinessExpandHelmReleases {
 		return baseRefs, nil, nil
@@ -2858,20 +2858,33 @@ func (p *Processor) expandHelmReleases(ctx context.Context, baseRefs []string) (
 	for _, ref := range baseRefs {
 		base[ref] = struct{}{}
 	}
+	// A child several HelmReleases list stays unmapped: settling it against
+	// one of them could drop a row another release still expects.
 	parents := make(map[string]string)
+	shared := make(map[string]struct{})
 	for i, ref := range baseRefs {
 		if len(children[i]) == 0 {
 			continue
 		}
 		hr, _ := readiness.ParseInventoryID(ref) // parsed fine above, or it would have no children
+		owner := hr.Namespace + "/" + hr.Name
 		for _, sub := range children[i] {
 			if _, inBase := base[sub]; inBase {
 				continue
 			}
-			if child, err := readiness.ParseInventoryID(sub); err == nil {
-				parents[rowKey(child.Kind, child.Namespace, child.Name)] = hr.Namespace + "/" + hr.Name
+			child, err := readiness.ParseInventoryID(sub)
+			if err != nil {
+				continue
 			}
+			k := rowKey(child.Kind, child.Namespace, child.Name)
+			if prev, ok := parents[k]; ok && prev != owner {
+				shared[k] = struct{}{}
+			}
+			parents[k] = owner
 		}
+	}
+	for k := range shared {
+		delete(parents, k)
 	}
 	return out, pending, parents
 }

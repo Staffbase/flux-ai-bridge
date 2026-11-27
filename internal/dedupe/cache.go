@@ -293,16 +293,23 @@ func (c *Cache) ForgetPR(ns, name string, pr int, headSHA string) {
 	c.cooldowns.Remove(key)
 }
 
+// MaxCooldown caps ExpirePR's cooldown. The Redis backend relies on it: an
+// admission mark expiring within MaxCooldown may be a cooldown, so the
+// re-eval floor migration leaves it alone (see markIfNewAtomic). GitHub
+// rate-limit cooldowns are clamped to the same hour.
+const MaxCooldown = time.Hour
+
 // ExpirePR keeps a per-PR-head admission record but makes it lapse after d —
 // a cooldown, between ForgetPR (re-admit on the next event) and keeping the
 // mark (never re-admit at this head). Used when delivery hit a GitHub rate
 // limit: Flux's re-fires stay deduped until the limit has reset, then the
-// next event re-admits the PR. d <= 0 is ForgetPR. No-op on a nil or
-// disabled cache.
+// next event re-admits the PR. d <= 0 is ForgetPR, and d is capped at
+// MaxCooldown. No-op on a nil or disabled cache.
 func (c *Cache) ExpirePR(ns, name string, pr int, headSHA string, d time.Duration) {
 	if c == nil || c.s == nil {
 		return
 	}
+	d = min(d, MaxCooldown)
 	if d <= 0 {
 		c.ForgetPR(ns, name, pr, headSHA)
 		return
