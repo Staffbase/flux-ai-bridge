@@ -206,11 +206,11 @@ config:
       # break.
       failedOnly: true
       # maxRetries (env DEDUPE_PR_REEVAL_MAX) caps how many re-evaluations a
-      # single PR-head gets. Only consulted when ttl is set. Default 0 =
+      # single PR-head gets. Only consulted when ttl is set. Default 4: with the
+      # default ttl a broken PR costs at most ~1h of re-polling per push. 0 =
       # unlimited: a deploy that stays broken forever is re-polled (readiness +
-      # LLM + comment refresh) EVERY window for as long as the PR lives. Set a
-      # positive count (e.g. 8) to stop re-evaluating a head once its budget is
-      # spent — the head then stops TRIGGERING analyses until a new commit
+      # LLM + comment refresh) EVERY window for as long as the PR lives. Once
+      # the budget is spent the head stops TRIGGERING analyses until a new commit
       # lands (a new head always starts with a fresh budget). It still
       # piggybacks on analyses other PRs of the same Kustomization trigger, so
       # its comment tracks the current verdict at zero extra analysis cost;
@@ -222,24 +222,24 @@ config:
       # visible as flux_ai_bridge_prs_skipped_total{reason="reeval_exhausted"}.
       # Only re-evals whose ANALYSIS concludes failed/warning count: healthy
       # skips (failedOnly) and re-evals that conclude healthy are both free —
-      # a recovery is the news re-eval exists for. With ttl 15m and maxRetries 8, a broken PR costs at
-      # most ~2h of re-polling per push, instead of polling until it's closed.
-      maxRetries: 0
-      # ttl is the re-evaluation floor (env DEDUPE_PR_REEVAL_TTL). By default
-      # ("" / unset → 0) the bridge analyses each PR exactly ONCE per its head
-      # commit: a Flux reconcile that re-fires for an unchanged PR is skipped
-      # ("PR already analysed at this head"), so the comment is NOT refreshed.
-      # That means RUNTIME DRIFT — a pod that starts crashlooping minutes after
-      # an initially-green deploy — is never reflected, because the PR head
-      # hasn't changed.
+      # a recovery is the news re-eval exists for.
+      maxRetries: 4
+      # ttl is the re-evaluation floor (env DEDUPE_PR_REEVAL_TTL). Default "15m":
+      # the PR-head's admission expires after 15 minutes, so a later reconcile
+      # re-admits the PR, re-polls the cluster, and updates the comment if state
+      # changed (idempotent — unchanged state writes nothing). This is what turns
+      # a warning or failure that resolves on its own — a chart upgrade or a
+      # rollout that outlasts the readiness poll — into the final verdict
+      # (with failedOnly, green heads are not re-checked). The cost: each such
+      # PR re-runs the readiness poll + LLM + GitHub write once per window, up
+      # to maxRetries times.
       #
-      # Set a positive duration (e.g. "30m" or "1h") to let that admission
-      # expire, so a later reconcile re-admits the PR, re-polls the cluster, and
-      # updates the comment if state changed (idempotent — unchanged state writes
-      # nothing). The trade-off is cost: each PR re-runs the readiness poll + LLM
-      # + GitHub write once per window. Pick a value balancing freshness vs that.
-      # The bridge refuses a value shorter than one analysis
-      # (config.readiness.pollTimeout + 2m, so 5m with the defaults).
+      # Set "0" to analyse each PR exactly ONCE per its head commit: a Flux
+      # reconcile that re-fires for an unchanged PR is then skipped ("PR already
+      # analysed at this head"), so the comment is NOT refreshed and a warning
+      # stays a warning until the next push. The bridge refuses a positive value
+      # shorter than one analysis (config.readiness.pollTimeout + 2m, so 5m with
+      # the defaults): raising pollTimeout above 13m needs a longer ttl too.
       #
       # Enabling this on a RUNNING install also applies to PRs analysed before
       # the change: their existing admission records get the expiry attached on
@@ -250,7 +250,7 @@ config:
       # version qualifies (Valkey forked from Redis 7.2), including the bundled
       # sub-chart. On older Redis the bridge logs a warning and only PR-heads
       # analysed AFTER enabling the ttl re-evaluate.
-      ttl: ""
+      ttl: "15m"
     # Expiry of the IN-MEMORY dedupe entries (one per Kustomization, PR and
     # PR head commit); ignored when persistence is enabled (see
     # persistence.maxTTL for Redis). Three modes:
