@@ -107,7 +107,7 @@ func TestBuildKstatusBody_HealthyPicksGreenMarker(t *testing.T) {
 		{Kind: "Deployment", Namespace: "apps", Name: "api", Status: "Current", Message: "ready"},
 		{Kind: "Deployment", Namespace: "apps", Name: "worker", Status: "Current", Message: "ready"},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil, "")
 	if !strings.HasPrefix(got, statusEmojiHealthy+"\n") {
 		t.Errorf("expected ✅ marker on first line, got: %q", got)
 	}
@@ -131,7 +131,7 @@ func TestBuildKstatusBody_AllCurrentSummaryIsReasonAware(t *testing.T) {
 		{Kind: "Deployment", Namespace: "apps", Name: "api", Status: "Current", Message: "ready"},
 	}
 	unverified := []pendingHelmRelease{{Name: "apps/app", Reason: helmReleaseReasonUnverified}}
-	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", unverified)
+	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", unverified, "")
 	if strings.Contains(got, "isn't fully visible yet") {
 		t.Errorf("unverified release must not get the install-pending headline: %q", got)
 	}
@@ -140,7 +140,7 @@ func TestBuildKstatusBody_AllCurrentSummaryIsReasonAware(t *testing.T) {
 	}
 
 	installPending := []pendingHelmRelease{{Name: "apps/app", Reason: helmReleaseReasonInstallPending}}
-	got = buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", installPending)
+	got = buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", installPending, "")
 	if !strings.Contains(got, "isn't fully visible yet") {
 		t.Errorf("install-pending release should keep its headline, got: %q", got)
 	}
@@ -157,7 +157,7 @@ func TestBuildKstatusBody_FailedOnly_FiltersTable(t *testing.T) {
 		{Kind: "Deployment", Namespace: "test", Name: "api", Status: "Current", Message: "ready"},
 		{Kind: "HelmRelease", Namespace: "test", Name: "podinfo", Status: "Failed", Message: "InstallFailed"},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, false, true /* failedOnly */, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, false, true, "", "", "", nil, "")
 	if !strings.HasPrefix(got, statusEmojiFailure+"\n") {
 		t.Errorf("overall marker must still reflect the full inventory (❌): %q", got)
 	}
@@ -186,8 +186,8 @@ func TestBuildKstatusBody_StaleRowShownWithNote(t *testing.T) {
 	}
 	stale := append([]readiness.ResourceStatus(nil), fresh...)
 	stale[1].Stale = true
-	freshBody := buildKstatusBody(fresh, nil, false, false, false, true /* failedOnly */, "", "", "", nil)
-	staleBody := buildKstatusBody(stale, nil, false, false, false, true /* failedOnly */, "", "", "", nil)
+	freshBody := buildKstatusBody(fresh, nil, false, false, false, true /* failedOnly */, "", "", "", nil, "")
+	staleBody := buildKstatusBody(stale, nil, false, false, false, true /* failedOnly */, "", "", "", nil, "")
 	if strings.Contains(freshBody, "| test | Service | api |") {
 		t.Errorf("fresh Current row must stay filtered out in failedOnly mode: %q", freshBody)
 	}
@@ -196,6 +196,22 @@ func TestBuildKstatusBody_StaleRowShownWithNote(t *testing.T) {
 	}
 	if freshBody == staleBody {
 		t.Error("a fresh-to-stale change must change the body")
+	}
+}
+
+// A poll cut short whose only unconfirmed rows are stale Current ones must
+// not read "the last snapshot reads Current": the last poll didn't read them.
+func TestBuildKstatusBody_StaleRowsCountAsUnconfirmed(t *testing.T) {
+	statuses := []readiness.ResourceStatus{
+		{Kind: "Deployment", Namespace: "test", Name: "api", Status: "Current", Message: "ready"},
+		{Kind: "Service", Namespace: "test", Name: "web", Status: "Current", Message: "ok", Stale: true},
+	}
+	got := buildKstatusBody(statuses, nil, false, false, true /* includeSummary */, true /* failedOnly */, "", "", "", nil, "")
+	if strings.Contains(got, "although the last snapshot reads") {
+		t.Errorf("headline must not call a stale row Current: %q", got)
+	}
+	if !strings.Contains(got, "1 of 2 resource(s) not yet `Current`") {
+		t.Errorf("headline must count the stale row as not confirmed: %q", got)
 	}
 }
 
@@ -209,7 +225,7 @@ func TestBuildKstatusBody_FailedOnly_AllCurrentCollapses(t *testing.T) {
 		{Kind: "Deployment", Namespace: "test", Name: "api", Status: "Current", Message: "ready"},
 		{Kind: "Service", Namespace: "test", Name: "api", Status: "Current", Message: "ready"},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, false, true /* failedOnly */, "apps", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, false, true, "apps", "", "", nil, "")
 	if !strings.HasPrefix(got, statusEmojiHealthy+"\n") {
 		t.Errorf("expected ✅ marker, got: %q", got)
 	}
@@ -234,7 +250,7 @@ func TestBuildKstatusBody_HealthyHeadlineLedByKustomization(t *testing.T) {
 		{Kind: "GrafanaDashboard", Namespace: "grafana", Name: "slo-detail", Status: "Current"},
 		{Kind: "GrafanaDashboard", Namespace: "grafana", Name: "slo-overview", Status: "Current"},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, true /* includeSummary */, false, "grafana", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, true, false, "grafana", "", "", nil, "")
 	if !strings.Contains(got, "Kustomization `grafana`: All 2 resource(s) reached") {
 		t.Errorf("expected headline led by the Kustomization with the full count, got: %q", got)
 	}
@@ -253,7 +269,7 @@ func TestBuildKstatusBody_SummaryRowKeyedByKustomization(t *testing.T) {
 		{Kind: "ClusterPolicy", Namespace: "", Name: "require-emptydir-sizelimit", Status: "Current"},
 		{Kind: "ClusterPolicy", Namespace: "", Name: "require-root-filesystem-readonly", Status: "Current"},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, false, true /* failedOnly */, "kyverno", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, false, true, "kyverno", "", "", nil, "")
 	if !strings.Contains(got, "| kyverno | 2 | "+statusEmojiHealthy+" Current |") {
 		t.Errorf("summary row should be keyed by the Kustomization name, got: %q", got)
 	}
@@ -262,7 +278,7 @@ func TestBuildKstatusBody_SummaryRowKeyedByKustomization(t *testing.T) {
 	}
 
 	// Empty scope renders "—" (nothing to show).
-	gotNoScope := buildKstatusBody(statuses, nil, false, true, false, true, "", "", "", nil)
+	gotNoScope := buildKstatusBody(statuses, nil, false, true, false, true, "", "", "", nil, "")
 	if !strings.Contains(gotNoScope, "| — | 2 | "+statusEmojiHealthy+" Current |") {
 		t.Errorf("with no scope the cell should be —, got: %q", gotNoScope)
 	}
@@ -281,7 +297,7 @@ func TestBuildKstatusBody_FailedOnly_WorkloadCompacts(t *testing.T) {
 		{Kind: "Pod", Namespace: "test", Name: "podinfo-a", Status: "Current", Controller: "Deployment/podinfo"},
 		{Kind: "Pod", Namespace: "test", Name: "podinfo-b", Status: "Current", Controller: "Deployment/podinfo"},
 	}
-	got := buildKstatusBody(inv, pods, true, true, false, true /* failedOnly */, "monitoring", "", "", nil)
+	got := buildKstatusBody(inv, pods, true, true, false, true, "monitoring", "", "", nil, "")
 	if !strings.Contains(got, "## Workload Status") {
 		t.Fatalf("missing Workload Status section: %q", got)
 	}
@@ -298,7 +314,7 @@ func TestBuildKstatusBody_FailedOnly_WorkloadCompacts(t *testing.T) {
 		{Kind: "Pod", Namespace: "test", Name: "podinfo-a", Status: "Current", Controller: "Deployment/podinfo"},
 		{Kind: "Pod", Namespace: "test", Name: "podinfo-b", Status: "Failed", Message: "CrashLoopBackOff", Controller: "Deployment/podinfo"},
 	}
-	got2 := buildKstatusBody(inv, pods2, true, true, false, true, "monitoring", "", "", nil)
+	got2 := buildKstatusBody(inv, pods2, true, true, false, true, "monitoring", "", "", nil, "")
 	if !strings.Contains(got2, "| Namespace | Controller | Pod | Status | Message |") {
 		t.Errorf("expected the detailed Workload table when a pod fails: %q", got2)
 	}
@@ -318,12 +334,32 @@ func TestBuildKstatusBody_FailureWinsOverInProgress(t *testing.T) {
 		{Kind: "Deployment", Namespace: "apps", Name: "api", Status: "Failed", Message: "CrashLoopBackOff"},
 		{Kind: "Deployment", Namespace: "apps", Name: "worker", Status: "InProgress", Message: "Available=False"},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil, "")
 	if !strings.HasPrefix(got, statusEmojiFailure+"\n") {
 		t.Errorf("expected ❌ marker, got: %q", got)
 	}
 	if !strings.Contains(got, "1 of 2 resource(s) failed to reconcile.") {
 		t.Errorf("expected failure summary, got: %q", got)
+	}
+}
+
+// TestBuildKstatusBody_OpenQuietWindowNamesReason: when only the pods' quiet
+// window kept the run from settling, the headline says so instead of the
+// generic "not confirmed" line, and the marker stays ⚠️.
+func TestBuildKstatusBody_OpenQuietWindowNamesReason(t *testing.T) {
+	statuses := []readiness.ResourceStatus{
+		{Kind: "StatefulSet", Namespace: "apps", Name: "db", Status: "Current", Message: "ready"},
+	}
+	why := "pod `db-0` was created, and the pods hadn't stayed unchanged for 1m0s (the pod quiet period) since then."
+	got := buildKstatusBody(statuses, nil, false, false, true, false, "db", "", "", nil, why)
+	if !strings.HasPrefix(got, statusEmojiWarning+"\n") {
+		t.Errorf("expected ⚠️ marker, got: %q", got)
+	}
+	if !strings.Contains(got, "Kustomization `db`: Readiness not confirmed: "+why) {
+		t.Errorf("expected the quiet-window reason in the headline, got: %q", got)
+	}
+	if strings.Contains(got, "before the poll ended") {
+		t.Errorf("generic line must give way to the reason, got: %q", got)
 	}
 }
 
@@ -335,7 +371,7 @@ func TestBuildKstatusBody_TimeoutDowngradesToWarning(t *testing.T) {
 	statuses := []readiness.ResourceStatus{
 		{Kind: "Deployment", Namespace: "apps", Name: "api", Status: "Current", Message: "ready"},
 	}
-	got := buildKstatusBody(statuses, nil, false, false, true, false, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, false, true, false, "", "", "", nil, "")
 	if !strings.HasPrefix(got, statusEmojiWarning+"\n") {
 		t.Errorf("expected ⚠️ marker on poll timeout, got: %q", got)
 	}
@@ -355,7 +391,7 @@ func TestBuildKstatusBody_SummaryOptOut(t *testing.T) {
 	statuses := []readiness.ResourceStatus{
 		{Kind: "Deployment", Namespace: "apps", Name: "api", Status: "Current", Message: "ready"},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, false, false, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, false, false, "", "", "", nil, "")
 	if !strings.HasPrefix(got, statusEmojiHealthy+"\n\n## Resource Status") {
 		t.Errorf("expected body to jump straight from marker to Resource Status, got: %q", got)
 	}
@@ -377,7 +413,7 @@ func TestBuildKstatusBody_FormatCommentLiftsHeader(t *testing.T) {
 	statuses := []readiness.ResourceStatus{
 		{Kind: "Deployment", Namespace: "apps", Name: "api", Status: "Current", Message: "ready"},
 	}
-	wrapped := formatComment(buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil), true, "")
+	wrapped := formatComment(buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil, ""), true, "")
 	if !strings.HasPrefix(wrapped, "# ✅ Flux Status\n\n") {
 		t.Errorf("expected ✅ header, got: %q", wrapped)
 	}
@@ -399,7 +435,7 @@ func TestFormatComment_FooterOptOut(t *testing.T) {
 	statuses := []readiness.ResourceStatus{
 		{Kind: "Deployment", Namespace: "apps", Name: "api", Status: "Current", Message: "ready"},
 	}
-	wrapped := formatComment(buildKstatusBody(statuses, nil, false, true, false, false, "", "", "", nil), false, "")
+	wrapped := formatComment(buildKstatusBody(statuses, nil, false, true, false, false, "", "", "", nil, ""), false, "")
 	if !strings.HasPrefix(wrapped, "# ✅ Flux Status\n\n") {
 		t.Errorf("expected ✅ header, got: %q", wrapped)
 	}
@@ -538,7 +574,7 @@ func TestBuildKstatusBody_FoldsConditionIntoTable(t *testing.T) {
 			},
 		},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil, "")
 	// No separate section anymore — the cause lives in the table.
 	if strings.Contains(got, "## Inventory Conditions") {
 		t.Errorf("conditions should be folded into the table, not a separate section: %q", got)
@@ -575,7 +611,7 @@ func TestBuildKstatusBody_SkipsHealthyAbnormalTrueCondition(t *testing.T) {
 			},
 		},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil, "")
 	for _, healthy := range []string{"NoDriftDetected", "NotStalled", "Idle"} {
 		if strings.Contains(got, healthy) {
 			t.Errorf("healthy abnormal-true condition %q must not be shown as the row's cause: %q", healthy, got)
@@ -608,7 +644,7 @@ func TestBuildKstatusBody_RolledBackHelmReleaseShowsUpgradeFailure(t *testing.T)
 			},
 		},
 	}
-	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil, "")
 	// markdownTableCell breaks "@" with a zero-width space so it can't mention.
 	want := "| app | HelmRelease | app-service | ❌ Failed | RetriesExceeded: Failed to upgrade after 4 attempt(s); " +
 		"RollbackSucceeded: Helm rollback to previous release app/app-service.v189 with chart app-chart@\u200b0.14.1 succeeded |"
@@ -662,7 +698,7 @@ func TestBuildKstatusBody_RemediatedHelmReleaseCauses(t *testing.T) {
 				Kind: "HelmRelease", Namespace: "app", Name: "app-service",
 				Status: "Failed", Message: "kstatus message", Conditions: tt.conds,
 			}}
-			got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil)
+			got := buildKstatusBody(statuses, nil, false, true, true, false, "", "", "", nil, "")
 			want := "| app | HelmRelease | app-service | ❌ Failed | " + tt.want + " |"
 			if !strings.Contains(got, want) {
 				t.Errorf("expected row %q in body:\n%s", want, got)
@@ -709,7 +745,7 @@ func TestBuildKstatusBody_RendersWorkloadStatus(t *testing.T) {
 		{Kind: "Pod", Namespace: "podinfo", Name: "podinfo-def", Status: "Current", Message: "all containers ready", Controller: "Deployment/podinfo"},
 		{Kind: "Pod", Namespace: "podinfo", Name: "naked-pod", Status: "Current", Message: "all containers ready"},
 	}
-	got := buildKstatusBody(inventory, pods, true, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(inventory, pods, true, true, true, false, "", "", "", nil, "")
 	if !strings.Contains(got, "## Workload Status") {
 		t.Errorf("missing Workload Status section: %q", got)
 	}
@@ -730,7 +766,7 @@ func TestBuildKstatusBody_ScannedButNoPods(t *testing.T) {
 	inventory := []readiness.ResourceStatus{
 		{Kind: "HelmRelease", Namespace: "test", Name: "podinfo", Status: "Current", Message: "released"},
 	}
-	got := buildKstatusBody(inventory, nil, true, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(inventory, nil, true, true, true, false, "", "", "", nil, "")
 	if !strings.Contains(got, "## Workload Status") {
 		t.Errorf("expected Workload Status section when scan ran with zero pods: %q", got)
 	}
@@ -746,7 +782,7 @@ func TestBuildKstatusBody_UnscannedOmitsWorkloadStatus(t *testing.T) {
 	inventory := []readiness.ResourceStatus{
 		{Kind: "HelmRelease", Namespace: "test", Name: "podinfo", Status: "Current", Message: "released"},
 	}
-	got := buildKstatusBody(inventory, nil, false, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(inventory, nil, false, true, true, false, "", "", "", nil, "")
 	if strings.Contains(got, "## Workload Status") {
 		t.Errorf("Workload Status section should be omitted when scan did not run: %q", got)
 	}
@@ -763,7 +799,7 @@ func TestBuildKstatusBody_FailingPodFlipsToRed(t *testing.T) {
 	pods := []readiness.ResourceStatus{
 		{Kind: "Pod", Namespace: "podinfo", Name: "podinfo-abc", Status: "Failed", Message: "podinfo: CrashLoopBackOff"},
 	}
-	got := buildKstatusBody(inventory, pods, true, true, true, false, "", "", "", nil)
+	got := buildKstatusBody(inventory, pods, true, true, true, false, "", "", "", nil, "")
 	if !strings.HasPrefix(got, statusEmojiFailure+"\n") {
 		t.Errorf("expected ❌ marker when a pod is failing: %q", got)
 	}
