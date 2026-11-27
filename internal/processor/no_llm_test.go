@@ -175,6 +175,46 @@ func TestBuildKstatusBody_FailedOnly_FiltersTable(t *testing.T) {
 	}
 }
 
+// A row kept from the previous poll (Stale) is shown even in failedOnly mode
+// when it reads Current, with a note that the last poll didn't read it. The
+// note also changes the body, which keys re-evaluations: one that differs only
+// in stale rows must not count as unchanged and keep the old analysis.
+func TestBuildKstatusBody_StaleRowShownWithNote(t *testing.T) {
+	fresh := []readiness.ResourceStatus{
+		{Kind: "StatefulSet", Namespace: "test", Name: "db", Status: "InProgress", Message: "Ready: 2/3"},
+		{Kind: "Service", Namespace: "test", Name: "api", Status: "Current", Message: "ok"},
+	}
+	stale := append([]readiness.ResourceStatus(nil), fresh...)
+	stale[1].Stale = true
+	freshBody := buildKstatusBody(fresh, nil, false, false, false, true /* failedOnly */, "", "", "", nil, "")
+	staleBody := buildKstatusBody(stale, nil, false, false, false, true /* failedOnly */, "", "", "", nil, "")
+	if strings.Contains(freshBody, "| test | Service | api |") {
+		t.Errorf("fresh Current row must stay filtered out in failedOnly mode: %q", freshBody)
+	}
+	if !strings.Contains(staleBody, "| test | Service | api | ✅ Current | "+staleRowNote+"ok |") {
+		t.Errorf("stale row must be shown with the note: %q", staleBody)
+	}
+	if freshBody == staleBody {
+		t.Error("a fresh-to-stale change must change the body")
+	}
+}
+
+// A poll cut short whose only unconfirmed rows are stale Current ones must
+// not read "the last snapshot reads Current": the last poll didn't read them.
+func TestBuildKstatusBody_StaleRowsCountAsUnconfirmed(t *testing.T) {
+	statuses := []readiness.ResourceStatus{
+		{Kind: "Deployment", Namespace: "test", Name: "api", Status: "Current", Message: "ready"},
+		{Kind: "Service", Namespace: "test", Name: "web", Status: "Current", Message: "ok", Stale: true},
+	}
+	got := buildKstatusBody(statuses, nil, false, false, true /* includeSummary */, true /* failedOnly */, "", "", "", nil, "")
+	if strings.Contains(got, "although the last snapshot reads") {
+		t.Errorf("headline must not call a stale row Current: %q", got)
+	}
+	if !strings.Contains(got, "1 of 2 resource(s) not yet `Current`") {
+		t.Errorf("headline must count the stale row as not confirmed: %q", got)
+	}
+}
+
 // TestBuildKstatusBody_FailedOnly_AllCurrentCollapses asserts that when every
 // resource is Current the per-resource rows collapse to a single compact
 // summary row (table format kept) whose first column is the Kustomization

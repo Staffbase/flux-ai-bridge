@@ -223,6 +223,31 @@ func TestBuildPrompt_ReadinessTimeout(t *testing.T) {
 	}
 }
 
+// A stale Current row (kept from the previous poll, which the last one didn't
+// reach) is listed in the prompt with the note and not counted as Current,
+// and the timeout line explains the note, so the model doesn't read it as a
+// fresh healthy row or blame the warning only on resources still changing.
+func TestBuildPrompt_StaleRowListedWithNote(t *testing.T) {
+	event := eventv1.Event{InvolvedObject: corev1.ObjectReference{Kind: "Kustomization", Name: "apps", Namespace: "default"}}
+	statuses := []readiness.ResourceStatus{
+		{Kind: "Deployment", Namespace: "default", Name: "api", Status: "Current", Message: "ready"},
+		{Kind: "Service", Namespace: "default", Name: "web", Status: "Current", Message: "ok", Stale: true},
+	}
+	prompt := buildPrompt(event, "abc1234", "kustomization-yaml", statuses, nil, false, "")
+	for _, want := range []string{
+		"Rows marked `" + staleRowNote + "` were not read in the last poll",
+		"1 of 2 resources reached Current. Not Current, or not read in the last poll:",
+		"- Service/default/web: Current — " + staleRowNote + "ok",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt must contain %q, got: %q", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "Deployment/default/api") {
+		t.Errorf("a fresh Current row must stay summarised away, got: %q", prompt)
+	}
+}
+
 func TestBuildPrompt(t *testing.T) {
 	event := eventv1.Event{
 		InvolvedObject: corev1.ObjectReference{
@@ -3066,6 +3091,10 @@ func TestRolloutInProgress(t *testing.T) {
 		{name: "HelmRelease children unseen", outcome: warning, statuses: rows(current), pending: true},
 		{name: "Terminating row", outcome: warning, statuses: rows(readiness.ResourceStatus{Status: "Terminating"})},
 		{name: "Unknown pod", outcome: warning, pods: rows(readiness.ResourceStatus{Status: "Unknown"})},
+		// A row kept from the previous poll wasn't read in the last one, so
+		// the warning may come from it, not from an observed rollout.
+		{name: "stale Current row from a cut poll", outcome: warning, pods: rows(startingPod),
+			statuses: rows(inProgress, readiness.ResourceStatus{Kind: "Service", Namespace: "apps", Name: "api", Status: "Current", Stale: true})},
 		{name: "Ready=False SourceNotReady", outcome: warning, statuses: rows(withCond("Ready", "False", "SourceNotReady"))},
 		{name: "Stalled=True", outcome: warning, statuses: rows(withCond("Stalled", "True", "RetriesExceeded"))},
 		{name: "retry after failed upgrade", outcome: warning, statuses: rows(withCond("Reconciling", "True", "ProgressingWithRetry"))},

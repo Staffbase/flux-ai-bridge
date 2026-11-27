@@ -1258,3 +1258,211 @@ func TestCheckOne_FailedRefreshLeavesCachedVersionUnconfirmedDuringCooldown(t *t
 		}
 	}
 }
+
+// scriptedFetcher answers the nth read (counting from 1) with an InProgress
+// Deployment, or a ready one for the reads listed in current. The reads listed
+// in block wait for ctx to end and fail with its error, like an MCP call cut
+// short by the poll deadline. Each read takes delay first. The poll reads one
+// row at a time, so a plain counter is enough.
+type scriptedFetcher struct {
+	block   map[int]bool
+	current map[int]bool
+	delay   time.Duration
+	calls   int
+}
+
+func (s *scriptedFetcher) GetKubernetesResource(ctx context.Context, _, _, _, _ string) ([]byte, error) {
+	s.calls++
+	if s.block[s.calls] {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	body := inProgressDeploymentYAML
+	if s.current[s.calls] {
+		body = readyDeploymentYAML
+	}
+	select {
+	case <-time.After(s.delay):
+		return []byte(body), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// A row the deadline cuts short keeps what the previous poll read for it, so
+// the result shows the last state seen instead of a timeout error. A row cut
+// short with no previous read stays Unknown.
+func TestWaitUntilSettled_CutRowKeepsPreviousPoll(t *testing.T) {
+	refs := []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+	// Poll 1 reads both rows (#1, #2); poll 2 reads api (#3) and is cut on
+	// worker (#4).
+	fetcher := &scriptedFetcher{block: map[int]bool{4: true}}
+	results, settled, err := NewChecker(fetcher).WaitUntilSettled(context.Background(), refs,
+		10*time.Millisecond, 200*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if fetcher.calls != 4 {
+		t.Fatalf("reads = %d, want 4 (two polls, the second cut short)", fetcher.calls)
+	}
+	for i, r := range results {
+		if r.Status != "InProgress" {
+			t.Errorf("row %d (%s) = %s %q, want InProgress kept from the previous poll", i, r.Name, r.Status, r.Message)
+		}
+	}
+	if results[0].Stale || !results[1].Stale {
+		t.Errorf("Stale = %v, %v; want only the kept worker row stale", results[0].Stale, results[1].Stale)
+	}
+
+	// Cut short in the first poll: nothing to keep.
+	fetcher = &scriptedFetcher{block: map[int]bool{2: true}}
+	results, _, _ = NewChecker(fetcher).WaitUntilSettled(context.Background(), refs,
+		10*time.Millisecond, 50*time.Millisecond)
+	if results[1].Status != "Unknown" {
+		t.Errorf("row cut in the first poll = %s, want Unknown", results[1].Status)
+	}
+}
+
+// The poll doesn't start a poll that can't finish by the deadline, judged by
+// how long the previous one took: it reports the previous poll instead of
+// one the deadline would cut short.
+func TestWaitUntilSettled_NoPollThatCannotFinish(t *testing.T) {
+	fetcher := &scriptedFetcher{delay: 60 * time.Millisecond}
+	start := time.Now()
+	results, settled, err := NewChecker(fetcher).WaitUntilSettled(context.Background(),
+		[]string{"default_api_apps_Deployment"}, 10*time.Millisecond, 100*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if fetcher.calls != 1 {
+		t.Errorf("reads = %d, want 1: a second 60ms poll can't finish in the 40ms left", fetcher.calls)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("poll returned after %s, want before the 100ms deadline", elapsed)
+	}
+	if len(results) != 1 || results[0].Status != "InProgress" {
+		t.Errorf("results = %+v, want the first poll's InProgress row", results)
+	}
+}
+
+// A kept row is never settled, even when it and every fresh row read Current:
+// the processor recomputes settled with AllSettled after dropping pruned rows,
+// and a poll the deadline cut short must not turn settled there.
+func TestWaitUntilSettled_KeptCurrentRowIsNotSettled(t *testing.T) {
+	refs := []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+	// Poll 1: api InProgress (#1), worker Current (#2). Poll 2: api Current
+	// (#3), worker cut short (#4).
+	fetcher := &scriptedFetcher{block: map[int]bool{4: true}, current: map[int]bool{2: true, 3: true}}
+	results, settled, err := NewChecker(fetcher).WaitUntilSettled(context.Background(), refs,
+		10*time.Millisecond, 200*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if results[0].Status != "Current" || results[1].Status != "Current" || !results[1].Stale {
+		t.Fatalf("results = %+v, want fresh Current api and kept Current worker", results)
+	}
+	if AllSettled(results) {
+		t.Error("AllSettled = true for a poll with a kept row, want false")
+	}
+}
+
+// When the poll ends right after the final refs check found a new ref (a
+// HelmRelease child that just appeared), the result has a row for it, Unknown
+// because it was never read, so no caller can count the result as settled.
+func TestWaitUntilSettledFunc_NewRefWithoutPollReadsUnknown(t *testing.T) {
+	fake := &fakeFetcher{resources: map[string]string{
+		"apps/v1|Deployment|api|default": readyDeploymentYAML,
+	}}
+	slow := &slowRefsFetcher{inner: fake, delay: 60 * time.Millisecond}
+	calls := 0
+	refsFunc := func(context.Context) []string {
+		calls++
+		if calls == 1 {
+			return []string{"default_api_apps_Deployment"}
+		}
+		return []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+	}
+	// The poll reads api Current in 60ms; the refs check then finds worker,
+	// and a second 60ms poll can't fit in the 40ms left.
+	results, settled, err := NewChecker(slow).WaitUntilSettledFunc(context.Background(), refsFunc,
+		10*time.Millisecond, 100*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if len(results) != 2 || results[0].Status != "Current" || results[1].Name != "worker" || results[1].Status != "Unknown" {
+		t.Fatalf("results = %+v, want api Current and an Unknown row for the unread worker", results)
+	}
+	if AllSettled(results) {
+		t.Error("AllSettled = true with an unread new ref, want false")
+	}
+}
+
+// slowRefsFetcher delays every read of inner by delay.
+type slowRefsFetcher struct {
+	inner ResourceFetcher
+	delay time.Duration
+}
+
+func (s *slowRefsFetcher) GetKubernetesResource(ctx context.Context, apiVersion, kind, name, namespace string) ([]byte, error) {
+	select {
+	case <-time.After(s.delay):
+		return s.inner.GetKubernetesResource(ctx, apiVersion, kind, name, namespace)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// failedDeploymentYAML is a Deployment past its progress deadline, which
+// kstatus reads as Failed.
+const failedDeploymentYAML = `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: default
+  generation: 1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+status:
+  observedGeneration: 1
+  replicas: 1
+  updatedReplicas: 1
+  readyReplicas: 0
+  availableReplicas: 0
+  conditions:
+    - type: Progressing
+      status: "False"
+      reason: ProgressDeadlineExceeded
+`
+
+// When the final refs check returns fewer refs (an expansion read failed),
+// the rows the poll read stay: a shorter list doesn't prove the child is gone,
+// and dropping its Failed row would hide an observed failure.
+func TestWaitUntilSettledFunc_ShrinkingRefsKeepReadRows(t *testing.T) {
+	fake := &fakeFetcher{resources: map[string]string{
+		"apps/v1|Deployment|api|default":    readyDeploymentYAML,
+		"apps/v1|Deployment|worker|default": failedDeploymentYAML,
+	}}
+	slow := &slowRefsFetcher{inner: fake, delay: 30 * time.Millisecond}
+	calls := 0
+	refsFunc := func(context.Context) []string {
+		calls++
+		if calls == 1 {
+			return []string{"default_api_apps_Deployment", "default_worker_apps_Deployment"}
+		}
+		return []string{"default_api_apps_Deployment"}
+	}
+	// The poll reads both rows in 60ms; the refs check then lists only api,
+	// and a second 60ms poll can't fit in the 40ms left.
+	results, settled, err := NewChecker(slow).WaitUntilSettledFunc(context.Background(), refsFunc,
+		10*time.Millisecond, 100*time.Millisecond)
+	if err != nil || settled {
+		t.Fatalf("settled=%v err=%v, want settled=false and no error", settled, err)
+	}
+	if len(results) != 2 || results[1].Name != "worker" || results[1].Status != "Failed" {
+		t.Fatalf("results = %+v, want the Failed worker row kept", results)
+	}
+}

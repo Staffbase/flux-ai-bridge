@@ -2992,9 +2992,16 @@ func buildPrompt(event eventv1.Event, revision, kustomizationYAML string, status
 		if unsettledWhy != "" {
 			builder.WriteString("What was still changing: " + unsettledWhy + "\n")
 		}
+		if anyStale(statuses) {
+			builder.WriteString("Rows marked `" + staleRowNote + "` were not read in the last poll: it ran out of time before it reached them. They show the poll before, so their current state is unknown: say they weren't read, and don't call them healthy or broken from those rows alone.\n")
+		}
 	}
 	writeReadinessSummary(&builder, "resources", statuses, func(r readiness.ResourceStatus) string {
-		line := fmt.Sprintf("- %s/%s/%s: %s — %s", r.Kind, r.Namespace, r.Name, r.Status, r.Message)
+		msg := r.Message
+		if r.Stale {
+			msg = staleRowNote + msg
+		}
+		line := fmt.Sprintf("- %s/%s/%s: %s — %s", r.Kind, r.Namespace, r.Name, r.Status, msg)
 		// Hard replica counts for workloads (Deployment/StatefulSet/…): the
 		// ground truth the model must use instead of guessing availability from
 		// the Deployment `Available` condition. "0/1 ready" is unambiguous.
@@ -3026,7 +3033,9 @@ func buildPrompt(event eventv1.Event, revision, kustomizationYAML string, status
 // writeReadinessSummary writes a token-frugal readiness section: a one-line
 // "X of N <noun> reached Current" count, then a line (via the formatter) for
 // each NON-Current row only. All-Current collapses to just the count line.
-// Empty input writes nothing.
+// A stale row (kept from the previous poll) is never counted as Current and
+// is always listed: it wasn't read in the last poll. Empty input writes
+// nothing.
 func writeReadinessSummary(b *strings.Builder, noun string, statuses []readiness.ResourceStatus, line func(readiness.ResourceStatus) string) {
 	total := len(statuses)
 	if total == 0 {
@@ -3034,7 +3043,7 @@ func writeReadinessSummary(b *strings.Builder, noun string, statuses []readiness
 	}
 	current := 0
 	for _, s := range statuses {
-		if s.Status == "Current" {
+		if s.Status == "Current" && !s.Stale {
 			current++
 		}
 	}
@@ -3042,12 +3051,26 @@ func writeReadinessSummary(b *strings.Builder, noun string, statuses []readiness
 		fmt.Fprintf(b, "All %d %s reached Current.\n", total, noun)
 		return
 	}
-	fmt.Fprintf(b, "%d of %d %s reached Current. Not Current:\n", current, total, noun)
+	label := "Not Current:"
+	if anyStale(statuses) {
+		label = "Not Current, or not read in the last poll:"
+	}
+	fmt.Fprintf(b, "%d of %d %s reached Current. %s\n", current, total, noun, label)
 	for _, s := range statuses {
-		if s.Status != "Current" {
+		if s.Status != "Current" || s.Stale {
 			b.WriteString(line(s))
 		}
 	}
+}
+
+// anyStale reports whether any row was kept from the previous poll.
+func anyStale(statuses []readiness.ResourceStatus) bool {
+	for _, s := range statuses {
+		if s.Stale {
+			return true
+		}
+	}
+	return false
 }
 
 // kstatusReadmeURL is the upstream reference linked from the optional
@@ -3277,14 +3300,23 @@ func buildKstatusBody(statuses, podStatuses []readiness.ResourceStatus, podsScan
 // section (markdownTableCell escapes the pipe/newline). Current rows and rows
 // with no usable condition keep the kstatus message.
 func inventoryRowMessage(r readiness.ResourceStatus) string {
-	if r.Status == "Current" {
-		return r.Message
+	msg := r.Message
+	if r.Status != "Current" {
+		if cm := notReadyConditionMessage(r.Conditions); cm != "" {
+			msg = cm
+		}
 	}
-	if cm := notReadyConditionMessage(r.Conditions); cm != "" {
-		return cm
+	if r.Stale {
+		return staleRowNote + msg
 	}
-	return r.Message
+	return msg
 }
+
+// staleRowNote leads the message of a row kept from the previous poll (see
+// readiness.ResourceStatus.Stale), so the reader knows the status wasn't read
+// in the last one. It also changes the comment body, so a re-evaluation that
+// differs only in stale rows isn't mistaken for an unchanged one.
+const staleRowNote = "not read in the last poll (timed out); previous poll: "
 
 // abnormalTrueConditions are condition types whose True status signals a
 // problem (kstatus's "abnormal-true" polarity), so False is their healthy
@@ -4113,6 +4145,11 @@ func rolloutInProgress(outcome bridgegithub.Outcome, statuses, podStatuses []rea
 	}
 	for _, rows := range [][]readiness.ResourceStatus{statuses, podStatuses} {
 		for _, r := range rows {
+			// A Stale row is the previous poll's read: the last poll ran out
+			// of time before it reached the resource, so it proves nothing.
+			if r.Stale {
+				return false
+			}
 			if r.Status == "Current" {
 				continue
 			}
@@ -4180,7 +4217,7 @@ func renderStatusTables(statuses, podStatuses []readiness.ResourceStatus, podsSc
 			// per managed namespace).
 			shown = shown[:0:0]
 			for _, r := range statuses {
-				if r.Status != "Current" {
+				if r.Status != "Current" || r.Stale {
 					shown = append(shown, r)
 				}
 			}
@@ -4275,10 +4312,12 @@ func writeResourceRows(b *strings.Builder, rows []readiness.ResourceStatus) {
 	}
 }
 
-// anyNotCurrent reports whether any row is in a non-`Current` kstatus.
+// anyNotCurrent reports whether any row is in a non-`Current` kstatus or is
+// stale: a stale `Current` row wasn't read in the last poll, so it isn't
+// folded into the all-Current summary row.
 func anyNotCurrent(statuses []readiness.ResourceStatus) bool {
 	for _, r := range statuses {
-		if r.Status != "Current" {
+		if r.Status != "Current" || r.Stale {
 			return true
 		}
 	}
@@ -4305,7 +4344,10 @@ func countStatuses(rows []readiness.ResourceStatus) (failed, notCurrent int) {
 			failed++
 			notCurrent++
 		case "Current":
-			// healthy
+			// healthy, unless it is a stale row the last poll didn't read
+			if r.Stale {
+				notCurrent++
+			}
 		default:
 			notCurrent++
 		}

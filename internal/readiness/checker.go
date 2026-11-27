@@ -61,6 +61,11 @@ type ResourceStatus struct {
 	// Pod rows produced by the pod kstatus snapshot; zero when absent or
 	// unparseable.
 	CreatedAt time.Time
+	// Stale reports that the row is the previous poll's read: the last poll
+	// ran out of time before it reached this resource (see keepPrevious). It
+	// shows the last state seen, but says nothing about now, so AllSettled
+	// never counts it as settled.
+	Stale bool
 	// VersionGuessed reports that the final read of this row used a guessed
 	// apiVersion: the (group, kind) wasn't in MCP's discovery cache, even
 	// after the NotFound refresh in checkOne, so the version came from
@@ -156,11 +161,40 @@ func (c *Checker) log() *slog.Logger {
 // recorded as a status row rather than aborting the whole batch — the goal is
 // to give the LLM a complete picture even if some lookups fail.
 func (c *Checker) CheckAll(ctx context.Context, refs []string) ([]ResourceStatus, error) {
-	results := make([]ResourceStatus, 0, len(refs))
-	for _, ref := range refs {
-		results = append(results, c.checkOne(ctx, ref))
-	}
+	results, _ := c.checkAll(ctx, refs)
 	return results, nil
+}
+
+// checkAll is CheckAll that also reports which rows ctx cut short: an Unknown
+// row read after ctx ended says nothing about the resource. The reads run one
+// after another, so once ctx ends every later row is cut too.
+func (c *Checker) checkAll(ctx context.Context, refs []string) (results []ResourceStatus, cut []bool) {
+	results = make([]ResourceStatus, 0, len(refs))
+	cut = make([]bool, 0, len(refs))
+	for _, ref := range refs {
+		rs := c.checkOne(ctx, ref)
+		results = append(results, rs)
+		cut = append(cut, rs.Status == "Unknown" && ctx.Err() != nil)
+	}
+	return results, cut
+}
+
+// keepPrevious replaces each row ctx cut short with the row the previous
+// snapshot read for the same ref, marked Stale, so a cut read reports the last
+// state seen instead of a timeout. A ref without a previous row stays Unknown.
+// It reports whether any row was cut.
+func keepPrevious(refs []string, results []ResourceStatus, cut []bool, prev map[string]ResourceStatus) (anyCut bool) {
+	for i, ref := range refs {
+		if !cut[i] {
+			continue
+		}
+		anyCut = true
+		if p, ok := prev[ref]; ok {
+			p.Stale = true
+			results[i] = p
+		}
+	}
+	return anyCut
 }
 
 // WaitUntilSettled re-runs CheckAll every interval until every row reaches a
@@ -196,13 +230,19 @@ func (c *Checker) WaitUntilSettled(ctx context.Context, refs []string, interval,
 // a HelmRelease that finishes its install between the two reads can read
 // Current while its new children are still missing from the refs.
 //
-// A cancelled ctx never yields settled=true, and the last sleep stops at the
-// deadline instead of running up to a whole interval past it. Each poll's
-// reads are bounded by the deadline (at least minPollRead per read): the rows
-// and the refs alike, since refsFunc reads too (a HelmRelease expansion is an
-// MCP read per HelmRelease), so refsFunc must make its reads with the ctx it
-// is given. A row read the timeout cuts short reads Unknown, so the result is
-// settled=false with a nil error.
+// A cancelled ctx never yields settled=true. Each poll's reads are bounded by
+// the deadline (at least minPollRead per read): the rows and the refs alike,
+// since refsFunc reads too (a HelmRelease expansion is an MCP read per
+// HelmRelease), so refsFunc must make its reads with the ctx it is given.
+//
+// A poll reads its rows one after another, so a poll the deadline cuts short
+// would report every row it didn't reach as Unknown. Two things keep that out
+// of the result. The last sleep ends early enough for the next poll to finish
+// by the deadline, judged by how long the previous poll took; when no poll
+// fits any more, the previous one is the result. And a row a slower poll
+// still loses to the deadline keeps the row the previous poll read for the
+// same ref. Either way the result is settled=false with a nil error; a row
+// cut short in the first poll has nothing to keep and reads Unknown.
 func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func(context.Context) []string, interval, timeout time.Duration) (results []ResourceStatus, settled bool, err error) {
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -217,34 +257,88 @@ func (c *Checker) WaitUntilSettledFunc(ctx context.Context, refsFunc func(contex
 		defer cancelRead()
 		return refsFunc(readCtx)
 	}
+	// prev holds the previous poll's rows by ref, for the rows the deadline
+	// cuts short.
+	var prev map[string]ResourceStatus
 	for {
+		pollStart := time.Now()
 		refs := readRefs()
 		// The poll's MCP reads are bounded by the timeout too (but get at
-		// least minPollRead), so a slow read can't run the poll past it. A
-		// read cut short reads Unknown, which keeps the snapshot unsettled.
+		// least minPollRead), so a slow read can't run the poll past it.
 		readCtx, cancelRead := readContext(ctx, deadline)
-		results, err = c.CheckAll(readCtx, refs)
+		var cut []bool
+		results, cut = c.checkAll(readCtx, refs)
 		cancelRead()
-		if err != nil {
-			return results, false, err
-		}
 		// Reads made with a dead context prove nothing (and no refs at all
 		// would read as settled).
 		if err := ctx.Err(); err != nil {
 			return results, false, err
 		}
-		if allSettled(results) && slices.Equal(readRefs(), refs) {
-			return results, true, nil
+		// A kept row is Stale, and a cut row without one reads Unknown, so a
+		// poll with cut rows never counts as settled.
+		if keepPrevious(refs, results, cut, prev) {
+			c.log().Warn("readiness: poll cut short by its timeout; keeping the previous poll's rows",
+				"rows", len(refs), "timeout", timeout)
+		}
+		// latest holds the refs of the check below when they differ from the
+		// poll's: a HelmRelease finished its install and now lists a child.
+		var latest []string
+		if allSettled(results) {
+			now := readRefs()
+			if slices.Equal(now, refs) {
+				return results, true, nil
+			}
+			latest = now
 		}
 		if !time.Now().Before(deadline) {
-			return results, false, nil
+			return rowsFor(latest, refs, results), false, nil
+		}
+		prev = make(map[string]ResourceStatus, len(refs))
+		for i, ref := range refs {
+			prev[ref] = results[i]
+		}
+		// Wake early enough for the next poll to finish by the deadline. When
+		// it can't, this poll is the last one: starting another would only
+		// cut it short.
+		wait := min(interval, time.Until(deadline)-time.Since(pollStart))
+		if wait < 0 {
+			return rowsFor(latest, refs, results), false, nil
 		}
 		select {
 		case <-ctx.Done():
 			return results, false, ctx.Err()
-		case <-time.After(min(interval, time.Until(deadline))):
+		case <-time.After(wait):
 		}
 	}
+}
+
+// rowsFor adds the refs a check after the poll found but the poll never read
+// (a HelmRelease child that just appeared) to the poll's rows, as Unknown, so
+// no caller can count the result as settled. Every row the poll read stays,
+// even when the check returned fewer refs: a shorter list (an expansion read
+// that failed) doesn't prove a resource is gone, and dropping a Failed row
+// would hide an observed failure. Removal is left to the prune handling.
+func rowsFor(latest, refs []string, results []ResourceStatus) []ResourceStatus {
+	read := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		read[ref] = true
+	}
+	out := results
+	for _, ref := range latest {
+		if read[ref] {
+			continue
+		}
+		parsed, err := ParseInventoryID(ref)
+		if err != nil {
+			out = append(out, ResourceStatus{Status: "Unknown", Message: err.Error()})
+			continue
+		}
+		out = append(out, ResourceStatus{
+			Kind: parsed.Kind, Name: parsed.Name, Namespace: parsed.Namespace,
+			Status: "Unknown", Message: "appeared in the inventory after the last poll; not read yet",
+		})
+	}
+	return out
 }
 
 // minPollRead is the least time one poll's reads get, even when the timeout
@@ -274,8 +368,16 @@ func readContext(ctx context.Context, deadline time.Time) (context.Context, cont
 // prune now keeps polling to the timeout instead of settling immediately;
 // that's an accepted trade for never emitting a confident "deleted" verdict
 // off a flaky MCP read.
+//
+// A Stale row (kept from the previous poll) is never settled, whatever its
+// status: it wasn't read now. Callers that recompute settled after dropping
+// rows (the processor's prune step) rely on this, so a poll the deadline cut
+// short can't turn settled off rows it didn't read.
 func allSettled(results []ResourceStatus) bool {
 	for _, r := range results {
+		if r.Stale {
+			return false
+		}
 		switch r.Status {
 		case string(status.CurrentStatus),
 			string(status.FailedStatus),
